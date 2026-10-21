@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src http://127.0.0.1:8766; img-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Результаты флота</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div><p class="eyebrow">Панель владельца</p><h1>Мои дела и результаты</h1>
+      <p class="lead">Сначала — что требует вашего участия. Остальное делает система.</p></div>
+      <div class="header-controls">
+      <label class="agent-label" for="owner-password">Пароль владельца (локальная роль)
+      <input id="owner-password" type="password" maxlength="1024" autocomplete="off" placeholder="Пароль владельца" aria-label="Пароль владельца"></label>
+      <button id="owner-login" type="button">Войти</button>
+      <label class="agent-label" for="project-filter">Проект (необязательно)
+      <input id="project-filter" type="text" maxlength="256" autocomplete="off" placeholder="Все проекты" aria-label="Фильтр проекта"></label>
+      <span id="connection" role="status" aria-live="polite">Подключение…</span>
+      <button id="refresh" type="button">Обновить</button></div>
+    </header>
+    <section id="notice" class="notice" hidden role="alert"></section>
+    <section class="human-section" aria-labelledby="owner-actions-title">
+      <h2 id="owner-actions-title">Что от тебя нужно</h2>
+      <div id="owner-actions" class="human-grid"><p>Загрузка действий…</p></div>
+    </section>
+    <section class="human-section" aria-labelledby="human-intents-title">
+      <h2 id="human-intents-title">Мои интенции</h2>
+      <div id="human-intents" class="human-grid"></div>
+    </section>
+    <section class="human-section" aria-labelledby="human-done-title">
+      <h2 id="human-done-title">Готово</h2>
+      <div id="human-done" class="human-grid"></div>
+    </section>
+    <section class="human-section" aria-label="Сводка флота">
+      <h2>Флот</h2>
+      <p id="fleet-line" class="fleet-line">Загрузка состояния…</p>
+    </section>
+    <details id="debug">
+      <summary>Подробности для отладки</summary>
+      <section id="summary" class="summary" aria-label="Статистика результатов"></section>
+      <section id="tree" aria-label="Дерево результатов"><p>Загрузка результатов…</p></section>
+    </details>
+    <footer>Данные обновляются автоматически. Отладочные данные скрыты до раскрытия раздела.</footer>
+  </main>
+  <dialog id="taste-dialog" aria-labelledby="taste-title">
+    <div class="dialog-head"><div><p class="eyebrow">Только выбор вкуса, не приёмка качества</p>
+    <h2 id="taste-title">Визуальные варианты</h2></div>
+    <button id="close-dialog" type="button" aria-label="Закрыть">Закрыть</button></div>
+    <p id="taste-status" role="status" aria-live="polite"></p>
+    <div id="taste-options" class="taste-options"></div>
+    <div id="taste-actions" class="taste-actions"></div>
+  </dialog>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

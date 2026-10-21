@@ -1,0 +1,16 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "SHA-256 inventory values are checksums, not API keys"
+condition = "AND"
+paths = ['(?:^|/|!)\.public-export\.json$']
+regexTarget = "secret"
+regexes = ['^[a-f0-9]{64}$']
+
+[[allowlists]]
+description = "RSA SubjectPublicKeyInfo for the public unpacked extension ID"
+condition = "AND"
+paths = ['(?:^|/)manifest\.json$']
+regexTarget = "secret"
+regexes = ['^MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A[A-Za-z0-9+/]+AQAB$']

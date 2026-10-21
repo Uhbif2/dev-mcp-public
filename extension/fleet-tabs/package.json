@@ -1,0 +1,11 @@
+{
+  "name": "fleet-tabs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/place.test.mjs test/package.test.mjs test/policy.test.mjs test/recovery.test.mjs test/runtime.test.mjs test/content.test.mjs test/fleet-report.test.mjs test/fleet-status.test.mjs test/dashboard-interventions.test.mjs test/research.test.mjs test/owner-notices.test.mjs test/modules-load.test.mjs test/interface-pressure.test.mjs test/browser-halt.test.mjs",
+    "test:dom": "node --test test/content.test.mjs",
+    "test:config": "node --test test/config.test.mjs",
+    "test:all": "npm test && npm run test:config"
+  }
+}

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.test-tmp*/
+logs/
+data/
+dist/
+build/
+*.egg-info/
+policy.toml
+fleet-projects.toml
+machine.toml
+extension/fleet-tabs/local-settings.json
+.env
+.env.*

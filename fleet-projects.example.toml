@@ -1,0 +1,6 @@
+# Optional registry of YOUR projects. Copy to fleet-projects.toml and edit paths.
+[projects."Example App"]
+goal = 'Build and verify the app in this workspace.'
+sources = ['GOAL.md']
+gate = 'python -m pytest -q'
+commit = false

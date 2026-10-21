@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAt7rX+4IN26Wt9OQmpUKjqkE+nZnHoiaviqe/RgUQxF9CyGd5GvNOgPw7OVKRTzkrDE3M9TuKMgQuQ7swHkJaxCQb8Pop/4kftguDXs9aM0fhmr7NBraR7qMEaUwCcZefie6aX1xZqBr9POrsLlLfdayXeiGXu5iprSKFkjQ5EU3vHN6jTfKh43LT1kzaBQTqAffpZhMN7/66C6y48Lbz+auTg099e1sPnHXTMGALNILwsbRuvaEIPBo3u3tGa4CIw1Drx9UghIyzFtyv5yM+Xkrc4+59SfiZytzP0b/etCb87pOeFfZRQsq2hJgwMYlsN7xbFfF17GCKwsxr/4lq2wIDAQAB",
+  "name": "Вкладки флота",
+  "version": "0.19.6",
+  "description": "Продолжает вкладки web-ChatGPT, которые держат задачу флота dev-mcp, и не даёт им засыпать.",
+  "permissions": [
+    "tabs",
+    "alarms",
+    "storage",
+    "notifications",
+    "scripting",
+    "system.memory"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "http://127.0.0.1:8766/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "mode.js",
+        "research-content.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Вкладки флота"
+  },
+  "icons": {
+    "128": "icon128.png"
+  }
+}

@@ -1,0 +1,28 @@
+# dev-mcp access policy. Anything not listed here is denied.
+# Copy to policy.toml next to pyproject.toml and adjust the paths.
+# The server re-reads this file on change (~3 s); a broken file is not applied.
+
+# Read access.
+roots = [
+    'C:\work\projects',
+]
+
+# Write access (must be inside roots).
+write_roots = [
+    'C:\work\projects\my-app',
+]
+
+# Process execution (every exec_root must also be a write_root).
+exec_roots = [
+    'C:\work\projects\my-app',
+]
+
+# Bare binary names allowed as argv[0] (resolved on the server's PATH).
+exec_allowed_bin = ['python', 'py', 'pytest', 'node', 'npm', 'git']
+
+allow_write = false
+allow_network_fetch = false
+exec_timeout_cap_s = 600
+
+# Checked against EVERY path segment: '.git' also hides '.git/config'.
+deny_patterns = ['.env', '.env.*', '*secret*', '*.pem', '*.key', 'keys', '.git', '.ssh']

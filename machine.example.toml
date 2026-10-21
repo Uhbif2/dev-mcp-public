@@ -1,0 +1,15 @@
+# Optional. Copy to machine.toml; local settings must never be committed.
+# Defaults: hub = installation parent; workspaces = [hub].
+workspaces = ['C:\work\projects']
+worktree_base = 'C:\work\.fleet-wt'
+# Set only for a live installation whose proxy you operate:
+# live_home = 'C:\work\dev-mcp'
+# proxy_state = 'C:\work\gateway\mcp-proxy\state.json'
+# gateway_health_url = 'https://gateway.example.net/healthz'
+# Remote project publishing stays off until you set your GitHub login:
+# github_owner = 'your-github-login'
+# Optional owner-notice routing: an existing project, plus your shared receipt checker.
+# owner_project = 'Owner Inbox'
+# Optional host integrations:
+# lens_docs = ['C:\work\skills\art-director\SKILL.md']
+# gemini_relay = 'C:\work\ai-relay\relay.mjs'
