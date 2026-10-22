@@ -24,7 +24,13 @@ server, fleet registry and Chrome extension.
 The browser adapter and host integrations remain experimental. The extension
 is distributed unpacked; this release is not a Chrome Web Store submission.
 Gateway hosting, credentials and account setup are supplied by each operator.
-# 0.1.1 — 2026-10-22
+## 0.1.1 — 2026-10-22
+
+- Keep reading owner card edits and reopen events after project binding;
+  explicitly filter active cards. TickTick choices record an operational request;
+  privileged execution requires separate attributable owner authorization.
+- `restart.py --help` and invalid arguments cannot restart services.
+- Make UTF-8 test fixtures independent of the Windows system code page.
 
 - Preserve recorded process argument boundaries during independent acceptance.
 - Respect TickTick rate limits, report sync request counts and bind approvals

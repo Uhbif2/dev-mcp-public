@@ -70,12 +70,25 @@ before any apply — checking a different commit is not delivery proof.
 The create_defect callback must schedule repair work by a stable event key,
 receiving original review proof and every verified delivery-stage proof.
 
-**Integration status:** this package supplies the trusted entrypoint but
-DOES NOT register the production acceptance hook; fleet/queue.py and the
-controller routing are outside TZ-13 owns. A separate integration task must
-call on_accept from the actual server acceptance transition and verify it
-end-to-end (Fleet Platform/request:9a85c795 for styk:2). Until then automated
-production delivery is NOT enabled.
+**Integration status (22 October 2026):** `Controller._delivery_events` consumes
+real `accept` events and calls `on_accept`; `Controller.tick` invokes that consumer.
+It also retries receipts waiting for claim integration without rewinding the
+global cursor. The hook is implemented and covered by
+`tests/fleet/test_controller_trusted_delivery.py`.
+
+Execution requires a trusted `delivery_route`. The launcher loads protected
+Operator provisioning and independent signed observations through
+`load_trusted_delivery_provisioning`; absent provisioning the consumer returns
+without effects and reports `delivery=unprovisioned`. A project `deliver.toml`
+alone grants no authority. In the owner's current installation no protected
+Operator delivery configuration is provisioned. No live target deployment or
+independent target attestation was performed by this maintenance work.
+
+Therefore the implemented hook and its tests do not establish production
+delivery. A concrete consumer must supply protected Operator/attestor setup
+and demonstrate an accepted artifact reaching its actual target with matching
+independent evidence. Retired Fleet Platform tasks are historical context,
+not a route for agents to edit or provision this platform.
 
 ## Delivery state and recovery
 

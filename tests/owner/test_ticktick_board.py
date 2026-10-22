@@ -166,7 +166,8 @@ def test_tick_cannot_approve_a_plan_changed_after_the_question(tmp_path):
     question["items"][0]["status"] = 1
     b.sync(SNAP, system_lines=["x"])
     with store.read() as tx:
-        records = tx.query("SELECT payload FROM events WHERE kind='intent.ops_approved'")
+        records = tx.query("SELECT payload FROM events WHERE kind='owner.ticktick_ops_requested'")
+        assert tx.scalar("SELECT COUNT(*) FROM events WHERE kind='intent.ops_approved'") == 0
     assert len(records) == 1
     assert json.loads(records[0]["payload"])["plan_sha256"] == hashlib.sha256(b"new plan").hexdigest()
 
@@ -192,11 +193,12 @@ def test_owner_tick_records_trusted_ops_approval_for_that_plan(tmp_path):
     question["items"][0]["status"] = 1  # the owner ticks «Да»
     b.sync(SNAP, system_lines=["x"])
     with store.read() as tx:
-        rows = tx.query("SELECT payload FROM events WHERE kind='intent.ops_approved'")
+        rows = tx.query("SELECT payload FROM events WHERE kind='owner.ticktick_ops_requested'")
+        assert tx.scalar("SELECT COUNT(*) FROM events WHERE kind='intent.ops_approved'") == 0
     payload = json.loads(rows[0]["payload"])
-    assert payload["approved_by"] == "owner"
+    assert payload["authorization"] == "operator_required" and "approved_by" not in payload
     assert payload["plan_sha256"] == hashlib.sha256("план".encode()).hexdigest()
-    assert question["status"] == 2 and any("решено: Да" in c["title"] for c in fake.comments)
+    assert question["status"] == 2 and any("для запуска подтвердите этот план оператору" in c["title"] for c in fake.comments)
 
 
 def test_two_ticks_decide_nothing_and_warn_once(tmp_path):
@@ -395,12 +397,16 @@ def test_closing_pauses_and_reopening_resumes(tmp_path, include_closed):
     card = _owner_card(fake, b, "Новая затея")
     b.sync(SNAP, system_lines=["x"])
     rec = b.state["owner_cards"][card["id"]]
+    b.state["cards"]["owner-bound-project"] = card["id"]
     card["status"] = -1  # «Не буду делать»
     b.sync(SNAP, system_lines=["x"])
     assert rec["state"] == "paused" and rec["why"] == "wont_do"
     card["status"] = 0
+    card["content"] = "Edited after project binding"
     b.sync(SNAP, system_lines=["x"])
     assert rec["state"] == "open"
+    from dev_mcp.fleet.controller import INTENT_INBOX
+    assert "Edited after project binding" in (INTENT_INBOX / rec["file"]).read_text(encoding="utf-8")
     assert any("продолжаю" in c["title"] for c in fake.comments if c["task"] == card["id"])
 
 

@@ -15,6 +15,18 @@ import pytest
 from tools import restart
 
 
+@pytest.mark.parametrize("argument,code", [("--help", 0), ("--typo", 2)])
+def test_help_and_unknown_arguments_never_restart(monkeypatch, argument, code):
+    monkeypatch.setattr(sys, "argv", ["restart.py", argument])
+    def forbidden(*args, **kwargs):
+        pytest.fail("argument parsing must finish before policy checks or effects")
+    monkeypatch.setattr(restart, "step_check_policy", forbidden)
+    monkeypatch.setattr(restart, "step_restart_proxy", forbidden)
+    with pytest.raises(SystemExit) as stopped:
+        restart.main()
+    assert stopped.value.code == code
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

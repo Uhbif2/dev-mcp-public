@@ -79,7 +79,7 @@ def test_failed_toast_remains_pending_and_recovers_once_after_restart(monkeypatc
     assert owner_channel.retry_pending_toasts(reopened)==1
     assert owner_channel.retry_pending_toasts(reopened)==0
     assert toast.calls==2
-    assert (tmp_path/'inbox.md').read_text().count('Review the versioned plan')==1
+    assert (tmp_path/'inbox.md').read_text(encoding='utf-8').count('Review the versioned plan')==1
     reopened.close()
 
 
@@ -96,7 +96,7 @@ def test_ops_approval_notice_waits_for_versioned_independent_plan_proof(monkeypa
                            spec={'depends_on':['plan']},evidence_spec={'kind':'review'},authority={'source':'owner'},
                            outcome_id='approval',parent_id='root')
     (tmp_path/'intent').mkdir()
-    (tmp_path/'intent/rollback-plan.md').write_text('## Нужно от владельца\nApprove the bounded pilot')
+    (tmp_path/'intent/rollback-plan.md').write_text('## Нужно от владельца\nApprove the bounded pilot', encoding='utf-8')
     toast=_Toast()
     monkeypatch.setattr(owner_channel,'INBOX_PATH',tmp_path/'inbox.md')
     monkeypatch.setattr(owner_channel,'_toast',lambda:toast)

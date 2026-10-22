@@ -37,6 +37,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -472,12 +473,18 @@ def step_deploy_receipt() -> None:
 
 
 def main() -> int:
-    args = set(sys.argv[1:])
-    local_only = "--local-only" in args
-    run_tests = "--no-tests" not in args
-    if "--all" in args:
+    parser = argparse.ArgumentParser(description="Check and restart selected MCP proxy instances.")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--all", action="store_true", help="restart dev and core")
+    scope.add_argument("--core", action="store_true", help="restart core only")
+    parser.add_argument("--local-only", action="store_true", help="skip public gateway checks")
+    parser.add_argument("--no-tests", action="store_true", help="skip the production test selection")
+    args = parser.parse_args()
+    local_only = args.local_only
+    run_tests = not args.no_tests
+    if args.all:
         targets = ["dev", "core"]
-    elif "--core" in args:
+    elif args.core:
         targets = ["core"]
     else:
         targets = ["dev"]

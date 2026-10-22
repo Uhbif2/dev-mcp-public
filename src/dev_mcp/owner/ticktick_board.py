@@ -747,6 +747,8 @@ class Board:
         plain = brief_for_question(brief or {}, action["action"])
         if plain:
             desc = plain + "\n\n" + desc
+        if action["action"].casefold().startswith(APPROVE_PREFIX):
+            desc += "\n\nДля запуска подтвердите этот план оператору в личном чате: отметка здесь сохраняет выбор."
         plan_sha = self._plan_sha(action["project"], action["action"])
         schedule: dict = {}
         try:
@@ -843,7 +845,9 @@ class Board:
         mine = {entry["id"] for entry in self.state["ledger"]}
         cards = self.state.setdefault("owner_cards", {})
         items = self.state.setdefault("owner_items", {})
-        server_cards = set(self.state["cards"].values())
+        # Once an owner card is bound to a project it is also in `cards`.
+        # It remains owner input: keep reading its edits and reopen transitions.
+        server_cards = set(self.state["cards"].values()) - set(cards)
         column_names = {cid: name for key, cid in self.state["columns"].items()
                         for name in [self.state.get("column_names", {}).get(cid, [None])[0]]}
         inbox = self.state["columns"].get("inbox")
@@ -1225,7 +1229,9 @@ class Board:
             q["decided"] = option
             self.api.call("update_task", {"task_id": q["id"], "task": {
                 "id": q["id"], "projectId": self.state["list_id"], "status": 2, "tags": []}})
-            self._comment(q["card"], f"Флот · {self._stamp()} · решено: {option}")
+            message = (f"выбор получен: {option}; для запуска подтвердите этот план оператору в личном чате"
+                       if q.get("authorization") == "operator_required" else f"решено: {option}")
+            self._comment(q["card"], f"Флот · {self._stamp()} · {message}")
             decided += 1
         return decided
 
@@ -1237,9 +1243,13 @@ class Board:
             if current is None or current != q.get("plan_sha256"):
                 return False
             payload["plan_sha256"] = current
-            payload["approved_by"] = "owner"
+            # OAuth identifies the shared TickTick account, not the actor.
+            # A non-ledger write can also come from another connected agent.
+            # Only the trusted operator may turn this request into an ops grant.
+            payload["authorization"] = "operator_required"
+            q["authorization"] = "operator_required"
             with self.store.tx() as tx:
-                tx.record_event(kind="intent.ops_approved", project=q["project"], payload=payload)
+                tx.record_event(kind="owner.ticktick_ops_requested", project=q["project"], payload=payload)
         with self.store.tx() as tx:
             tx.record_event(kind="owner.ticktick_decision", project=q["project"], payload=payload)
         return True
