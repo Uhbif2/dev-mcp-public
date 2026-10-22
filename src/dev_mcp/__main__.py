@@ -101,7 +101,14 @@ def main() -> int:
         action='store_true',
         help='проверить файл политики и выйти (сервер не поднимать)',
     )
+    parser.add_argument('--transport', choices=('stdio', 'http'), default='stdio',
+                        help='stdio or loopback Streamable HTTP for a local client/tunnel')
+    parser.add_argument('--port', type=int, default=8766, help='loopback HTTP port')
+    parser.add_argument('--core-only', action='store_true',
+                        help='file/process tools without autonomous fleet background workers')
     opts = parser.parse_args()
+    if not 1 <= opts.port <= 65535:
+        parser.error('--port must be between 1 and 65535')
 
     try:
         policy = Policy.load(opts.policy)
@@ -157,6 +164,21 @@ def main() -> int:
         name='dev-mcp-policy-watch',
     )
     watcher.start()
+
+    def serve() -> None:
+        server = build_server(policy, audit, policy_path=opts.policy)
+        if opts.transport == 'http':
+            server.run(transport='http', host='127.0.0.1', port=opts.port,
+                       path='/servers/dev/mcp', json_response=True)
+        else:
+            server.run()
+
+    if opts.core_only:
+        try:
+            serve()
+        finally:
+            stop_watch.set()
+        return 0
 
     # FleetChrome is an execution dependency, but its extension cannot resurrect the
     # browser after Chrome has exited.  Keep that outer self-heal loop in dev-mcp:
@@ -232,7 +254,7 @@ def main() -> int:
         ).start()
 
     try:
-        build_server(policy, audit, policy_path=opts.policy).run()
+        serve()
     finally:
         fleet_stop.set()
         stop_watch.set()

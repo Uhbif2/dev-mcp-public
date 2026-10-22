@@ -24,3 +24,15 @@ server, fleet registry and Chrome extension.
 The browser adapter and host integrations remain experimental. The extension
 is distributed unpacked; this release is not a Chrome Web Store submission.
 Gateway hosting, credentials and account setup are supplied by each operator.
+# 0.1.1 — 2026-10-22
+
+- Preserve recorded process argument boundaries during independent acceptance.
+- Respect TickTick rate limits, report sync request counts and bind approvals
+  to the plan version originally presented by the question.
+- Support explicit question deadlines and existing duration tags; owner section
+  moves update the intent and moving back to the inbox pauses it.
+- Add loopback HTTP, core-only mode, standalone setup/doctor and opt-in
+  manifest startup management without machine-wide settings changes.
+- Add Windows CI, production test markers, security guidance and the missing
+  TickTick connection helper.
+

@@ -61,6 +61,9 @@ ChatGPT project and connector. Fresh installs start disabled.
 
 ## Running
 
+For the guided Windows setup, local doctor, authenticated ChatGPT transport,
+startup and removal, follow [INSTALL.md](INSTALL.md).
+
 ```powershell
 uv sync --frozen --extra dev
 copy policy.example.toml policy.toml
@@ -81,7 +84,8 @@ For a fleet, copy `fleet-projects.example.toml` to `fleet-projects.toml` and
 register your own projects using the [fleet protocol](docs/FLEET-PROTOCOL.md).
 The public snapshot contains no existing projects, tasks, credentials, chat
 history or production configuration. A small set of tests requiring the
-maintainer's production configuration is explicitly skipped by `conftest.py`.
+maintainer's production configuration carries the `production` marker and is
+explicitly skipped by the public `conftest.py`.
 
 Expose it to a remote client through any MCP proxy/gateway you trust; never without a token.
 For a local stdio client, adapt [mcp-client.example.json](mcp-client.example.json).

@@ -790,6 +790,7 @@ async def test_policy_reload_without_path_configured_fails_clean(tmp_path: Path)
 # ---------- боевой policy.toml ----------
 
 
+@pytest.mark.production
 def test_production_exec_roots_inside_roots_and_no_shell() -> None:
     config = Path(__file__).resolve().parents[1] / 'policy.toml'
     policy = Policy.load(config)
@@ -800,6 +801,7 @@ def test_production_exec_roots_inside_roots_and_no_shell() -> None:
         assert b.lower() not in _SHELL_BIN_BLOCKLIST
 
 
+@pytest.mark.production
 def test_production_policy_has_no_duplicate_permissions_or_directory_as_binary() -> None:
     """review.cmd не должен плодить дубли и путать путь проекта с argv[0]."""
     config = Path(__file__).resolve().parents[1] / 'policy.toml'
@@ -811,6 +813,7 @@ def test_production_policy_has_no_duplicate_permissions_or_directory_as_binary()
         assert Path(name).name == name, f'каталог/путь ошибочно попал в exec_allowed_bin: {name}'
 
 
+@pytest.mark.production
 def test_production_allowed_bins_resolve_in_launch_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """restart.cmd/run.cmd добавляют эти стабильные каталоги в PATH сервиса."""
     stable_dirs = (
@@ -825,6 +828,7 @@ def test_production_allowed_bins_resolve_in_launch_environment(monkeypatch: pyte
     assert policy._exec_bin_missing == []
 
 
+@pytest.mark.production
 def test_production_memory_service_has_complete_agent_permissions() -> None:
     config = Path(__file__).resolve().parents[1] / 'policy.toml'
     policy = Policy.load(config)
@@ -836,6 +840,7 @@ def test_production_memory_service_has_complete_agent_permissions() -> None:
     assert {'memory_service-lint', 'memory_service-typecheck', 'memory_service-test'} <= set(policy.tasks)
 
 
+@pytest.mark.production
 def test_production_every_exec_root_is_write_root() -> None:
     """Каждый exec_root обязан быть и write_root: процесс `run` пишет кэш/pyc в
     cwd, а cwd проходит проверку for_write. Иначе `run` там молча не заработает."""
@@ -846,6 +851,7 @@ def test_production_every_exec_root_is_write_root() -> None:
         assert str(er) in write, f'{er} есть в exec_roots, но не в write_roots'
 
 
+@pytest.mark.production
 def test_production_exec_args_unrestricted_subset_of_allowed_bin() -> None:
     config = Path(__file__).resolve().parents[1] / 'policy.toml'
     policy = Policy.load(config)

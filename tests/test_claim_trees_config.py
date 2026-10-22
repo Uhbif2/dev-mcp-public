@@ -1,9 +1,11 @@
 """Production manifest retires platform self-editing without changing other projects."""
 
+import pytest
 from pathlib import Path
 import tomllib
 
 
+@pytest.mark.production
 def test_fleet_platform_is_retired_from_production_manifest():
     config_path = Path(__file__).resolve().parents[1] / "fleet-projects.toml"
     with config_path.open("rb") as config_file:

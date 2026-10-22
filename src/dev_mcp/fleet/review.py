@@ -313,7 +313,7 @@ def _norm_command(value: str) -> str:
     return " ".join(parts)
 
 
-def _acceptance_argv(command: str) -> tuple[str, ...] | None:
+def _acceptance_argv(command: str | tuple[str, ...]) -> tuple[str, ...] | None:
     """Tokenize Windows command text without dividing quoted path operands.
 
     The run event contains argv rendered as command text. Backslashes first
@@ -321,15 +321,20 @@ def _acceptance_argv(command: str) -> tuple[str, ...] | None:
     Windows-style double quotes delimit one operand. Preserve whitespace
     *inside* the quotes rather than normalizing it as argument separators.
     """
-    lexer = shlex.shlex(str(command).replace("\\", "/"), posix=True)
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    lexer.quotes = '"'
-    lexer.escape = ""
-    try:
-        parts = [part.casefold() for part in lexer]
-    except ValueError:
-        return None
+    if isinstance(command, tuple):
+        # Server-recorded argv already has trusted argument boundaries. Joining
+        # it first loses quoted pytest -k expressions and paths with spaces.
+        parts = [part.replace("\\", "/").casefold() for part in command]
+    else:
+        lexer = shlex.shlex(str(command).replace("\\", "/"), posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        lexer.quotes = '"'
+        lexer.escape = ""
+        try:
+            parts = [part.casefold() for part in lexer]
+        except ValueError:
+            return None
     if parts and parts[0] in {"cmd", "cmd.exe"}:
         parts = parts[1:]
         while parts and parts[0] in {"/d", "/s"}:
@@ -343,7 +348,7 @@ def _acceptance_argv(command: str) -> tuple[str, ...] | None:
     return tuple(parts)
 
 
-def _matches_acceptance_run(required: str, observed: str, run_cwd: str,
+def _matches_acceptance_run(required: str, observed: str | tuple[str, ...], run_cwd: str,
                             expected_cwd: str = "") -> bool:
     """Match an absolute acceptance operand to a safe relative run operand.
 
@@ -393,21 +398,21 @@ def _matches_acceptance_run(required: str, observed: str, run_cwd: str,
     return changed
 
 
-def _payload_commands(payload: Any) -> list[str]:
+def _payload_commands(payload: Any) -> list[str | tuple[str, ...]]:
     if isinstance(payload, str):
         try:
             return _payload_commands(json.loads(payload))
         except (json.JSONDecodeError, TypeError):
             return [payload] if payload.strip() else []
     if isinstance(payload, dict):
-        out: list[str] = []
+        out: list[str | tuple[str, ...]] = []
         for key in ("command", "cmd", "argv"):
             if key in payload:
                 out.extend(_payload_commands(payload[key]))
         return out
     if isinstance(payload, (list, tuple)):
         if payload and all(isinstance(x, (str, int, float)) for x in payload):
-            return [" ".join(str(x) for x in payload)]
+            return [tuple(str(x) for x in payload)]
     return []
 
 
@@ -461,7 +466,7 @@ def _missing_runs(
     if not required:
         return []
     expected_cwd = _expected_run_cwd(tx,worker_id,since)
-    successful: list[tuple[str, str]] = []
+    successful: list[tuple[str | tuple[str, ...], str]] = []
     for row in tx.query(
         "SELECT payload,rc,path_norm FROM events WHERE worker_id=? AND kind='run' AND ts>=? ORDER BY id",
         (worker_id, since),

@@ -27,6 +27,13 @@ class TickTickUnavailable(RuntimeError):
     pass
 
 
+class TickTickRateLimited(TickTickUnavailable):
+    def __init__(self, retry_after_s: float = 120.0):
+        import math
+        super().__init__("TickTick MCP rate limited")
+        self.retry_after_s = max(0.0, retry_after_s) if math.isfinite(retry_after_s) else 120.0
+
+
 @dataclass(frozen=True)
 class PublishedTask:
     task_id: str
@@ -112,7 +119,22 @@ class StreamableHTTP:
                     self._session = session
                 raw = response.read(1024 * 1024 + 1)
                 ctype = response.headers.get("Content-Type", "").lower().split(";", 1)[0].strip()
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        except HTTPError as exc:
+            if exc.code == 429:
+                from datetime import datetime, timezone
+                from email.utils import parsedate_to_datetime
+
+                value = exc.headers.get("Retry-After", "120") if exc.headers else "120"
+                try:
+                    delay = float(value)
+                except ValueError:
+                    try:
+                        delay = (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+                    except (TypeError, ValueError, OverflowError):
+                        delay = 120.0
+                raise TickTickRateLimited(delay) from None
+            raise TickTickUnavailable("TickTick MCP unavailable") from None
+        except (URLError, TimeoutError, OSError):
             raise TickTickUnavailable("TickTick MCP unavailable") from None
         if len(raw) > 1024 * 1024:
             raise TickTickUnavailable("TickTick MCP response too large")

@@ -153,6 +153,38 @@ def test_second_sync_writes_nothing_when_nothing_changed(tmp_path):
     assert not [c for c in fake.calls if c.startswith(("create", "update", "add"))]
 
 
+def test_tick_cannot_approve_a_plan_changed_after_the_question(tmp_path):
+    store, fake, b, root = board(tmp_path)
+    b.sync(SNAP, system_lines=["x"])
+    question = next(t for t in fake.tasks.values() if t["kind"] == "CHECKLIST")
+    (root / "intent/rollback-plan.md").write_text("new plan", encoding="utf-8")
+    question["items"][0]["status"] = 1
+    b.sync(SNAP, system_lines=["x"])
+    with store.read() as tx:
+        assert tx.scalar("SELECT COUNT(*) FROM events WHERE kind='intent.ops_approved'") == 0
+    assert question["items"][0]["status"] == 0
+    question["items"][0]["status"] = 1
+    b.sync(SNAP, system_lines=["x"])
+    with store.read() as tx:
+        records = tx.query("SELECT payload FROM events WHERE kind='intent.ops_approved'")
+    assert len(records) == 1
+    assert json.loads(records[0]["payload"])["plan_sha256"] == hashlib.sha256(b"new plan").hexdigest()
+
+
+def test_question_uses_explicit_zoned_deadline_and_existing_duration_tag(tmp_path):
+    from copy import deepcopy
+    store, fake, b, _ = board(tmp_path)
+    fake.tags.append("15-минут")
+    snap = deepcopy(SNAP)
+    snap["human"]["actions"][0].update(deadline="2026-10-22T06:30:00+00:00", duration_tag="15-минут")
+    b.sync(snap, system_lines=["x"])
+    question = next(t for t in fake.tasks.values() if t["kind"] == "CHECKLIST")
+    assert question["dueDate"] == "2026-10-22T09:30:00+03:00"
+    assert question["timeZone"] == "Europe/Moscow"
+    assert "15-минут" in question["tags"]
+    assert not question.get("reminders")
+
+
 def test_owner_tick_records_trusted_ops_approval_for_that_plan(tmp_path):
     store, fake, b, root = board(tmp_path)
     b.sync(SNAP, system_lines=["x"])
@@ -317,6 +349,26 @@ def test_card_in_a_project_section_says_which_project(tmp_path):
     assert "раздел «Beta App»" in text
 
 
+def test_owner_move_revises_section_and_inbox_keeps_the_card_paused(tmp_path):
+    from dev_mcp.fleet import controller
+    store, fake, b, _ = board(tmp_path)
+    b.sync(SNAP, system_lines=["x"])
+    card = _owner_card(fake, b, "Move canary")
+    b.sync(SNAP, system_lines=["x"])
+    rec = b.state["owner_cards"][card["id"]]
+    key = next(k for k in b.state["columns"] if k.startswith("s:") and "Beta App" in k)
+    card["columnId"] = b.state["columns"][key]
+    b.sync(SNAP, system_lines=["x"])
+    assert "раздел «Beta App»" in (controller.INTENT_INBOX / rec["file"]).read_text(encoding="utf-8")
+    card["columnId"] = b.state["columns"]["inbox"]
+    b.sync(SNAP, system_lines=["x"])
+    b.sync(SNAP, system_lines=["x"])
+    assert rec["state"] == "paused" and rec["why"] == "inbox"
+    card["columnId"] = b.state["columns"][key]
+    b.sync(SNAP, system_lines=["x"])
+    assert rec["state"] == "open"
+
+
 def test_tag_anywhere_pulls_the_task_onto_the_board(tmp_path):
     from dev_mcp.fleet import controller
     store, fake, b, _ = board(tmp_path)
@@ -329,9 +381,17 @@ def test_tag_anywhere_pulls_the_task_onto_the_board(tmp_path):
     assert (controller.INTENT_INBOX / "razobrat-pochtu.md").is_file()
 
 
-def test_closing_pauses_and_reopening_resumes(tmp_path):
+@pytest.mark.parametrize("include_closed", [False, True])
+def test_closing_pauses_and_reopening_resumes(tmp_path, include_closed):
     store, fake, b, _ = board(tmp_path)
     b.sync(SNAP, system_lines=["x"])
+    if include_closed:
+        original_call = fake.call
+        def call(name, args):
+            if name == "filter_tasks" and args["filter"].get("projectIds"):
+                return list(fake.tasks.values())
+            return original_call(name, args)
+        fake.call = call
     card = _owner_card(fake, b, "Новая затея")
     b.sync(SNAP, system_lines=["x"])
     rec = b.state["owner_cards"][card["id"]]

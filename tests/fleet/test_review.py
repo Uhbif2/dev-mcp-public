@@ -185,6 +185,24 @@ def test_accept_requires_matching_command_rc_zero_and_releases_claims(tmp_path: 
     assert json.loads(event["payload"])["note"] == "green"
 
 
+def test_review_preserves_recorded_argv_boundaries_for_pytest_expression(tmp_path: Path):
+    store = setup_store(tmp_path)
+    expression = "cloud_client or failover or latency"
+    command = f'py -3 -m pytest test -q -k "{expression}"'
+    add_task(store, "TZ-quoted", state="submitted", author_worker="W1", acceptance=(command,))
+    add_original_claim(store, "TZ-quoted")
+    review_tz = open_review(store, "P", "TZ-quoted")
+    assert take_next(store, "W2", "P").tz == review_tz
+    prefix = ["py", "-3", "-m", "pytest", "test", "-q", "-k"]
+    # An actually different argv cannot stand in for one quoted operand.
+    record_run(store, "W2", prefix + expression.split(), 0)
+    with pytest.raises(ValueError, match="own successful run"):
+        decide(store, "W2", "accept", "wrong boundaries")
+    record_run(store, "W2", prefix + [expression], 0)
+    decide(store, "W2", "accept", "same argv")
+    assert task_row(store, "TZ-quoted")["state"] == "accepted"
+
+
 def test_review_accepts_absolute_script_paths_via_verified_relative_run(tmp_path: Path):
     store = setup_store(tmp_path)
     root = "C:/hub/_todo/hub-fleet"

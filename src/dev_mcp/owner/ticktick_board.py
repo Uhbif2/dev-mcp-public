@@ -61,20 +61,30 @@ class Api:
         self.transport = transport
         self.credential = credential
         self._ready = False
+        self.requests = 0
+        self.request_seconds = 0.0
+
+    def _request(self, *args, **kwargs):
+        started = time.monotonic()
+        self.requests += 1
+        try:
+            return self.transport.request(*args, **kwargs)
+        finally:
+            self.request_seconds += time.monotonic() - started
 
     def _init(self, bearer: str) -> None:
         if self._ready:
             return
-        self.transport.request("initialize", {
+        self._request("initialize", {
             "protocolVersion": "2025-06-18", "capabilities": {},
             "clientInfo": {"name": "dev-mcp-board", "version": "1"}}, bearer)
-        self.transport.request("notifications/initialized", {}, bearer, notification=True)
+        self._request("notifications/initialized", {}, bearer, notification=True)
         self._ready = True
 
     def call(self, name: str, arguments: dict) -> Any:
         bearer = self.credential()
         self._init(bearer)
-        result = self.transport.request("tools/call", {"name": name, "arguments": arguments}, bearer)
+        result = self._request("tools/call", {"name": name, "arguments": arguments}, bearer)
         if result.get("isError"):
             raise BoardUnavailable(f"TickTick {name} refused")
         data = result.get("structuredContent")
@@ -653,6 +663,8 @@ class Board:
             if name not in known:
                 self.api.call("create_tag", {"tag": {"name": name, "parent": TAG_ROOT}})
         self.state["tags"] = sorted(TAGS.values())
+        self.state["duration_tags"] = sorted(name for name in known
+                                             if re.fullmatch(r"\d+-(?:минут|час|часа|часов)", name))
 
     def _upsert_note(self, key: str, column: str, title: str, content: str, order: int) -> None:
         note_id = self.state["notes"].get(key)
@@ -690,7 +702,8 @@ class Board:
         if owned:
             self.state["cards"][key] = owned
             rec = self.state["owner_cards"][owned]
-            if rec.get("column") == self.state["columns"].get("inbox") and column != rec.get("column"):
+            if (rec.get("column") == self.state["columns"].get("inbox") and column != rec.get("column")
+                    and rec.get("why") != "inbox"):
                 # From «＋ Новое» to its project's section, once; elsewhere the owner's placement stands.
                 self.api.call("update_task", {"task_id": owned, "task": {
                     "id": owned, "projectId": self.state["list_id"], "columnId": column}})
@@ -734,22 +747,56 @@ class Board:
         plain = brief_for_question(brief or {}, action["action"])
         if plain:
             desc = plain + "\n\n" + desc
+        plan_sha = self._plan_sha(action["project"], action["action"])
+        schedule: dict = {}
+        try:
+            due = datetime.fromisoformat(str(action.get("deadline") or "").replace("Z", "+00:00"))
+            if due.tzinfo is not None:
+                schedule = {"dueDate": due.astimezone(timezone(timedelta(hours=3))).isoformat(),
+                            "timeZone": "Europe/Moscow", "isAllDay": False}
+        except ValueError:
+            pass
+        duration = action.get("duration_tag")
+        tags = [TAGS["wait_owner"]] + ([duration] if duration in self.state.get("duration_tags", []) else [])
         known = self.state["questions"].get(qkey)
         if known:
-            digest = _digest([title, desc])
+            digest = _digest([title, desc, plan_sha, schedule, tags])
             if known.get("decided") is None and known.get("hash") != digest:
+                change = {"id": known["id"], "projectId": self.state["list_id"], "title": title, "desc": desc}
+                if known.get("plan_sha256") != plan_sha:
+                    current = self.api.call("get_task_by_id", {"task_id": known["id"]}) or {}
+                    change["items"] = [dict(item, status=0) for item in current.get("items", [])]
+                if known.get("schedule") != schedule:
+                    change.update(schedule)
+                    if known.get("schedule") and not schedule:
+                        change["dueDate"] = "1970-01-01T00:00:00.000+0000"
+                if known.get("service_tags") != tags:
+                    current = self.api.call("get_task_by_id", {"task_id": known["id"]}) or {}
+                    change["tags"] = [t for t in current.get("tags", [])
+                                      if t not in known.get("service_tags", [TAGS["wait_owner"]])] + tags
                 self.api.call("update_task", {"task_id": known["id"], "task": {
-                    "id": known["id"], "projectId": self.state["list_id"], "title": title, "desc": desc}})
+                    **change}})
                 known["hash"] = digest
+                known["plan_sha256"] = plan_sha
+                known.update(schedule=schedule, service_tags=tags)
             return
         task = self.api.call("create_task", {"task": {
             "projectId": self.state["list_id"], "parentId": card_id, "kind": "CHECKLIST",
-            "title": title, "desc": desc, "tags": [TAGS["wait_owner"]],
+            "title": title, "desc": desc, "tags": tags, **schedule,
             "items": [{"title": o, "status": 0, "sortOrder": i} for i, o in enumerate(options)]}})
         self._wrote("question", task["id"])
         self.state["questions"][qkey] = {"id": task["id"], "card": card_id, "options": options,
                                         "action": action["action"], "project": action["project"],
-                                        "decided": None, "hash": _digest([title, desc])}
+                                        "decided": None, "hash": _digest([title, desc, plan_sha, schedule, tags]),
+                                        "plan_sha256": plan_sha, "schedule": schedule, "service_tags": tags}
+
+    def _plan_sha(self, project: str, action: str) -> str | None:
+        if not action.casefold().startswith(APPROVE_PREFIX):
+            return None
+        with self.store.read() as tx:
+            row = tx.one("SELECT root FROM projects WHERE name=?", (project,))
+        plan = Path(row["root"]) / "intent/rollback-plan.md" if row else None
+        return hashlib.sha256(plan.read_bytes()).hexdigest() if plan and plan.is_file() else None
 
     def _ensure_brief(self, intent: dict) -> None:
         brief = intent.get("brief") or {}
@@ -818,6 +865,9 @@ class Board:
             self._comment(task["id"], f"Флот · {self._stamp()} · взял с тега «флот»")
             task = dict(task, projectId=self.state["list_id"], columnId=inbox)
             board.append(task)
+        # The official filter can return closed tasks unless status is explicit.
+        # Never treat a closed card as a live card (or immediately resume it).
+        board = [task for task in board if task.get("status", 0) == 0]
         live = {task["id"]: task for task in board}
         for task in board:
             tid = task["id"]
@@ -842,13 +892,24 @@ class Board:
                                     "hash": None, "state": "open"}
                 self._comment(tid, f"Флот · {self._stamp()} · принял, разбираюсь — объясню, как понял")
                 made += 1
+            elif column != rec.get("column"):
+                # A new owner placement is a revision request, never direct
+                # authority to move already claimed files to another project.
+                rec.update(column=column, section=section)
+                rec["hash"] = None
+                if column == inbox:
+                    self._pause(tid, rec, "inbox")
+                self._comment(tid, f"Флот · {self._stamp()} · вижу перенос в другой раздел, учитываю в намерении")
+            else:
+                # Renaming a section changes presentation, not the binding.
+                section = rec.get("section")
             if rec["hash"] != digest:
                 (INTENT_INBOX / rec["file"]).write_text(owner_intent_text(title, content, section, tid),
                                                         encoding="utf-8")
                 if rec["hash"] is not None:
                     self._comment(tid, f"Флот · {self._stamp()} · вижу правку, учитываю")
                 rec["hash"] = digest
-            if rec["state"] == "paused":
+            if rec["state"] == "paused" and not (rec.get("why") == "inbox" and column == inbox):
                 self._resume(tid, rec)
             self._save()
         for tid, rec in cards.items():
@@ -917,7 +978,7 @@ class Board:
     def read_card_ticks(self, intents: dict[str, dict]) -> int:
         """The owner's tick on a card the fleet made: on «на-приёмку» it accepts the result,
         earlier it stops the work (like «Не буду делать»); unticking resumes."""
-        live = {task["id"] for task in self._board or []}
+        live = {task["id"] for task in self._board or [] if task.get("status", 0) == 0}
         owner = self.state.get("owner_cards", {})
         states = self.state.setdefault("card_states", {})
         accepted = 0
@@ -1010,7 +1071,9 @@ class Board:
         mine = {entry["id"] for entry in self.state["ledger"]}
         items = self.state.setdefault("owner_items", {})
         board = self._board if self._board is not None else (
-            self.api.call("filter_tasks", {"filter": {"projectIds": [self.state["list_id"]]}}) or [])
+            self.api.call("filter_tasks", {"filter": {
+                "projectIds": [self.state["list_id"]], "status": [0]}}) or [])
+        board = [task for task in board if task.get("status", 0) == 0]
         live = {task["id"]: task for task in board}
         made = 0
         for task in board:
@@ -1153,7 +1216,12 @@ class Board:
             if len(ticked) != 1:
                 continue
             option = q["options"][ticked[0]] if ticked[0] < len(q["options"]) else str(ticked[0])
-            self._record_decision(q, option, approve=(ticked[0] == 0))
+            if not self._record_decision(q, option, approve=(ticked[0] == 0)):
+                self.api.call("update_task", {"task_id": q["id"], "task": {
+                    "id": q["id"], "projectId": self.state["list_id"],
+                    "items": [dict(item, status=0) for item in task.get("items", [])]}})
+                self._comment(q["card"], "Флот · план изменился после вопроса — обновляю его; выберите вариант заново")
+                continue
             q["decided"] = option
             self.api.call("update_task", {"task_id": q["id"], "task": {
                 "id": q["id"], "projectId": self.state["list_id"], "status": 2, "tags": []}})
@@ -1161,20 +1229,20 @@ class Board:
             decided += 1
         return decided
 
-    def _record_decision(self, q: dict, option: str, *, approve: bool) -> None:
+    def _record_decision(self, q: dict, option: str, *, approve: bool) -> bool:
         payload: dict[str, Any] = {"question": q["action"], "option": option, "channel": "ticktick",
                                    "task_id": q["id"]}
-        with self.store.read() as tx:
-            row = tx.one("SELECT root FROM projects WHERE name=?", (q["project"],))
-        if approve and q["action"].casefold().startswith(APPROVE_PREFIX) and row:
-            plan = Path(row["root"]) / "intent" / "rollback-plan.md"
-            if plan.is_file():
-                payload["plan_sha256"] = hashlib.sha256(plan.read_bytes()).hexdigest()
-                payload["approved_by"] = "owner"
-                with self.store.tx() as tx:
-                    tx.record_event(kind="intent.ops_approved", project=q["project"], payload=payload)
+        if approve and q["action"].casefold().startswith(APPROVE_PREFIX):
+            current = self._plan_sha(q["project"], q["action"])
+            if current is None or current != q.get("plan_sha256"):
+                return False
+            payload["plan_sha256"] = current
+            payload["approved_by"] = "owner"
+            with self.store.tx() as tx:
+                tx.record_event(kind="intent.ops_approved", project=q["project"], payload=payload)
         with self.store.tx() as tx:
             tx.record_event(kind="owner.ticktick_decision", project=q["project"], payload=payload)
+        return True
 
     def _announce_result(self, card_id: str, intent: dict, rec: dict) -> None:
         """Once per result: the owner's own card keeps its text, so the result goes as a comment."""
@@ -1204,7 +1272,8 @@ class Board:
         stamp = self.clock().strftime("%H:%M")
         system = self._ensure_column("system", SYSTEM_COLUMN, 1_000_000)
         self._ensure_column("inbox", INBOX_COLUMN, -1_000_000)
-        self._board = self.api.call("filter_tasks", {"filter": {"projectIds": [self.state["list_id"]]}}) or []
+        self._board = self.api.call("filter_tasks", {"filter": {
+            "projectIds": [self.state["list_id"]], "status": [0]}}) or []
         self.read_owner_cards(self._board)
         pins = {}
         keys_by_column = {cid: key for key, cid in self.state["columns"].items()}
@@ -1287,7 +1356,11 @@ def run_worker(store: Any, stop_event: Any) -> None:
     from urllib.request import ProxyHandler, build_opener
     from dev_mcp.owner.ticktick import StreamableHTTP, _NoRedirect
     board: Board | None = None
+    failures = 0
     while not stop_event.is_set():
+        delay = SYNC_INTERVAL_S
+        started = time.monotonic()
+        before = board.api.requests if board is not None else 0
         try:
             if oauth.status().get("connected"):
                 if board is None:
@@ -1298,13 +1371,23 @@ def run_worker(store: Any, stop_event: Any) -> None:
                 snap = overview_snapshot(store)
                 if snap.get("status") in {"ready", "empty"}:
                     result = board.sync(snap, system_lines=system_lines(snap, oauth.status()))
-                    _status({"ok": True, **result})
+                    _status({"ok": True, **result,
+                             "requests": board.api.requests - before,
+                             "cycle_seconds": round(time.monotonic() - started, 3),
+                             "retry_after_seconds": SYNC_INTERVAL_S})
+                    failures = 0
             else:
                 board = None
                 _status({"ok": False, "error": "not connected"})
         except Exception as exc:
+            failures += 1
+            delay = max(min(SYNC_INTERVAL_S * 2 ** min(failures - 1, 4), 900),
+                        float(getattr(exc, "retry_after_s", 0)))
             LOG.exception("ticktick board sync deferred")
             # The server log is not where anyone looks: fleet.cmd and Claude read this file.
-            _status({"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]})
+            _status({"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300],
+                     "requests": board.api.requests - before if board is not None else 0,
+                     "cycle_seconds": round(time.monotonic() - started, 3),
+                     "retry_after_seconds": delay, "consecutive_failures": failures})
             board = None  # fresh MCP session next time
-        stop_event.wait(SYNC_INTERVAL_S)
+        stop_event.wait(delay)

@@ -27,6 +27,10 @@ class Runner:
 
     def __call__(self, argv, **kwargs):
         args = tuple(str(a) for a in argv)
+        if "pytest" in args and "--collect-only" in args:
+            # This fixture contains only text files. Do not depend on pytest
+            # being installed in the machine's base Python outside this venv.
+            return subprocess.CompletedProcess(args, 5, "no tests collected\n", "")
         if (("-m" in args and "pytest" in args and "--collect-only" not in args)
                 or any(part.endswith("verify.py") for part in args)):
             work = Path(kwargs["cwd"])
@@ -102,7 +106,7 @@ def test_three_green_acceptances_one_candidate_three_attributed_commits(fleet):
     accepted(store, root, [f"part{i}.txt" for i in range(3)])
     results = integ.tick()
 
-    assert len(runner.candidates) == 1, runner.candidates
+    assert len(runner.candidates) == 1, json.dumps(results, ensure_ascii=False)
     assert runner.candidates == [("part0.txt", "part1.txt", "part2.txt")]
     commits = [e["payload"]["commit"] for e in results
                if e["kind"] == "integrate" and e["payload"].get("commit")]
@@ -123,7 +127,7 @@ def test_one_bad_is_deferred_with_failure_and_two_good_commits(fleet):
 
     assert len(runner.candidates) <= 4, runner.candidates
     by_tz = {e["tz"]: e["payload"] for e in results if e["kind"] == "integrate"}
-    assert by_tz["TZ-0"].get("commit")
+    assert by_tz["TZ-0"].get("commit"), by_tz["TZ-0"]
     assert by_tz["TZ-2"].get("commit")
     assert by_tz["TZ-1"]["reason_code"] == "batch_candidate_failed"
     assert "test_regression" in by_tz["TZ-1"]["reason"]
@@ -155,7 +159,7 @@ def test_unfinished_foreign_write_is_not_part_of_shared_train(fleet):
     output = integ.tick()
     by_tz = {e["tz"]: e["payload"] for e in output if e["kind"] == "integrate"}
 
-    assert runner.candidates == [("part0.txt", "part2.txt")]
+    assert runner.candidates == [("part0.txt", "part2.txt")], output
     assert by_tz["TZ-0"].get("commit") and by_tz["TZ-2"].get("commit")
     assert by_tz["TZ-1"]["waiting_for"] == ["TZ-WIP"]
     assert git(root, "rev-list", "--count", f"{base}..HEAD") == "2"

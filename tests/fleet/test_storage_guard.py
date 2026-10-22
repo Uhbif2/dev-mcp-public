@@ -114,6 +114,7 @@ def test_new_archive_allows_compacting_former_latest_local_backup(tmp_path, monk
     assert gzip.decompress(Path(str(old) + ".gz").read_bytes()) == final.read_bytes()
 
 
+@pytest.mark.production
 def test_installed_disk_reserve_does_not_block_small_build_tests(monkeypatch):
     import tomllib
     cfg = tomllib.loads((Path(__file__).parents[2] / "fleet-projects.toml").read_text(encoding="utf-8"))

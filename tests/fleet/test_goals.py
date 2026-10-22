@@ -1,6 +1,7 @@
 """Цели проектов (fleet-projects.toml) в памятке к задаче."""
 from __future__ import annotations
 
+import pytest
 import sys
 from pathlib import Path
 
@@ -28,6 +29,7 @@ def test_missing_or_broken_file_is_silent(tmp_path: Path, monkeypatch) -> None:
     assert goals.goal_block('Demo') == ''
 
 
+@pytest.mark.production
 def test_repo_file_has_fleet_projects() -> None:
     import os
     os.environ.pop('DEV_MCP_FLEET_PROJECTS', None)

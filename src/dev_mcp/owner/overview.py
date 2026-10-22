@@ -248,12 +248,18 @@ def _human_projection(rows: list[Any], evidence: dict[str, list[Any]],
                 (project + "\n" + action_text).encode("utf-8")).hexdigest()[:20]
             if (project, action_id) in completed:
                 continue
-            actions.append({
+            action = {
                 "project": project, "title": name,
                 "action_id": action_id,
                 "action": action_text, "default": default,
                 "reason": reason,
-            })
+            }
+            for label, key in (("срок:", "deadline"), ("время:", "duration_tag")):
+                value = next((part.partition(":")[2].strip() for part in chunks[1:]
+                              if part.casefold().startswith(label)), "")
+                if value:
+                    action[key] = value
+            actions.append(action)
             if len(actions) >= 30:
                 break
         if item["stages"].get("handed_over"):

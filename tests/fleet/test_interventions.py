@@ -1,6 +1,8 @@
 """TZ-48: manual evidence is captured once and leads to scoped remediation."""
 from __future__ import annotations
 
+import pytest
+
 import json
 import os
 from datetime import datetime, timezone
@@ -282,6 +284,7 @@ def test_lessons_are_seeded_without_copying_prose(tmp_path):
     assert classify(source[0]).startswith("lesson-")
 
 
+@pytest.mark.production
 def test_actual_russian_lessons_remain_distinct_failure_classes():
     source = Path(__file__).resolve().parents[2] / "docs" / "LESSONS-AUTONOMY-2026-10.md"
     items = lesson_interventions(source)
@@ -291,6 +294,7 @@ def test_actual_russian_lessons_remain_distinct_failure_classes():
     assert all("lesson-other" != classify(item) for item in items[:20])
 
 
+@pytest.mark.production
 def test_seed_full_lessons_once_and_keep_drafts_machine_readable(tmp_path):
     store, root, ledger = setup(tmp_path)
     source = Path(__file__).resolve().parents[2] / "docs" / "LESSONS-AUTONOMY-2026-10.md"

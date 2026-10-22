@@ -1,8 +1,16 @@
 [project]
 name = 'dev-mcp'
-version = '0.1.0'
-description = 'Узкий MCP-сервер для работы с кодом внутри разрешённых корней'
+version = '0.1.1'
+description = 'Policy-controlled MCP file and process server with an agent task fleet'
 requires-python = '>=3.11'
+classifiers = [
+    'Development Status :: 3 - Alpha',
+    'Operating System :: Microsoft :: Windows',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+]
 dependencies = [
     'fastmcp>=2.0',
     'psutil>=5.9',
@@ -23,3 +31,4 @@ packages = ['src/dev_mcp']
 
 [tool.pytest.ini_options]
 testpaths = ['tests']
+markers = ['production: requires the operator production policy, registry or machine setup']

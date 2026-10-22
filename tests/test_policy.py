@@ -353,6 +353,7 @@ def test_missing_policy_file_raises_policyerror(tmp_path: Path) -> None:
         Policy.load(tmp_path / 'нет-такого.toml')
 
 
+@pytest.mark.production
 def test_production_policy_closes_critical_names() -> None:
     """Страж боевого policy.toml.
 
@@ -383,6 +384,7 @@ def test_production_policy_closes_critical_names() -> None:
                 policy.resolve(str(root / name), for_write=False)
 
 
+@pytest.mark.production
 def test_production_policy_has_no_global_write() -> None:
     """Глобального права записи у внешнего профиля нет — только точечные write_roots."""
     config = Path(__file__).resolve().parents[1] / 'policy.toml'
@@ -391,6 +393,7 @@ def test_production_policy_has_no_global_write() -> None:
     assert policy.write_roots, 'ожидался хотя бы один write_root, иначе профиль полностью read-only'
 
 
+@pytest.mark.production
 def test_production_write_is_confined_to_write_roots() -> None:
     """Запись открыта ровно в объявленных папках, а корни с кодом остаются на чтение."""
     config = Path(__file__).resolve().parents[1] / 'policy.toml'
@@ -405,6 +408,7 @@ def test_production_write_is_confined_to_write_roots() -> None:
                 policy.resolve(str(root / 'посторонний.txt'), for_write=True)
 
 
+@pytest.mark.production
 def test_production_task_cwd_in_write_roots() -> None:
     """Каждая задача боевого policy.toml обязана резолвить свой cwd на запись:
     run_task делает это с for_write=True и иначе отказывает, хотя policy_info
