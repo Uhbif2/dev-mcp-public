@@ -190,6 +190,8 @@ def main() -> int:
     parser.add_argument('--project', default='Demo')
     parser.add_argument('--port', type=int, default=8766)
     parser.add_argument('--core-only', action='store_true')
+    parser.add_argument('--configuration-only', action='store_true',
+                        help='doctor: validate installation files before the first start')
     parser.add_argument('--manifest', type=Path, help='explicit existing autostart manifest; opt-in only')
     args = parser.parse_args()
     root = args.root.resolve()
@@ -218,8 +220,14 @@ def main() -> int:
                 result['ticktick_helper'] = (root / 'ticktick-connect.cmd').is_file()
                 if current:
                     result.update(probe(current[1]['port']))
+                result['ready'] = bool(result['configuration'] and result['ticktick_helper']
+                                       and result.get('initialize') and result.get('policy_info'))
                 result['remote_connection'] = 'verify authorized tunnel/gateway and ChatGPT separately'
         print(json.dumps(result, ensure_ascii=False))
+        if args.action == 'doctor':
+            if args.configuration_only:
+                return 0 if result['configuration'] and result['ticktick_helper'] else 1
+            return 0 if result['ready'] else 1
         return 0
     except (OSError, ValueError, RuntimeError) as exc:
         print(json.dumps({'error': str(exc)}, ensure_ascii=False), file=sys.stderr)

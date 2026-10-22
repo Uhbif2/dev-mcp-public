@@ -16,5 +16,5 @@ if (Get-Command uv -ErrorAction SilentlyContinue) {
 }
 & .venv\Scripts\python.exe tools\standalone.py init --workspace $Workspace --project $Project
 if ($LASTEXITCODE -ne 0) { throw 'Configuration already exists or is invalid; no overwrite performed' }
-& .venv\Scripts\python.exe tools\standalone.py doctor
+& .venv\Scripts\python.exe tools\standalone.py doctor --configuration-only
 exit $LASTEXITCODE

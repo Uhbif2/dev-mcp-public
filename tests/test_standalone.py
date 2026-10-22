@@ -60,3 +60,14 @@ def test_pid_reuse_cannot_authorize_stopping_another_process(standalone, tmp_pat
     (tmp_path / 'data/standalone-process.json').write_text(json.dumps(record))
     with pytest.raises(RuntimeError, match='identity changed'):
         standalone.identity(tmp_path)
+
+
+def test_doctor_does_not_report_ready_without_a_real_server(standalone, tmp_path, monkeypatch, capsys):
+    for name in ('policy.toml', 'machine.toml', 'fleet-projects.toml', 'ticktick-connect.cmd'):
+        (tmp_path / name).write_text('', encoding='utf-8')
+    monkeypatch.setattr(sys, 'argv', ['standalone.py', 'doctor', '--root', str(tmp_path)])
+    assert standalone.main() == 1
+    assert json.loads(capsys.readouterr().out)['ready'] is False
+    monkeypatch.setattr(sys, 'argv', ['standalone.py', 'doctor', '--root', str(tmp_path), '--configuration-only'])
+    assert standalone.main() == 0
+    assert json.loads(capsys.readouterr().out)['running'] is False
