@@ -23,7 +23,11 @@ from dev_mcp.operator_core import AdapterEvidence, Operator
 
 
 ITERATIONS = 20
-CLIENT_TIMEOUT_S = 2.0
+# This is a budget/idempotency stress test, not a two-second disk SLA.
+# Hosted Windows storage can spend >2s on reserve+complete fsync alone.
+# Keep a bounded wait below the production client's 30s default; dedicated
+# short-deadline tests in test_operator_ipc.py still exercise timeout refusal.
+CLIENT_TIMEOUT_S = 10.0
 
 
 def _make_operator(tmp_path: Path, *, max_calls: int = 2, adapter_delay_s: float = 0.008):

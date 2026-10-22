@@ -394,7 +394,7 @@
     "tests/operator/test_operator_catalog.py": "72c0d3dd47abff92cb55c7105928c1e7ffcc1cc765b1b4c5f5250c7d7f8d015c",
     "tests/operator/test_operator_core.py": "4b959943cba146a9504c163e8b1bd407c9e1017000b05685ceab89c058bebc9b",
     "tests/operator/test_operator_ipc.py": "e910c6ba378501d7acc146b9992f701bc1cdf747c6f576d042331fc360c422bb",
-    "tests/operator/test_operator_ipc_guard_stress.py": "a989fe2e843bfc6b9f89aacf42ed27dd3f4f03d9943f582dfcb647a4c54a7c83",
+    "tests/operator/test_operator_ipc_guard_stress.py": "98ca64992ed2ba34017c3444490694171e9e0f908a147082ec77efa8457eaff4",
     "tests/operators/adapters/test_device_screens_integration.py": "1fdbf1e6ea7d788e84e2078ef06b8683606013e6614f4915f14a97b9a0d3a264",
     "tests/operators/adapters/test_gateway.py": "6417206f6b82883c027fbb3aef6be8a6040e2e06b0fd5b0a8b2743abef818ccd",
     "tests/operators/adapters/test_runtime.py": "f771dd475ff0f36029800f32c0daeba265167fabb579ce5849379f5c31654db0",
