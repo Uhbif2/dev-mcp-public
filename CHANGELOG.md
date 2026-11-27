@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 — 2026-11-27
+
+### Fixed
+- `python -m dev_mcp --check` and other diagnostics no longer crash with `UnicodeEncodeError` on a non-UTF-8 console (English/European Windows): stdout/stderr are UTF-8.
+- A project lead's compact first screen again shows its focus: an open, unintegrated delivery and the first step.
+- The candidate-gate cache notices new files in dependency folders (`deps`), even when the folder's own timestamp does not change.
+- Tests: UTF-8 reads, nightly fixtures independent of the machine's time zone, interpreter-independent gate and timing tests, stale expectations updated.
+
 ## 0.2.0 — 2026-11-27
 
 ### Added

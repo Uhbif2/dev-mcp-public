@@ -118,7 +118,7 @@ def test_absent_or_unattested_baseline_never_accuses(tmp_path):
     missing = analyze(ctx, baseline=False)
     assert (missing.cause_code, missing.reason_code) == ("unknown", "baseline_missing")
     assert ctx[6] == ctx[7] == []
-    assert any(json.loads(f.read_text())["reason_code"] == "baseline_missing"
+    assert any(json.loads(f.read_text(encoding="utf-8"))["reason_code"] == "baseline_missing"
                for f in ctx[0].journal.root.glob("*.json"))
     corrupted = ctx[1].root / ctx[1].verify_evidence(ctx[2]).artifact_path / "stdout.bin"
     corrupted.write_bytes(b"tampered")

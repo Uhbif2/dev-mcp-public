@@ -114,7 +114,9 @@ async def test_real_entrypoint_keeps_mcp_available_with_missing_project(tmp_path
     check = subprocess.run(
         [sys.executable, '-m', 'dev_mcp', '--policy', str(cfg), '--check'],
         cwd=repo, capture_output=True, timeout=30,
-        env={**os.environ, 'PYTHONPATH': str(repo / 'src')},
+        # cp1252 console: Cyrillic diagnostics once crashed here (public CI, 27.11).
+        env={**os.environ, 'PYTHONPATH': str(repo / 'src'),
+             'PYTHONIOENCODING': 'cp1252', 'PYTHONUTF8': '0'},
     )
     assert check.returncode == 1  # Operator validation still catches retired paths.
     assert b'write_root' in check.stdout

@@ -71,7 +71,7 @@ def test_all_five_scenarios_prove_recovery_on_versioned_evidence(tmp_path):
         assert entry["elapsed_seconds"] >= 0
         assert entry["cleanup"] == "removed" and entry["report_digest"]
     assert not list(root.glob("case-*"))
-    assert json.loads((root / "reports" / "2026-10-09.json").read_text()) == report
+    assert json.loads((root / "reports" / "2026-10-09.json").read_text(encoding="utf-8")) == report
     assert SCHEDULER_CONTRACT["cadence"] == "daily"
 
 
@@ -141,7 +141,7 @@ def test_modified_cached_report_is_not_accepted_as_recovery(tmp_path):
     root = sandbox(tmp_path)
     run_daily(root, now=NOW)
     path = root / "reports" / "2026-10-09.json"
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     data["scenarios"][0]["evidence"][-1]["digest"] = "0" * 64
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(DrillSafetyError, match="cached drill report"):

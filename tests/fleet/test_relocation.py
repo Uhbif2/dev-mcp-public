@@ -112,7 +112,7 @@ def test_identity_collision_refuses_plan(moved):
 def test_wrong_component_origin_refuses_plan(moved):
     store, name, old, new, spec, _ = moved
     path = new / 'component.json'
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     data['origin']['external_id'] = 'another-owner-intent.md'
     path.write_text(json.dumps(data))
     with pytest.raises(relocation.RelocationError, match='origin/identity'):

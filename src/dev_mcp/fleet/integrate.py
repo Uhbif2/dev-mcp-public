@@ -1969,7 +1969,22 @@ class Integrator:
             stamps = {}
             for name, path in sorted(deps.items()):
                 st = path.stat()
-                stamps[name] = [str(path), st.st_mtime_ns, st.st_size]
+                stamp: list = [str(path), st.st_mtime_ns, st.st_size]
+                if path.is_dir():
+                    # 27.11 (публичный CI): mtime каталога на NTFS не всегда меняется в тот же
+                    # тик, когда в нём появился файл, — в ключ идут и непосредственные дети.
+                    children = []
+                    with os.scandir(path) as it:
+                        for entry in it:
+                            try:
+                                cst = entry.stat(follow_symlinks=False)
+                            except OSError:
+                                continue
+                            children.append([entry.name, cst.st_mtime_ns, cst.st_size])
+                            if len(children) >= 2000:
+                                break
+                    stamp.append(sorted(children))
+                stamps[name] = stamp
             config = [str(info.get('gate') or ''), str(info.get('candidate_gate') or ''),
                       list(info.get('deps') or ()), stamps]
             key = hashlib.sha256(json.dumps(

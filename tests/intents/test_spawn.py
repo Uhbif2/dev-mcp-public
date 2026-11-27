@@ -67,7 +67,7 @@ def test_repeat_same_revision_and_update_create_only_new_tree(env):
     assert not again.created and again.tree == first.tree
     updated = spawn(root, store, source(root, revision="r2"), size="small")
     assert updated.created and updated.tree.root_id != first.tree.root_id
-    assert json.loads((updated.directory / "component.json").read_text())["component_id"]
+    assert json.loads((updated.directory / "component.json").read_text(encoding="utf-8"))["component_id"]
     with store.read() as tx:
         assert tx.scalar("SELECT COUNT(*) FROM outcomes") == len(first.tree.nodes) * 2
 
@@ -188,7 +188,7 @@ def test_project_collision_and_modified_manifest_cannot_be_overwritten(env):
     (existing / "component.json").write_text("{}")
     with pytest.raises(SpawnError, match="different intent"):
         spawn(root, store)
-    assert json.loads((existing / "component.json").read_text()) == {}
+    assert json.loads((existing / "component.json").read_text(encoding="utf-8")) == {}
 
 
 def test_existing_symlink_project_and_alias_root_rejected(env, tmp_path):

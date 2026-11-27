@@ -46,7 +46,7 @@ def test_autostart_install_remove_preserves_other_entries_and_data(standalone, t
     observed = json.loads(manifest.read_text(encoding='utf-8'))
     assert observed['items'][0] == original['items'][0]
     assert observed['items'][1]['start']['hidden'] is True
-    assert json.loads(Path(proof['backup']).read_text()) == original
+    assert json.loads(Path(proof['backup']).read_text(encoding="utf-8")) == original
     standalone.autostart(root, manifest, 18766, remove=True)
     assert json.loads(manifest.read_text(encoding='utf-8')) == original
     assert Path(proof['backup']).exists()

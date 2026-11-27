@@ -79,7 +79,7 @@ def test_journal_fsync_and_phase_order(guarded, monkeypatch):
     assert [e["code"] for e in entries][-1] == "deployed"
     assert observed
     assert guard._known_good_logged(candidate)
-    pulse = json.loads((guard.config.live / "data/guard-heartbeat.json").read_text())
+    pulse = json.loads((guard.config.live / "data/guard-heartbeat.json").read_text(encoding="utf-8"))
     assert pulse["pid"] == os.getpid() and pulse["candidate"] == candidate
 
 

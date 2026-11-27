@@ -75,6 +75,13 @@ def _describe_plain(policy: Policy, policy_path: str) -> str:
 
 
 def main() -> int:
+    # 27.11: Cyrillic diagnostics crashed `--check` with UnicodeEncodeError on a cp1252
+    # console (public CI, any non-Russian Windows). MCP stdio is UTF-8 JSON anyway.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
     from dev_mcp import winproc
     winproc.install()  # 13.10: без консолей у детей — нет окон 0xc0000142 у владельца
     try:

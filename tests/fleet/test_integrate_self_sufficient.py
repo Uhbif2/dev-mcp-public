@@ -200,7 +200,7 @@ def test_project_with_pytest_gate_collects_tests_from_candidate(ctx) -> None:
     git(root, 'commit', '-q', '-m', 'working test baseline')
     (root / 'src' / 'pkg' / 'missing.py').write_text('item = 2\n', encoding='utf-8')
     integ = Integrator(store, root.parent / 'cursor.json',
-                       project_info=lambda _: {'commit': True, 'gate': 'pytest -q'})
+                       project_info=lambda _: {'commit': True, 'gate': f'"{sys.executable}" -m pytest -q'})
     candidate.write_text('from pkg.missing import item\n', encoding='utf-8')
     task(store, 'TZ-A', [candidate])
     accept(store, 'TZ-A')
@@ -217,7 +217,7 @@ def test_unrelated_root_test_collection_failure_does_not_block_candidate(ctx) ->
     git(root, 'add', '-A')
     git(root, 'commit', '-q', '-m', 'pre-existing collection error')
     integ = Integrator(store, root.parent / 'cursor.json',
-                       project_info=lambda _: {'commit': True, 'gate': 'pytest -q'})
+                       project_info=lambda _: {'commit': True, 'gate': f'"{sys.executable}" -m pytest -q'})
     changed = root / 'src' / 'pkg' / 'shared.py'
     changed.write_text('result = 3\n', encoding='utf-8')
     task(store, 'TZ-A', [changed])

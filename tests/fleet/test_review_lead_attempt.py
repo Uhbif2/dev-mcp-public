@@ -17,6 +17,10 @@ def test_rejected_lead_milestone_returns_charter_instead_of_fix_round(tmp_path, 
     from dev_mcp.fleet import generators
     generation_enabled = [True]
     monkeypatch.setattr(generators, "enabled", lambda: generation_enabled[0])
+    # Receipts for L1→L2 are covered by test_lead_stages; here only the reject path matters.
+    from dev_mcp.fleet import lead_stages
+    monkeypatch.setattr(lead_stages, "validate_transition",
+                        lambda *a, **k: lead_stages.StageVerdict(lead_stages.LeadStage.L2))
     root = tmp_path / "Proj"
     (root / "ToDo" / "lead").mkdir(parents=True)
     (root / "ToDo" / "lead" / "LEDGER.json").write_text(

@@ -26,6 +26,8 @@ os.environ.setdefault('DEV_MCP_FLEET_GATE_LOCK', '0')
 os.environ['DEV_MCP_FRAME_CHECK'] = '0'
 # Снимок сдачи (fleet/snapshot.py) идёт фоновым потоком с git: в тестах выключен, свои тесты зовут его явно.
 os.environ.setdefault('DEV_MCP_FLEET_SUBMIT_SNAPSHOT', '0')
+# Ночные фикстуры написаны в MSK; продукт берёт пояс машины (CI — UTC). Тесты пояса меняют его сами.
+os.environ['DEV_MCP_NIGHTLY_TZ_OFFSET'] = '3'
 
 
 @pytest.fixture(autouse=True)

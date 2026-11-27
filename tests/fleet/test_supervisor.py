@@ -377,9 +377,9 @@ def test_partial_extension_receipt_preserves_snapshot_and_completed_tick(tmp_pat
     supervisor.record_extension_heartbeat(store,version='0.19.2',tabs=3,pending=1,
                                           enabled=True,runnable=2,tick_completed=True)
     path=Path(store.path).with_name(supervisor.STATUS_FILE)
-    before=json.loads(path.read_text())['extension']
+    before=json.loads(path.read_text(encoding="utf-8"))['extension']
     supervisor.record_extension_heartbeat(store)
-    after=json.loads(path.read_text())['extension']
+    after=json.loads(path.read_text(encoding="utf-8"))['extension']
     assert {k:after[k] for k in before if k!='seen_at'}=={k:v for k,v in before.items() if k!='seen_at'}
 
 
@@ -487,7 +487,7 @@ def test_progress_after_wake_cancels_escalation(tmp_path, monkeypatch):
         extension_reloader=lambda: actions.append("reload") or True,
     )
     assert actions == ["wake"]
-    data = json.loads(Path(store.path).with_name(supervisor.STATUS_FILE).read_text())
+    data = json.loads(Path(store.path).with_name(supervisor.STATUS_FILE).read_text(encoding="utf-8"))
     assert data["recovery"]["wake_at"] is None
     assert "supervisor=control-unreachable" in supervisor.status_line(store)
 

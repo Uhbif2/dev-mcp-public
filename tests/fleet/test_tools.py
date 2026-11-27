@@ -1297,7 +1297,7 @@ def test_owner_console_needs_password_and_stays_inside_its_command_list(tmp_path
     console = _tool_fn(server, "fleet_owner")
 
     assert "worker_id: W1" in fleet_join("owner-tab")
-    refused = console("W1", "active")
+    refused = console("W1", "metrics")
     assert "owner-grant W1" in refused and "demo/TZ-1" not in refused
 
     set_password(secret_path(tmp_path), "correct-horse-battery")
@@ -1323,7 +1323,7 @@ def test_owner_console_needs_password_and_stays_inside_its_command_list(tmp_path
         assert tx.one("SELECT state FROM tasks WHERE project='demo' AND tz='TZ-1'")["state"] == "ready"
         assert tx.one("SELECT state FROM tasks WHERE project='demo' AND tz='TZ-2'")["state"] == "submitted"
     assert "Сессия владельца закрыта" in console("W1", "lock")
-    assert "owner-grant W1" in console("W1", "active")
+    assert "owner-grant W1" in console("W1", "metrics")
 
     # пароль не попадает в аудит
     assert "correct-horse-battery" not in audit.path.read_text(encoding="utf-8")

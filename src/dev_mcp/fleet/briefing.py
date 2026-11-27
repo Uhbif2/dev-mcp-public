@@ -355,10 +355,18 @@ def _lead_brief(store: Any, worker_id: str, task: Task, rules: str, spec: str,
             value = re.sub(r"\bO-[\w.\-]+\b", "текущее обязательство", value)
         return value[:limit].rstrip()
 
+    # 27.11: компактный экран (W10, 18.11) потерял фокус ведущего — открытую поставку
+    # (gate_launch_failed и т.п.) и первый шаг. Возвращаем статус + первую подсказку, ≤1200.
+    from . import lead_focus
+    status_count = len(lead_focus.lines(store, task.project))
+    focus = lead_focus.brief_lines(store, task.project)[:status_count + 1]
+    focus_text = "\n".join(focus)[:1200].rstrip()
+
     lines = [
         brief_field(goal[0], 230) if goal else f"Цель проекта {task.project}: см. устав.",
         f"Ведущий {task.project} · {task.tz} · worker {worker_id}",
         window[0][:320],
+        *([focus_text] if focus_text else []),
         brief_field(blocker),
         brief_field(window[2]),
         "Оркестрация: fleet_quick new/say для быстрых задач; "
@@ -371,7 +379,7 @@ def _lead_brief(store: Any, worker_id: str, task: Task, rules: str, spec: str,
     if memory:
         lines.append("Правила памяти (полный текст — по запросу): " +
                      brief_field(memory, 380))
-    return "\n".join(lines)[:_LEAD_BRIEF_LIMIT]
+    return "\n".join(lines)[:_LEAD_BRIEF_LIMIT + len(focus_text)]
 
 
 def _reject_history_lines(store: Any, task: Task) -> list[str]:

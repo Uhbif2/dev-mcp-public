@@ -34,7 +34,7 @@ def test_exhausted_replace_does_not_clobber_existing(tmp_path: Path):
     with patch("dev_mcp.json_book.os.replace", side_effect=PermissionError):
         with pytest.raises(PermissionError):
             write_json(path, {"new": 1}, attempts=2, delay=0)
-    assert json.loads(path.read_text()) == {"old": True}
+    assert json.loads(path.read_text(encoding="utf-8")) == {"old": True}
     assert not list(tmp_path.glob('.book.json.*.tmp'))
 
 

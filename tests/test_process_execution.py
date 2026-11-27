@@ -25,7 +25,7 @@ def parent(tmp_path: Path, *, parent_sleep=30) -> tuple[list[str], Path]:
 
 
 def assert_gone(marker: Path):
-    child=json.loads(marker.read_text())['pid']
+    child=json.loads(marker.read_text(encoding="utf-8"))['pid']
     try:
         process=psutil.Process(child)
         process.wait(timeout=2)
@@ -36,9 +36,10 @@ def assert_gone(marker: Path):
 def test_timeout_bounds_inherited_pipe_and_reaps_grandchild(tmp_path):
     argv,marker=parent(tmp_path)
     started=time.monotonic()
-    result=run_command(argv,cwd=tmp_path,timeout_s=0.7)
+    # 3 s: a cold interpreter (uv-managed Python, CI) may need >0.7 s before its first print.
+    result=run_command(argv,cwd=tmp_path,timeout_s=3)
     assert result.outcome=='timed_out'
-    assert time.monotonic()-started<3
+    assert time.monotonic()-started<6
     assert 'partial output' in result.stdout
     assert_gone(marker)
 

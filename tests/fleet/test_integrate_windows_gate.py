@@ -210,6 +210,6 @@ def test_candidate_collection_uses_current_candidate_not_global_baseline(tmp_pat
         assert cwd != root and candidate_bytes == "def test_value(): assert 2 == 2\n"
         candidate.write_text("import missing_new_candidate_dependency\n", encoding="utf-8")
         ok, reason = manager._candidate(str(root), ["tests/test_candidate.py"], "P")
-        assert not ok and "gate_launch_failed" in reason
+        assert not ok and "pytest_collection_failed" in reason
     finally:
         store.close()
