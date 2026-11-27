@@ -55,7 +55,10 @@ def test_retarget_commit_defaults_use_authorized_registered_root(tmp_path, monke
     outcome.create_outcome(store, project='canonical-intent-hash', title='root',intent_id='i',
                            spec=origin, evidence_spec={'kind':'run'},
                            authority={'project_roots':[str(tmp_path)]},outcome_id='root')
+    goals._INTENT_DEFAULTS.clear()
     assert goals._intent_project_defaults('canonical-intent-hash') == {'commit':True}
     (root/'component.json').write_text(json.dumps({'kind':'intent-outcome-tree','origin':{}}))
+    assert goals._intent_project_defaults('canonical-intent-hash') == {'commit':True}  # 60 с из памяти
+    goals._INTENT_DEFAULTS.clear()
     assert goals._intent_project_defaults('canonical-intent-hash') == {}
     store.close()

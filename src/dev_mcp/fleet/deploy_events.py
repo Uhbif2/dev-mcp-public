@@ -121,8 +121,9 @@ def _thaw(tx: Any, candidate: str, deployed_at: str, receipt: str) -> int:
         # policy in queue.thaw_frozen, after this trusted receipt is recorded.
         # Legacy blocks retain the existing exactly-matched thaw contract.
         registered = data.get("reactivate_policy")
+        # operator_condition (04.11.2026, I3): деплой не лечит условие среды — ждать оператора.
         if (isinstance(registered, dict) and registered.get("kind") in
-                {"platform_deploy_commit", "platform_deploy_after"}):
+                {"platform_deploy_commit", "platform_deploy_after", "operator_condition"}):
             continue
         wanted = _criterion(data)
         if wanted is None:

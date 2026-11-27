@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from dev_mcp.fleet import gemini, outcome
+from dev_mcp.fleet import outcome
 from dev_mcp.fleet.store import Store
 from dev_mcp.intents import stages
 from dev_mcp.intents.sources.model import IntentEnvelope
@@ -58,64 +58,6 @@ def _events(store, kind):
         return [json.loads(row["payload"]) for row in tx.query(
             "SELECT payload FROM events WHERE kind=? AND project='StageCase'",
             (kind,))]
-
-
-def test_external_outage_keeps_accepted_and_recovers_same_submission(case, monkeypatch):
-    store, node, tz, root = case
-    online = {"up": False}
-    calls = []
-    monkeypatch.setattr(gemini, "_listening", lambda: online["up"])
-    monkeypatch.setattr(gemini, "last_error", lambda: {"code": "network_error"})
-    def ask(*args, **kwargs):
-        calls.append(1)
-        return {"verdict": "approve", "critique": "All good"} if online["up"] else None
-    monkeypatch.setattr(gemini, "ask", ask)
-
-    assert stages.prove_once(store) == 0
-    assert _task(store, tz)["state"] == "accepted"
-    assert len(calls) == 1
-    waiting = _events(store, "intent.stage_waiting_external")
-    assert len(waiting) == 1 and waiting[0]["kind"] == "external_pending"
-    assert waiting[0]["digest"]
-    assert not _events(store, "intent.stage_reopened")
-
-    # No blind 60-second poll that calls Gemini again for an unchanged artifact/service.
-    assert stages.prove_once(store) == 0
-    assert len(calls) == 1
-    online["up"] = True
-    assert stages.prove_once(store) == 1
-    assert len(calls) == 2
-    assert outcome.get_outcome(store, node.identifier).state == "done"
-    assert _task(store, tz)["state"] == "accepted"
-    assert _events(store, "intent.stage_external_resumed")
-
-
-def test_changed_artifact_bypasses_external_backoff(case, monkeypatch):
-    store, node, tz, root = case
-    monkeypatch.setattr(gemini, "_listening", lambda: False)
-    monkeypatch.setattr(gemini, "last_error", lambda: {"code": "relay_unavailable"})
-    calls = []
-    monkeypatch.setattr(gemini, "ask", lambda *args, **kwargs: calls.append(1) or None)
-    assert stages.prove_once(store) == 0
-    (root / "intent" / "consensus" / "understood.md").write_text(
-        "a new submitted artifact revision", encoding="utf-8")
-    assert stages.prove_once(store) == 0
-    assert len(calls) == 2
-    assert _task(store, tz)["state"] == "accepted"
-    assert len(_events(store, "intent.stage_waiting_external")) == 2
-
-
-def test_real_revise_reopens_author_with_critique(case, monkeypatch):
-    store, _node, tz, _root = case
-    monkeypatch.setattr(gemini, "_listening", lambda: True)
-    monkeypatch.setattr(gemini, "ask", lambda *args, **kwargs: {
-        "verdict": "revise", "critique": "Missing independent evidence"})
-    assert stages.prove_once(store) == 0
-    task = _task(store, tz)
-    assert task["state"] == "ready"
-    assert "Missing independent evidence" in task["body"]
-    assert _events(store, "intent.stage_reopened")
-    assert not _events(store, "intent.stage_waiting_external")
 
 
 def test_platform_exception_creates_single_repair_without_reopening(case, monkeypatch,

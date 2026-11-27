@@ -11,6 +11,23 @@ from types import SimpleNamespace
 
 import pytest
 
+
+def test_partial_dependency_link_failure_removes_only_created_links(tmp_path,monkeypatch):
+    from dev_mcp.fleet import exec_preflight
+    outside=tmp_path/'outside';outside.mkdir()
+    (outside/'keep.txt').write_text('live dependency',encoding='utf-8')
+    work=tmp_path/'snapshot';work.mkdir()
+    create=exec_preflight.link_dir
+    def fail_second(source,target):
+        if target.name=='second':
+            raise OSError('synthetic junction creation failure')
+        return create(source,target)
+    monkeypatch.setattr(exec_preflight,'link_dir',fail_second)
+    with pytest.raises(OSError,match='synthetic junction'):
+        exec_preflight.link_deps(work,{'first':outside,'second':outside})
+    assert not (work/'first').exists()
+    assert (outside/'keep.txt').read_text()=='live dependency'
+
 from dev_mcp.fleet.exec_preflight import (
     EXECUTABLE_SOURCES, ConfigActivation, PreflightResult,
     install_verified, inventory, parse_command, preflight_gate, run_command,
@@ -488,7 +505,7 @@ def test_integrator_candidate_preflights_gate_before_commit(tmp_path: Path) -> N
             project_info=lambda _: {"gate": "definitely-not-installed-executable-xyz"},
         )
         ready, reason = failing._candidate(str(root), ["src/candidate.py"], "P")
-        assert not ready and "exec_preflight: gate_launch_failed" in reason
+        assert not ready and reason == "launch_error"
         assert git("rev-parse", "HEAD").stdout.strip() == initial_sha
         assert source.read_text(encoding="utf-8") == "result = 2\n"
 
@@ -575,3 +592,17 @@ def test_preflight_links_ignored_deps_without_snapshotting_them(tmp_path: Path) 
     assert linked.ok, linked
     # The link is gone and the dependency itself is intact.
     assert (root / "vendor" / "libx" / "__init__.py").is_file()
+
+
+def test_ignored_single_file_dep_is_copied_into_work_tree(tmp_path):
+    from dev_mcp.fleet import exec_preflight
+    root=tmp_path/'root'; (root/'app'/'android').mkdir(parents=True)
+    (root/'app'/'android'/'local.properties').write_text('sdk.dir=X\n',encoding='utf-8')
+    deps=exec_preflight.project_deps(root,('app/android/local.properties','missing.txt'))
+    assert list(deps)==['app/android/local.properties']
+    work=tmp_path/'work'; work.mkdir()
+    links=exec_preflight.link_deps(work,deps)
+    copied=work/'app'/'android'/'local.properties'
+    assert links==[] and copied.read_text(encoding='utf-8')=='sdk.dir=X\n'
+    copied.write_text('changed',encoding='utf-8')
+    assert (root/'app'/'android'/'local.properties').read_text(encoding='utf-8')=='sdk.dir=X\n'

@@ -111,7 +111,7 @@ def main() -> int:
         parser.error('--port must be between 1 and 65535')
 
     try:
-        policy = Policy.load(opts.policy)
+        policy = Policy.load(opts.policy, allow_unavailable_roots=not opts.check)
     except (PolicyError, OSError) as exc:
         stream = sys.stdout if opts.check else sys.stderr
         print(f'[X] policy.toml НЕ загружена ({opts.policy}):\n    {exc}', file=stream)
@@ -125,6 +125,11 @@ def main() -> int:
         return 0
 
     audit = Audit(opts.audit)
+    if policy.unavailable_roots:
+        audit.record('policy_unavailable_roots', {'roots': policy.unavailable_roots},
+                     decision='deny', reason='missing directories quarantined; other tools remain available')
+        print('dev-mcp: недоступные каталоги отключены до policy_reload: '
+              + '; '.join(policy.unavailable_roots), file=sys.stderr)
     audit.record(
         'server_start',
         {
@@ -153,6 +158,8 @@ def main() -> int:
             decision='allow' if ok else 'deny', reason=message,
         )
         tag = 'перечитан' if ok else f'ОШИБКА, старая политика в силе: {message}'
+        if ok and policy.unavailable_roots:
+            tag += '; недоступные каталоги отключены: ' + '; '.join(policy.unavailable_roots)
         print(f'dev-mcp: policy.toml изменился — {tag}', file=sys.stderr)
 
     stop_watch = threading.Event()

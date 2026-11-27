@@ -1,7 +1,7 @@
 """Intent-oriented, explicitly evidenced quality lens catalog.
 
 A lens is complete only after two independent clean observations. Visual lenses
-need actual pixels, an Operator capture proof and Gemini analysis.
+need actual pixels, an Operator capture proof and a visual judge.
 """
 from __future__ import annotations
 

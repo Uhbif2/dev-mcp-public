@@ -238,7 +238,9 @@ def open_mining(store: Any, *, now: datetime | None = None) -> list[str]:
     with store.read() as tx:
         roots = {str(r["name"]): str(r["root"]) for r in tx.query("SELECT name,root FROM projects WHERE active=1")}
     for project, root in roots.items():
-        with store.tx() as tx:
+        # Historical pool/dedup scans are read-only and can take seconds on a
+        # large journal. Keep them off the global writer gate.
+        with store.read() as tx:
             items = pool(tx, project)
             if len(items) < POOL_N:
                 continue
@@ -286,7 +288,6 @@ def open_mining(store: Any, *, now: datetime | None = None) -> list[str]:
                     notes.append(f"- [{item['ev']}] {row['ts'][:10]} {row['tz']}: "
                                  + str(_j(row["payload"]).get("note") or "")[:700])
             known = [f"- {x['id']}: {x['class']}" for x in catalog(tx, project)]
-            Path(root, "ToDo", "lessons").mkdir(parents=True, exist_ok=True)
             body = "\n".join([
                 f"Задача-суждение. В {project} ревьюер {len(items)} раз отклонил работу, которую штатная приёмка "
                 "пропустила; оракул счёл эти отказы общими способами ошибиться, а не разовыми недоделками.",
@@ -312,9 +313,32 @@ def open_mining(store: Any, *, now: datetime | None = None) -> list[str]:
                 "Файлы уроков вне `ToDo/lessons/` не пиши, код проекта и ТЗ не правь. В note сдачи — одно "
                 "предложение: сколько классов выделено.",
             ])
-            tz = judgment._insert(tx, project, subject, f"Суждение: классы дефектов, которые пропускает приёмка ({project})",
-                                  body, [judgment._abs(root, "ToDo/lessons/**")], 2,
-                                  extra={"pool": ids, "pool_fingerprint": fingerprint})
+            version = int(tx.scalar(
+                "SELECT COALESCE(MAX(id),0) FROM events WHERE project=?", (project,)
+            ) or 0)
+        # Filesystem preflight may block (network share, antivirus); no Store.tx
+        # is held here. The version check below makes stale preparations retry.
+        Path(root, "ToDo", "lessons").mkdir(parents=True, exist_ok=True)
+        owns = [judgment._abs(root, "ToDo/lessons/**")]
+        with store.tx() as write:
+            current = int(write.scalar(
+                "SELECT COALESCE(MAX(id),0) FROM events WHERE project=?", (project,)
+            ) or 0)
+            active = write.one(
+                "SELECT root FROM projects WHERE name=? AND active=1", (project,)
+            )
+            if current != version or active is None or str(active["root"]) != root:
+                continue
+            if (project, subject) in judgment._open_subjects(write):
+                continue
+            if judgment._spent_today(write, project, now) >= judgment.DAILY_BUDGET:
+                continue
+            tz = judgment._insert(
+                write, project, subject,
+                f"Суждение: классы дефектов, которые пропускает приёмка ({project})",
+                body, owns, 2,
+                extra={"pool": ids, "pool_fingerprint": fingerprint},
+            )
             opened.append(f"{project}/{tz}")
     return opened
 

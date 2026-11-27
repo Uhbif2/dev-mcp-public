@@ -61,6 +61,15 @@ class FleetContext:
         if self.owner is None:
             return False
         try:
+            from . import quick
+            if quick.is_quick_agent(agent):
+                # Быстрый агент наследует роль владельца задачи (15.11): Claude Code — да,
+                # агент с выданной ролью — пока она у него есть; закрытый — нет.
+                job = quick.lookup(quick.Book(Path(str(self.store.path)).parent), agent)
+                if not job or job.get("state") == "closed":
+                    return False
+                parent = str(job.get("owner") or "")
+                return parent == "claude" or (parent.startswith("W") and bool(self.owner.is_owner(parent)))
             return bool(self.owner.is_owner(agent))
         except Exception:
             return False
@@ -351,9 +360,12 @@ class FleetContext:
             return source, source, None
         project_settings = goals.project_info(str(held["project"]))
         with self.store.read() as tx:
+            # 08.11: на каждую запись агента; по индексу воркера и сразу нужный claim — 84–310 мс
+            # (все take проекта) → <1 мс.
             saved = tx.query(
-                "SELECT payload FROM events WHERE kind='take' AND worker_id=? AND project=? "
-                "ORDER BY id DESC", (agent, str(held["project"])),
+                "SELECT payload FROM events INDEXED BY events_worker_ts WHERE worker_id=? "
+                "AND kind='take' AND project=? AND json_extract(payload,'$.claim_id')=? LIMIT 1",
+                (agent, str(held["project"]), int(held["id"])),
             )
         durable_isolated = False
         for row in saved:
@@ -778,9 +790,20 @@ class FleetContext:
         worker_id = str(agent or "").strip()
         if not worker_id:
             return ""
+        # Quick agents have no fleet_take. A server restart can interrupt the
+        # outstanding park request: restore its durable lease and put the
+        # instruction in the response to ANY tool carrying agent=Q...
+        park_hint = ""
+        try:
+            from . import quick
+            if quick.is_quick_agent(worker_id):
+                park_hint = quick.park_restart_notice(
+                    quick.Book(Path(str(self.store.path)).parent), worker_id)
+        except Exception:
+            pass  # An advisory recovery hint must never hide a tool result.
         inbox = self.module("inbox")
         if inbox is None:
-            return ""
+            return park_hint
         try:
             hazard = self.module("hazard")
             if hazard is not None:
@@ -795,7 +818,7 @@ class FleetContext:
         except Exception:
             text = ""
         steer = self.steering(worker_id)
-        return f"{steer}\n{text}" if steer and text else steer or text
+        return "\n".join(part for part in (park_hint, steer, text) if part)
 
     def schedule_hazard(self, hazard: Any, worker_id: str) -> None:
         """Bound advisory work independently of the response path and traffic."""
@@ -976,6 +999,10 @@ def _dedupe_autostart_workers(ctx: FleetContext, only_label: str = "") -> list[s
                 },
             )
             merged.append(f"{label}: {', '.join(duplicates)} → {canonical_id}")
+            # Роль владельца переходит на оставшийся номер той же вкладки (20.11.2026).
+            from .owner import carry_grant
+            for duplicate_id in duplicates:
+                carry_grant(ctx.store, duplicate_id, canonical_id)
     return merged
 
 
@@ -1002,9 +1029,13 @@ def _repair_dedupe_heartbeats(ctx: FleetContext) -> list[str]:
     # Поиск — снимком без замка записи (07.10.2026: этот шаг идёт на каждом fleet_list/take, обходит
     # всех воркеров и почти никогда ничего не пишет, а держал замок записи до 7 с за раз).
     with ctx.store.read() as tx:
+        # Only canonical workers with an actual dedupe event can need this
+        # one-time historical repair. Scanning 5,500+ unrelated tab workers and
+        # issuing an events lookup for each consumed ~300 ms each idle tick.
         workers = [dict(row) for row in tx.query(
             """SELECT id,label,first_seen,last_seen FROM workers
-               WHERE revoked_at IS NULL AND kind='chatgpt'"""
+               WHERE revoked_at IS NULL AND kind='chatgpt'
+                 AND id IN (SELECT worker_id FROM events WHERE kind='worker_dedupe')"""
         )]
         for worker in workers:
             worker_id = str(worker["id"])
@@ -1086,6 +1117,30 @@ def _repair_dedupe_heartbeats(ctx: FleetContext) -> list[str]:
             )
             repaired.append(f"{label}/{worker_id}")
     return repaired
+
+
+# 24.11.2026 (владелец): ТЗ регистрирует любой агент, которого запустила НЕ система. Системные —
+# чаты, открытые расширением (метка fMMDD-HHMMxxx), быстрые агенты (kind=quick, Q-теги, ночное
+# ревью). Остальные — чаты и клиенты владельца: им эти команды пульта открыты без роли владельца.
+SELF_STARTED_COMMANDS = ("bootstrap", "status", "active", "report")
+
+
+def _self_started(ctx: FleetContext, agent: str) -> bool:
+    from . import quick
+    agent = str(agent or "").strip()
+    if not agent or quick.is_quick_agent(agent):
+        return False
+    try:
+        with ctx.store.read() as tx:
+            row = tx.one("SELECT label,kind FROM workers WHERE id=?", (agent,))
+    except Exception:
+        return False
+    if row is None:
+        return False
+    # revoked_at не смотрим: автовосстановление отзывает номер у захвата, чат владельца от этого
+    # системным не становится.
+    return (str(row["kind"] or "") != "quick"
+            and not _AUTOSTART_LABEL.fullmatch(str(row["label"] or "").strip()))
 
 
 def _register_worker(ctx: FleetContext, label: str, kind: str) -> str:
@@ -1363,7 +1418,8 @@ def _briefing(ctx: FleetContext, worker_id: str, task: Task | None = None) -> st
     try:
         from dev_mcp.fleet.goals import goal_block
 
-        return _compact_task_briefing(goal_block(task.project) + text)
+        goal = goal_block(task.project)
+        return _compact_task_briefing(text if goal and text.startswith(goal.splitlines()[0]) else goal + text)
     except Exception:  # цель — компас, не условие выдачи задачи
         return _compact_task_briefing(text)
 
@@ -1975,6 +2031,18 @@ def _note_maintenance_error(ctx: FleetContext, step: int, exc: Exception) -> Non
 
 _REPO = Path(__file__).resolve().parents[3]
 _PULT = _REPO / "tools" / "fleet.py"
+_OWNER_BROWSER: Any = None
+_OWNER_BROWSER_LOCK = threading.Lock()
+
+
+def _owner_browser() -> Any:
+    """Один мост jev-browser на процесс dev-mcp (fleet/owner_browser.py, владелец 15.11)."""
+    global _OWNER_BROWSER
+    with _OWNER_BROWSER_LOCK:
+        if _OWNER_BROWSER is None:
+            from .owner_browser import OwnerBrowser
+            _OWNER_BROWSER = OwnerBrowser()
+        return _OWNER_BROWSER
 # Урезанная роль (решение владельца 22.09.2026): только пульт флота. Список закрытый и
 # совпадает с подкомандами fleet.cmd; revoke/resume и всё, что пишет или запускает в
 # самом dev-mcp, сюда не входит. argv уходит в argparse пульта без оболочки.
@@ -2061,6 +2129,336 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
             raise ValueError('invalid launcher address')
         return json.dumps(_required(ctx, 'launch').release(ctx.store,label,claim_id))
 
+    # Надзиратель хода (пульт _todo/59): расширение держит чаты под надзором и после каждого
+    # законченного хода присылает снимок; ответ — что отправить в чат (или ничего).
+    def _overseer_book():
+        from . import overseer
+        return overseer.Book(Path(ctx.store.path).parent)
+
+    def _overseer_fleet_state(project: str, tz: str) -> str | None:
+        """Статус fleet-задачи для блокера Надзора: источник истины — реестр, не карточка чата."""
+        if not project or not tz:
+            return None
+        with ctx.store.read() as tx:
+            row = tx.one("SELECT state FROM tasks WHERE project=? AND tz=?", (project, tz))
+        return str(row["state"]) if row is not None else None
+
+    @mcp.tool(name='fleet_overseer_chats', description='Launcher: chats under turn supervision (url, mode).')
+    def fleet_overseer_chats() -> str:
+        from . import overseer
+        book = _overseer_book()
+        registry = book.chats()
+        rows = []
+        for row in overseer.watched(book):
+            item = {**row, "tag": registry.get(row["chat"], {}).get("tag") or overseer.tag_of(row["chat"])}
+            if row.get("engine") == "proxy":
+                # 25.11 jev-1: ждущий чат — дешёвая проверка fleet-блокеров без Jev; токен = одна переоценка.
+                token = overseer.proxy_wake(book, row["chat"], _overseer_fleet_state)
+                if token:
+                    item["reobserve"] = token
+            rows.append(item)
+        return json.dumps(rows, ensure_ascii=False)
+
+    @mcp.tool(name='fleet_overseer_mark',
+              description='Launcher popup: put a chat under supervision (mode shadow|send|off; project optional; '
+                          'engine proxy = act for the owner, semantic = legacy model judge).')
+    def fleet_overseer_mark(url: str, mode: str, project: str = '', engine: str = 'proxy') -> str:
+        from . import overseer
+        book = _overseer_book()
+        cid = overseer.chat_id(url)
+        if mode == 'off' and cid not in book.chats():
+            return json.dumps({'chat': cid, 'mode': 'off'})
+        chosen = engine if mode != 'off' else None
+        if cid in book.chats() and not project:
+            entry = overseer.set_mode(book, url, mode, chosen)
+        else:
+            entry = overseer.add(book, url, project or book.chats().get(cid, {}).get('project', ''), mode,
+                                 chosen)
+        return json.dumps(entry, ensure_ascii=False)
+
+    @mcp.tool(name='fleet_overseer_observe',
+              description='Launcher: snapshot of a supervised chat after a finished turn; returns what to send.')
+    def fleet_overseer_observe(snapshot: str) -> str:
+        from . import overseer
+        from .owner_telegram import _send
+        if not isinstance(snapshot, str) or len(snapshot) > 400_000:
+            raise ValueError('snapshot: JSON string up to 400 KB')
+        data = json.loads(snapshot)
+        if not isinstance(data, dict):
+            raise ValueError('snapshot must be an object')
+        watched_entry = _overseer_book().chats().get(overseer.chat_id(str(data.get('url') or '')), {})
+
+        def _notify(text: str) -> None:
+            # 21.11: Telegram может быть не привязан — тот же текст уходит и в уведомления браузера флота.
+            try:
+                _send(text)
+            except Exception:  # noqa: BLE001
+                pass
+            from ..intents import owner_channel
+            owner_channel.notify_owner(ctx.store, watched_entry.get('project') or 'Main Hub', 'needs', text[:4096])
+
+        return json.dumps(overseer.observe(_overseer_book(), data, notify_fn=_notify,
+                                           fleet_fn=_overseer_fleet_state), ensure_ascii=False)
+
+    # Быстрые агенты (fleet/quick.py, владелец 15.11): чат-субагент Claude Code или ведущего.
+    def _quick_book():
+        from . import quick
+        return quick.Book(Path(ctx.store.path).parent)
+
+    def _quick_deliver(job: dict[str, Any], answer: str) -> None:
+        """Ответ быстрого агента — сразу владельцу-воркеру в конверт (Claude Code читает книгу)."""
+        owner = str(job.get("owner") or "")
+        if not owner.startswith("W"):
+            return
+        body = (f"Быстрый агент {job['id']} ответил (ответ №{job['answers']}):\n"
+                f"{answer[-3000:]}\n— целиком: fleet_quick(agent, 'show', ['{job['id']}']); "
+                f"продолжить: fleet_quick(agent, 'say', ['{job['id']}', 'текст']).")
+        import uuid as _uuid
+        mid = "m-" + _uuid.uuid4().hex[:8]
+        with ctx.store.tx() as tx:
+            tx.change(
+                """INSERT INTO messages(id,dedup_key,to_worker,to_task,broadcast,from_kind,from_id,kind,body,
+                       created_at,delivered_at,acked_at) VALUES(?,'',?,NULL,0,'owner',?,'note',?,?,NULL,NULL)""",
+                (mid, owner, job["tag"], body, datetime.now(timezone.utc).isoformat()),
+                event={"kind": "quick_answer", "worker_id": owner,
+                       "payload": {"job": job["id"], "message_id": mid}},
+            )
+
+    def _quick_register(tag: str, label: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with ctx.store.tx() as tx:
+            if tx.one("SELECT 1 AS x FROM workers WHERE id=?", (tag,)) is None:
+                tx.change("""INSERT INTO workers(id,label,kind,first_seen,last_seen,revoked_at,revoke_reason)
+                             VALUES (?,?,'quick',?,?,NULL,'')""", (tag, label, now, now),
+                          event={"kind": "quick_new", "worker_id": tag, "payload": {"label": label}})
+
+    def _lead_project(agent: str) -> str:
+        from .lead import is_lead
+        with ctx.store.read() as tx:
+            for row in tx.query("SELECT project,tz FROM claims WHERE worker_id=? AND state='active'", (agent,)):
+                if is_lead(str(row["tz"])):
+                    return str(row["project"])
+        return ""
+
+    @mcp.tool(name='fleet_quick_orders', description='Launcher: quick-agent chats to open, feed or close.')
+    def fleet_quick_orders() -> str:
+        from . import quick
+        # Wake requires actual MCP silence; never wake a parked agent or a generating tab.
+        # The book is shared with the Claude Code CLI, so read worker heartbeats first.
+        orders = quick.orders(_quick_book())
+        # Последнее предметное обращение Q* к dev-mcp, не сам факт открытой вкладки.
+        with ctx.store.read() as tx:
+            rows = tx.query("SELECT id,first_seen,last_seen FROM workers WHERE kind='quick' AND revoked_at IS NULL")
+        now = datetime.now(timezone.utc)
+        recent = {}
+        silence_s = {}
+        for row in rows:
+            try:
+                age = (now - datetime.fromisoformat(row["last_seen"])).total_seconds()
+                # Создание Q* выставляет first_seen=last_seen, но это не вызов агента.
+                silence_s[str(row["id"])] = age
+                recent[str(row["id"])] = row["last_seen"] != row["first_seen"] and 0 <= age <= 120
+            except (TypeError, ValueError):
+                continue
+        quick.wake_silent(_quick_book(), recent, silence_s=silence_s)
+        orders = quick.orders(_quick_book())
+        for order in orders:
+            order["recentMcp"] = bool(recent.get(str(order["id"]).upper(), False))
+        return json.dumps(orders, ensure_ascii=False)
+
+    @mcp.tool(name='fleet_quick_report',
+              description='Launcher: quick-agent chat state (id, url, sent, answer, tab_closed).')
+    def fleet_quick_report(report: str) -> str:
+        from . import quick, chat_handoff
+        if not isinstance(report, str) or len(report) > 300_000:
+            raise ValueError('report: JSON string up to 300 KB')
+        data = json.loads(report)
+        if not isinstance(data, dict):
+            raise ValueError('report must be an object')
+        previous = _quick_book().jobs().get(quick.norm_id(str(data.get('id') or '')))
+        outcome = quick.report(_quick_book(), data, deliver=_quick_deliver)
+        current = _quick_book().jobs().get(quick.norm_id(str(data.get('id') or '')))
+        handoff = (current or {}).get('chat_handoff') or {}
+        if (previous and current and handoff.get('status') == 'activated'
+                and handoff.get('successor_url') and handoff.get('old_tag')):
+            chat_handoff.transfer_rights(ctx.store, handoff['old_tag'], handoff['new_tag'])
+            chat_handoff.activated(chat_handoff.Book(Path(ctx.store.path).parent),
+                                   agent=handoff['old_tag'], url=handoff['old_url'],
+                                   successor_url=handoff['successor_url'], token=handoff['token'])
+        return json.dumps(outcome, ensure_ascii=False)
+
+    @mcp.tool(name='fleet_chat_handoff',
+              description='ChatGPT length handoff: observe/save/prepare/activate a successor; durable file and marker.')
+    def fleet_chat_handoff(agent: str, command: str, url: str, fill: float = 0,
+                           chars: int = 0, full: bool = False, token: str = '',
+                           content: str = '', successor_url: str = '',
+                           label: str = '') -> str:
+        from . import chat_handoff, quick, overseer
+        book = chat_handoff.Book(Path(ctx.store.path).parent)
+        cmd = str(command or '').lower().strip()
+        tag = chat_handoff._agent(agent)
+        cid = chat_handoff._chat_id(url)
+        if quick.is_quick_agent(tag):
+            job = quick.lookup(_quick_book(), tag) or next((
+                j for j in _quick_book().jobs().values()
+                if (j.get('chat_handoff') or {}).get('old_tag') == tag
+            ), None)
+            if not job or job.get('state') == 'closed':
+                raise PermissionError('handoff: inactive quick agent')
+            previous = (job.get('chat_handoff') or {}).get('old_url')
+            if url.rstrip('/') not in (str(job.get('url') or '').rstrip('/'),
+                                        str(previous or '').rstrip('/')):
+                raise PermissionError('handoff: quick conversation does not match')
+        elif tag.startswith('S-'):
+            registered = overseer.Book(Path(ctx.store.path).parent).chats().get(cid)
+            if tag != str((registered or {}).get("tag") or overseer.tag_of(cid)).upper():
+                raise PermissionError('handoff: overseer chat mismatch')
+            if not registered:
+                raise PermissionError('handoff: not supervised')
+        else:
+            with ctx.store.read() as tx:
+                worker = tx.one('SELECT id,label,revoked_at FROM workers WHERE id=?', (tag,))
+            if not worker or worker['revoked_at'] is not None:
+                raise PermissionError('handoff: unknown or revoked worker')
+            if cmd == 'observe' and str(label or '') != str(worker['label']):
+                raise PermissionError('handoff: worker label mismatch')
+        if cmd == 'observe':
+            usage = chat_handoff.audit_usage(tag)
+            # Include conversations that the extension actually sends; these
+            # messages do not appear in MCP audit's tool-request/result traffic.
+            message_chars = 0
+            if quick.is_quick_agent(tag):
+                active = quick.lookup(_quick_book(), tag) or {}
+                handoff = active.get('chat_handoff') or {}
+                since = str(handoff.get('at') or '') if handoff.get('new_tag') == tag else ''
+                message_chars = sum(len(str(m.get('text') or '')) for m in
+                                    active.get('messages', []) if m.get('role') == 'owner' and
+                                    (not since or str(m.get('ts') or '') >= since))
+            elif tag.startswith('S-'):
+                card = _overseer_book().card(cid) or {}
+                message_chars = sum(len(str(s.get('text') or ''))
+                                    for s in card.get('segments', []) if isinstance(s, dict))
+            # The browser measure is a fallback only if no MCP audit calls exist.
+            actual_chars = usage['chars'] + message_chars if usage['calls'] else chars
+            actual_fill = (min(1.0, actual_chars / chat_handoff.AUDIT_CAPACITY_CHARS)
+                           if usage['calls'] else fill)
+            result = chat_handoff.observe(book, agent=tag, url=url, fill=actual_fill,
+                                          chars=actual_chars, full=full,
+                                          source='audit+messages' if usage['calls'] else 'dom')
+            result['calls'] = usage['calls']
+        elif cmd == 'save':
+            result = chat_handoff.save(book, agent=tag, url=url, content=content)
+        elif cmd == 'prepare':
+            context = ''
+            if full:
+                if quick.is_quick_agent(tag):
+                    j = quick.lookup(_quick_book(), tag) or {}
+                    context = ('Project: ' + str(j.get('project') or '') + '\n'
+                               + 'Task: ' + str(j.get('prompt') or '')[:8000] + '\n'
+                               + 'Owner: ' + str(j.get('owner') or '') + '\n'
+                               + 'Scope: ' + json.dumps(j.get('scope') or []) + '\n'
+                               + 'Last answer: ' + str(j.get('last_answer') or '')[-5000:])
+                else:
+                    context = 'Сверить рабочую задачу, её claim и журнал MCP перед продолжением.'
+                try:
+                    history = overseer.agent_history(tag, '', any_tool=True)
+                    context += '\nJournal (metadata): ' + json.dumps(history, ensure_ascii=False)[:6000]
+                except Exception:
+                    pass
+            result = chat_handoff.prepare(book, agent=tag, url=url, token=token,
+                                          full=full, context=context,
+                                          quick_book=_quick_book() if quick.is_quick_agent(tag) else None)
+            result['new_label'] = chat_handoff.register_successor(ctx.store, tag, result['new_agent'])
+            if not quick.is_quick_agent(tag) and not tag.startswith('S-'):
+                result['start'] = ('@Dev\'s Computer dev-mcp+ Продолжай сессию флота, '
+                                   f"label='{result['new_label']}', agent='{result['new_agent']}'. "
+                                   "Не вызывай fleet_join. "
+                                   f"Вызови fleet_resume(agent='{result['new_agent']}').\n\n"
+                                   + result['start'])
+        elif cmd == 'activate':
+            result = chat_handoff.activated(book, agent=tag, url=url,
+                                            successor_url=successor_url, token=token)
+            chat_handoff.transfer_rights(ctx.store, tag, result['new_agent'])
+            if tag.startswith('S-'):
+                chat_handoff.transfer_overseer(_overseer_book(), url, successor_url, result['new_agent'])
+        else:
+            raise ValueError('command: observe | save | prepare | activate')
+        return json.dumps(result, ensure_ascii=False)
+
+    @mcp.tool(
+        name="fleet_quick",
+        description=(
+            "Быстрые агенты — свои субагенты в новых чатах ChatGPT, без очереди, ТЗ и ревью: ответ "
+            "агента приходит тебе сразу (в конверт следующего вызова и в show). Доступно ведущему "
+            "и агенту с ролью владельца. Агент наследует твои права: твои захваты и корень проекта. "
+            "command: new [ПРОЕКТ] ТЕКСТ — запустить (ПРОЕКТ можно опустить у ведущего — его проект); "
+            "say ID ТЕКСТ — дописать в его чат; show ID — состояние, последний ответ, его действия; "
+            "list — твои открытые; close ID — остановить. Для Q*-исполнителя: "
+            "report с args=[полный итог] — немедленно сохранить ответ владельцу и парковаться; "
+            "park с args=[] — продолжить ожидание. args — списком. "
+            "Новый чат или прежний — твой выбор по задаче: продолжение той же темы (агент уже "
+            "прочитал нужные файлы) — say в его открытый чат; другая тема или чат разросся — new. "
+            "Ненужные закрывай: открытый чат держит вкладку."
+        ),
+    )
+    def fleet_quick(agent: str, command: str, args: list[str] | None = None) -> str:
+        from . import overseer, quick
+        from .project_config import project_root
+        argv = [str(a) for a in (args or [])]
+        call = {"agent": agent, "command": command, "args": argv[:1]}
+        try:
+            ctx.touch(agent)
+            owner_role = ctx.is_owner(agent)
+            lead_project = _lead_project(agent)
+            cmd = str(command or "").strip().lower()
+            if quick.is_quick_agent(agent):
+                if cmd not in ("report", "park"):
+                    raise PermissionError("быстрый агент может только report/park, не создавать субагентов")
+                result = quick.exchange(
+                    _quick_book(), agent,
+                    answer=" ".join(argv) if cmd == "report" else "",
+                    deliver=_quick_deliver,
+                )
+                return _respond_ok(ctx, "fleet_quick", call,
+                                   json.dumps(result, ensure_ascii=False))
+            if not owner_role and not lead_project:
+                raise PermissionError("быстрые агенты — для ведущего и агента с ролью владельца")
+            book = _quick_book()
+            if cmd == "new":
+                projects = set()
+                with ctx.store.read() as tx:
+                    projects = {str(r["name"]) for r in tx.query("SELECT name FROM projects")}
+                project = argv[0] if len(argv) >= 2 and argv[0] in projects else lead_project
+                text = " ".join(argv[1:] if len(argv) >= 2 and argv[0] in projects else argv)
+                if lead_project and not owner_role and project != lead_project:
+                    raise PermissionError(f"ведущий заводит быстрых агентов только в своём проекте {lead_project}")
+                job = quick.create(book, owner=agent, prompt=text, project=project,
+                                   root=(project_root(project) or "") if project else "",
+                                   register=_quick_register)
+                out = (f"{job['id']} запущен (agent {job['tag']}); чат откроет расширение. "
+                       f"Ответ придёт сюда сообщением; ход — fleet_quick(agent,'show',['{job['id']}']).")
+            elif cmd == "say":
+                if len(argv) < 2:
+                    raise ValueError("say ID ТЕКСТ")
+                job = quick.say(book, argv[0], " ".join(argv[1:]), owner=agent)
+                out = (f"{job['id']}: сообщение в парковку без вкладки"
+                       if job.get("state") == "parked" else
+                       f"{job['id']}: сообщение в очереди чата ({len(job['outbox'])})")
+            elif cmd == "show":
+                job = quick.get(book, (argv or [""])[0], owner=agent)
+                out = quick.render(job, overseer.agent_history(job["tag"], job["created"], any_tool=True), full=False)
+            elif cmd == "list":
+                rows = quick.listing(book, owner=agent)
+                out = "\n".join(quick.render(j, full=False).split("\n")[0] for j in rows) or "открытых нет"
+            elif cmd == "close":
+                job = quick.close(book, (argv or [""])[0], owner=agent)
+                out = f"{job['id']} закрыт: чат больше не получает сообщений, запись остановлена"
+            else:
+                raise ValueError("command: new | say | show | list | close")
+            return _respond_ok(ctx, "fleet_quick", call, out)
+        except Exception as exc:
+            return _respond_fail(ctx, "fleet_quick", call, exc)
+
     @mcp.tool(
         name="fleet_join",
         description=(
@@ -2106,25 +2504,6 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
             return _respond_ok(ctx, "fleet_resume", args, _compact_task_briefing(str(payload)))
         except Exception as exc:
             return _respond_fail(ctx, "fleet_resume", args, exc)
-
-    @mcp.tool(
-        name="fleet_look",
-        description=(
-            "Проверяет качество видимого интерфейса по 1–12 PNG/JPEG/WebP кадрам, "
-            "из owns автора или проекта текущего ревью. Gemini возвращает JSON "
-            "{ok, defects:[{severity,where,what}]}; общий лимит 60 вызовов за час. "
-            "Зови для любого визуального UI; rubric добавляется к базовым критериям."
-        ),
-    )
-    def fleet_look(agent: str, paths: list[str], rubric: str = "") -> str:
-        args = {"agent": agent, "paths": paths, "rubric": rubric}
-        try:
-            ctx.touch(agent)
-            evaluator = _required(ctx, "look")
-            payload = evaluator.look_for_agent(ctx.store, agent, paths, rubric, policy=ctx.policy)
-            return _respond_ok(ctx, "fleet_look", args, json.dumps(payload, ensure_ascii=False))
-        except Exception as exc:
-            return _respond_fail(ctx, "fleet_look", args, exc)
 
     @mcp.tool(
         name="fleet_task_body",
@@ -2358,6 +2737,10 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
     def _take(agent: str, _maintain: bool = False) -> tuple[str, str]:
         """Одна попытка выдачи: (status, payload), status — task | empty | cold | final."""
         worker_id = str(agent or "").strip()
+        from . import quick as _quick
+        if _quick.is_quick_agent(worker_id):
+            return "final", (f"{worker_id} — быстрый агент владельца, задач из очереди не берёт. "
+                             "Делай задачу из своего чата и отвечай в чате.")
         with ctx.store.read() as tx:
             worker = tx.one(
                 "SELECT revoked_at,revoke_reason FROM workers WHERE id=?",
@@ -2395,7 +2778,25 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
                 f"(claim_id={held['id']}) — продолжай её. "
                 "Памятка и уже сделанное — fleet_resume; сдача — fleet_submit (review — fleet_review)."
             )
+        take_started = datetime.now(timezone.utc)
         task = queue.take_next(ctx.store, agent, pinned)
+        if task is None:
+            with ctx.store.read() as view:
+                refusal = view.one(
+                    "SELECT ts,payload FROM events WHERE worker_id=? "
+                    "AND kind='claim_take_refused' ORDER BY id DESC LIMIT 1", (agent,))
+            if refusal is not None:
+                try:
+                    info = json.loads(refusal["payload"] or "{}")
+                    at = datetime.fromisoformat(str(refusal["ts"]).replace("Z", "+00:00"))
+                    if at.tzinfo is None:
+                        at = at.replace(tzinfo=timezone.utc)
+                    if at >= take_started - timedelta(seconds=2) and info.get("requeued"):
+                        return "final", ("Задача с визуальным ревью оставлена в очереди: "
+                                         + str(info.get("reason") or "нет read_image")
+                                         + ". Нужен новый разговор после обновления инструментов.")
+                except (ValueError, TypeError):
+                    pass
         if task is None and pinned:
             return "final", (
                 f"В проекте {pinned} доступных готовых задач сейчас нет (эта вкладка открыта под него). "
@@ -2611,8 +3012,30 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
             })
             ctx.nudged.pop(str(agent or "").strip(), None)
             note = _record_provides(ctx, str(agent or "").strip(), task, f"{done} {decided}")
+            from . import goals, lead
+            project, _, tz = task.rpartition("/")
+            goal = ""
+            next_label = "Сейчас, в этом же ходе: "
+            continue_hint = ("Точка — не конец хода и не отчёт: сразу вызови инструмент для "
+                             "этого шага. Ход заканчивают только fleet_submit, fleet_block или "
+                             "ответ сервера «остановись».")
+            if lead.is_lead(tz):
+                from .lead_focus import lines as focus_status_lines
+                goal = "\n".join([goals.goal_block(project).partition("\n")[0],
+                                  *lead.focus_lines(project, ctx.store), *focus_status_lines(ctx.store, project), ""])
+                next_label = "Следующий шаг из твоей точки: "
+                continue_hint = ("В этом же ходе выполни действие, которое продвигает явное поручение "
+                                 "владельца или ближайшую проверку результата. При внешнем препятствии "
+                                 "укажи, кто и по какому факту может его снять.")
             return _respond_ok(ctx, "fleet_checkpoint", args,
-                               f"Контрольная точка {task} сохранена.{note} Продолжай со следующего шага.")
+                               # 03.11.2026: 52% немых захватов ведущего Nova (65 из 125)
+                               # обрывались сразу после точки — «сохранено, продолжай» модель
+                               # читала как конец хода. Ответ возвращает её же следующий шаг
+                               # как поручение на этот ход.
+                               f"{goal}Контрольная точка {task} сохранена.{note}\n"
+                               + next_label
+                               + " ".join(str(next_step or "").split())[:400] + "\n"
+                               + continue_hint)
         except Exception as exc:
             return _respond_fail(ctx, "fleet_checkpoint", args, exc)
 
@@ -2739,12 +3162,23 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
             admission = ("Работа сдана; проверку выполняет сервер: " + review_tz
                          if review_tz.startswith('server-') else
                          f"Работа сдана на приёмку; создана/найдена задача ревью {project}/{review_tz}")
+            from . import lead
+            goal = ""
+            if lead.is_lead(tz):
+                goal = "\n".join([goals.goal_block(project).partition("\n")[0],
+                                  *lead.focus_lines(project, ctx.store), ""])
+                if review_tz.startswith("server-progress:"):
+                    admission += ". Следующий шаг — проверить пользовательский результат после интеграции"
+                try:
+                    lead.reopen(ctx.store, project=project)
+                except Exception:
+                    pass  # The controller retries reopening independently of the saved submission.
             result = _respond_ok(
                 ctx,
                 "fleet_submit",
                 args,
                 (
-                    admission + ". Claim и ресурсы уже освобождены — fleet_finish НЕ нужен."
+                    goal + admission + ". Claim и ресурсы уже освобождены — fleet_finish НЕ нужен."
                     + _handoff(agent)
                 ),
             )
@@ -2790,6 +3224,7 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
                 # rejection to accept + follow-up. That hidden accept path
                 # must NEVER bypass independent sealed review and bite proof.
                 from . import review as review_impl
+                from .lead_admin import review_criteria
                 with ctx.store.read() as tx:
                     original = tx.one(
                         "SELECT t.project,t.tz,t.kind,t.body,t.acceptance,t.owns "
@@ -2803,6 +3238,7 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
                     )
                     if (original is not None and active_review is not None
                             and original["kind"] == "fix"
+                            and not review_criteria(str(original["tz"]), str(original["body"] or ""))
                             and review_impl.FINAL_MARK in str(original["body"] or "")):
                         commands = json.loads(str(original["acceptance"] or "[]"))
                         implicit_accept = (bool(commands) and not review_impl._missing_runs(
@@ -2811,13 +3247,21 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
             if desired == "accept" or implicit_accept:
                 if source is not None:
                     from .claim_review_bite import ClaimReviewError, accept_claim, check_fix_bite
+                    from .review import check_lead_criteria
                     source_claim_id, _ = source
                     with ctx.store.read() as tx:
                         task = tx.one(
-                            "SELECT t.kind FROM claims c JOIN tasks t "
+                            "SELECT t.kind,t.tz,t.body FROM claims c JOIN tasks t "
                             "ON t.project=c.project AND t.tz=c.tz WHERE c.id=?",
                             (source_claim_id,),
                         )
+                        if task is not None and desired == "accept":
+                            active_review = tx.one(
+                                "SELECT project,tz,started_at FROM claims WHERE worker_id=? "
+                                "AND state='active' ORDER BY id DESC LIMIT 1", (agent,),
+                            )
+                            if active_review is not None:
+                                check_lead_criteria(tx, agent, active_review, task, note)
                         plans = tx.query(
                             "SELECT payload FROM events WHERE kind='claim_bite_plan' "
                             "ORDER BY id DESC",
@@ -2877,6 +3321,13 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
         except Exception as exc:
             return _respond_fail(ctx, "fleet_presence", args, exc)
 
+    @mcp.tool(name="fleet_activity_24h",
+              description="Read-only 24-hour activity samples: regular, quick MCP, waiting, open quick.")
+    def fleet_activity_24h() -> str:
+        from . import activity_history
+        return json.dumps(activity_history.read(activity_history.history_path(ctx.store)),
+                          ensure_ascii=False)
+
     @mcp.tool(
         name="fleet_extension_report",
         description=(
@@ -2908,6 +3359,12 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
                                                   runnable=int(runnable),
                                                   enabled=enabled if type(enabled) is bool else None,
                                                   tick_completed=tick_completed is True)
+            try:
+                from . import activity_history
+                activity_history.sample(ctx.store)
+            except Exception:
+                # History is auxiliary and must never break the launcher heartbeat.
+                pass
             if account_event:
                 from . import account_telemetry
                 account_telemetry.record(ctx.store, account_event)
@@ -3112,11 +3569,13 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
             from .queue_intake import health as queue_intake_health
             from .storage_guard import health as storage_health
             from .owner_notices import lines as owner_notice_lines
+            from .lead_focus import lines as focus_status_lines
             gate = _chatgpt_gate_state(ctx)
             projects = _required(ctx, "queue").peek_projects(ctx.store)
             # The extension consumes queue/worker/attention records. Detailed
             # per-project prose is an operator report, expensive under paging.
-            diagnostics = ([*_project_blocker_lines(ctx, projects), *_external_waiting_lines(ctx)]
+            diagnostics = ([*_project_blocker_lines(ctx, projects), *_external_waiting_lines(ctx),
+                            *(line for name, _, _ in projects for line in focus_status_lines(ctx.store, name))]
                            if not launcher_version else [])
             lines = [controller_health(ctx.store),
                      queue_intake_health(ctx.store),
@@ -3180,7 +3639,7 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
                     pending = []
                     for event in recent:
                         meta = json.loads(event["payload"] or "{}")
-                        claim = tx.one("SELECT c.project,c.tz,c.worker_id,c.state,w.label,w.last_seen "
+                        claim = tx.one("SELECT c.project,c.tz,c.worker_id,c.state,c.started_at,w.label,w.last_seen "
                                        "FROM claims c JOIN workers w ON w.id=c.worker_id WHERE c.id=?",
                                        (meta.get("claim_id"),))
                         if (claim is None or claim["state"] != "active" or
@@ -3193,8 +3652,16 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
                         item = {"label": label, "url": url, "project": claim["project"],
                                 "tz": claim["tz"], "worker_id": claim["worker_id"],
                                 "wake": str(meta.get("wake") or "")}
-                        item["text"] = wake.wake_text(item)
+                        saved = tx.one("SELECT payload FROM events WHERE kind='checkpoint' AND "
+                                       "project=? AND tz=? AND worker_id=? AND ts>=? ORDER BY id DESC LIMIT 1",
+                                       (item["project"], item["tz"], item["worker_id"], claim["started_at"]))
+                        if saved:
+                            item["next_step"] = json.loads(saved["payload"] or "{}").get("next")
                         pending.append(item)
+                # Текст будки — вне снимка: для ведущего wake_text читает реестр сам
+                # (lead.focus_lines), вложенный read ронял весь fleet_list (20.11.2026).
+                for item in pending:
+                    item["text"] = wake.wake_text(item, ctx.store)
                 lines.extend(wake.order_lines(pending))
             except (ValueError, TypeError):
                 pass
@@ -3257,9 +3724,50 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
             return _respond_fail(ctx, "fleet_ack", args, exc)
 
     @mcp.tool(
+        name="fleet_lead",
+        description=(
+            "Полномочия ВЕДУЩЕГО в своём проекте (только держатель захвата TZ-LEAD). action: "
+            "freeze/reactivate {tz, reason} и priority {tz, value 0..9} — задачи своего проекта; "
+            "issue {title, body, owns[], acceptance?, criteria?, priority?, resources?} — "
+            "acceptance[] содержит исполняемые команды, criteria[] — условия независимой проверки. "
+            "Подзадача рабочему "
+            "с непересекающейся зоной; redeploy {} — выкатить живую поверхность проекта сейчас; "
+            "wait {claim_id, tz, summary, result_task?} — отдать захват и продолжить после вердикта по точной задаче; "
+            "result_task=true, если задача сама даёт результат пользователю. "
+            "result {claim_id, event_id, summary} — передать проверенный результат и остановить работу над ним; "
+            "choose {claim_id, obligation, summary, criterion} — выбрать следующий результат проекта "
+            "в режиме самостоятельного ведения; park {claim_id, obstacle, summary} — освободить захват "
+            "до снятия конкретного препятствия; "
+            "discovery {summary, new[]} — итог разведки неучтённого; instruction {id, status: "
+            "accepted+obligation=O-… | declined+reason | done+evidence} — закрыть поручение владельца "
+            "из брифа (текст в STATE.md его не закрывает); obstacle {obligations[], type: owner_action|"
+            "external_fact, ask, option, not_covered, predicate{kind: owner_answer|resource_up+resource|"
+            "file_exists+path}} — препятствие с карточкой владельцу (нечего продвинуть — устав паркуется "
+            "сам); owner_action только с not_covered: почему разрешения владельца из брифа его не "
+            "покрывают; "
+            "obstacle_close {id, reason}; ask {question, options:[вариант1,вариант2], obligations:[O-…], "
+            "owner_decision?, reversible?} — быстрый выбор обратимой тактики через gemini-decision-1/Jev, "
+            "неуверенность и owner-only уходят владельцу, ответ в конверт; откат fleet.cmd undo. "
+            "Приборы (ops/witness, ledger_check) "
+            "правит рабочий по issue, не ведущий. Конфиг проекта — "
+            "ops/lead/fleet.toml (witness, canon, deps, gate, live.every_min)."
+        ),
+    )
+    def fleet_lead(agent: str, action: str, params: dict | None = None) -> str:
+        args = {"agent": agent, "action": action}
+        try:
+            ctx.touch(agent)
+            from . import lead_admin
+            return _respond_ok(ctx, "fleet_lead", args,
+                               lead_admin.act(ctx.store, agent, action, params or {}))
+        except Exception as exc:
+            return _respond_fail(ctx, "fleet_lead", args, exc)
+    @mcp.tool(
         name="fleet_send",
         description=(
-            "Отправляет соседу или задаче короткий ФАКТ, не вопрос и не новую работу. "
+            "Отправляет соседу или задаче короткий ФАКТ, не вопрос. Работу соседу не поручай "
+            "письмом: ведущий выдаёт её fleet_lead issue. Письмо владельца ведущему (Project/TZ-LEAD "
+            "или любой его раунд) платформа сама заводит поручением со статусом. "
             "to — worker_id или адрес Project/TZ-N; kind обычно note или contract."
         ),
     )
@@ -3315,8 +3823,11 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
     @mcp.tool(
         name="fleet_owner",
         description=(
-            "Пульт владельца флота — для worker_id, которому владелец выдал роль локально "
-            "(fleet.cmd owner-grant). command: status (платформа, "
+            "Пульт владельца флота. БЕЗ роли владельца любому агенту, которого запустил владелец "
+            "(не чату, открытому системой, и не быстрому агенту), доступны bootstrap, status, active и report: "
+            "регистрация написанных ТЗ мгновенная, ТЗ сразу ready, без пробного прогона приёмки; роль для "
+            "этого не нужна и просить её не надо. Остальные команды — для worker_id, которому владелец выдал "
+            "роль (fleet.cmd owner-grant). command: status (платформа, "
             "исключения, кто что держит, живые воркеры, очередь); report [ПРОЕКТ] (заявлено против "
             "сделано); active [ПРОЕКТ]; metrics --since ГГГГ-ММ-ДД; bootstrap ПРОЕКТ TZ-NN [TZ-NN ...] "
             "[--reactivate] — поставить в очередь ТЗ, уже написанные в ToDo/tz проекта. Перед bootstrap "
@@ -3338,20 +3849,46 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
         call = {"agent": agent, "command": command, "args": argv}
         try:
             ctx.touch(agent)
-            if not ctx.is_owner(agent):
+            wanted = str(command or "").strip().partition(" ")[0].lower()
+            if not ctx.is_owner(agent) and not (
+                    wanted in SELF_STARTED_COMMANDS and _self_started(ctx, agent)):
+                if wanted in SELF_STARTED_COMMANDS:
+                    raise PermissionError(
+                        f"{agent} запущен системой (чат флота или быстрый агент): регистрировать ТЗ "
+                        "сам он не может — поставь ТЗ через ведущего проекта (fleet_lead issue). "
+                        "Агентам, которых запустил владелец, bootstrap доступен без роли.")
                 raise PermissionError(
-                    f"роль владельца не выдана worker_id {agent}. Скажи владельцу: «выдай роль "
-                    f"{agent}» — он выполнит у себя fleet.cmd owner-grant {agent}; затем повтори этот "
-                    "вызов. Пароль в чат не проси и не передавай."
+                    f"роль владельца у {agent} не выдана или истекла (срок выдачи — 48 ч). Это не "
+                    "поломка флота: остальные инструменты работают. Владелец выдаёт роль по номеру сам "
+                    f"(fleet.cmd owner-grant {agent}) — тем же номером, даже если номер был отозван "
+                    "автовосстановлением; заявка не нужна — назови свой номер, если владелец спросит. "
+                    "Пароль не проси и не передавай."
                 )
-            command = str(command or "").strip().lower()
+            raw_command = str(command or "").strip()
+            head, _, tail = raw_command.partition(" ")
+            if tail.strip() and head.lower() in OWNER_COMMANDS:
+                # 20.11.2026: агенты пишут команду с аргументами одной строкой
+                # («active nova vpn»). Проект с пробелом — один аргумент.
+                import shlex
+                extra = ([tail.strip()] if head.lower() in ("active", "report")
+                         else shlex.split(tail, posix=True))
+                argv = [*extra, *argv]
+                raw_command = head
+            command = raw_command.lower()
             if command not in OWNER_COMMANDS:
                 raise ValueError(f"неизвестная команда {command!r}; доступны: {', '.join(OWNER_COMMANDS)}")
             if command == "lock":
                 ctx.owner.lock(agent)
                 return _respond_ok(ctx, "fleet_owner", call, "Сессия владельца закрыта.")
             if command == "status":
-                text = "\n".join([_run_pult(ctx, []), "", _run_pult(ctx, ["active"]), "", _fresh_fleet_lines(_fleet_list_snapshot())])
+                from concurrent.futures import ThreadPoolExecutor
+                # Два вызова пульта по 30 с подряд превышали потолок шлюза (45 с):
+                # на загруженном хосте один запуск fleet.py идёт 10–20 с (20.11.2026).
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    platform = pool.submit(_run_pult, ctx, [])
+                    active = pool.submit(_run_pult, ctx, ["active"])
+                    text = "\n".join([platform.result(), "", active.result(), "",
+                                      _fresh_fleet_lines(_fleet_list_snapshot())])
             else:
                 if command == "bootstrap":
                     argv = _bootstrap_argv(ctx, argv)
@@ -3362,12 +3899,59 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
         except Exception as exc:
             return _respond_fail(ctx, "fleet_owner", call, exc)
 
+    @mcp.tool(
+        name="fleet_browser",
+        description=(
+            "Агентский браузер владельца (jev-browser: настоящий Chrome с его входами в аккаунты) — "
+            "только для worker_id с ролью владельца. tool='list' — каталог инструментов; "
+            "tool='schema', args={'name': '<инструмент>'} — схема аргументов; иначе — имя инструмента "
+            "jev-browser (browser_goto, browser_snapshot, browser_click, browser_fill_form, browser_run, "
+            "browser_secret_list/fill/request, browser_handoff, browser_screenshot (картинка), browser_close …) "
+            "и его аргументы объектом. Своя вкладка на агента; чужие не трогать. Вход: "
+            "browser_secret_list → browser_secret_fill (значения не видны); записи нет → "
+            "browser_secret_request или browser_handoff. Оплата, удаление, отправка писем, принятие "
+            "условий — только если задача владельца прямо требует; CAPTCHA и подтверждения на телефоне "
+            "— browser_handoff. В конце — browser_close."
+        ),
+    )
+    def fleet_browser(agent: str, tool: str, args: dict[str, Any] | None = None) -> Any:
+        call = {"agent": agent, "tool": tool, "args": sorted((args or {}).keys())}
+        try:
+            ctx.touch(agent)
+            if not ctx.is_owner(agent):
+                raise PermissionError(
+                    f"jev-browser открыт только агенту с ролью владельца; у {agent} её нет. "
+                    "Владелец выдаёт роль по номеру сам (fleet.cmd owner-grant <номер>).")
+            from . import owner_browser as ob
+            bridge = _owner_browser()
+            name = str(tool or "").strip()
+            if name in ("", "list"):
+                return _respond_ok(ctx, "fleet_browser", call, ob.tool_catalog(bridge.tools(agent)))
+            if name == "schema":
+                return _respond_ok(ctx, "fleet_browser", call,
+                                   ob.tool_schema(bridge.tools(agent), str((args or {}).get("name") or "")))
+            result = bridge.call(agent, name, dict(args or {}))
+            text, images = ob.split_result(result)
+            with ctx.store.tx() as tx:
+                tx.record_event(kind="owner_browser", worker_id=agent,
+                                payload={"tool": name, "error": bool(result.get("isError"))})
+            out = _respond_ok(ctx, "fleet_browser", call, text or "(пустой ответ)")
+            if not images:
+                return out
+            from fastmcp.utilities.types import Image
+            return [out, *(Image(data=data, format=mime.split("/")[-1]) for data, mime in images)]
+        except Exception as exc:
+            return _respond_fail(ctx, "fleet_browser", call, exc)
+
     return {
+        "fleet_browser": fleet_browser,
+        "fleet_quick": fleet_quick,
+        "fleet_quick_orders": fleet_quick_orders,
+        "fleet_quick_report": fleet_quick_report,
         'fleet_launch_reserve': fleet_launch_reserve,
         'fleet_launch_release': fleet_launch_release,
         "fleet_join": fleet_join,
         "fleet_resume": fleet_resume,
-        "fleet_look": fleet_look,
         "fleet_take": fleet_take,
         "fleet_task_body": fleet_task_body,
         "fleet_task_source_page": fleet_task_source_page,
@@ -3381,6 +3965,7 @@ def register(mcp: Any, ctx: FleetContext, parking: Parking | None = None) -> dic
         "fleet_expect": fleet_expect,
         "fleet_inbox": fleet_inbox,
         "fleet_ack": fleet_ack,
+        "fleet_lead": fleet_lead,
         "fleet_send": fleet_send,
         "fleet_owner_unlock": fleet_owner_unlock,
         "fleet_owner": fleet_owner,

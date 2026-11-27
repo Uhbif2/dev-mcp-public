@@ -38,6 +38,52 @@ MAX_FIX_ROUNDS = 2
 # Семью НЕ замораживаем: следующий fix становится diagnostic/end-to-end repair и обязан
 # разобрать накопленные причины целиком. Ручного owner-gate в review lifecycle нет.
 MAX_FIX_ROUNDS_HARD = 5
+# №118 (21.11.2026): при выключенных генераторах reject независимого ревью возвращает ту же
+# задачу в ready. После стольких отказов подряд (или повторной сдачи той же ревизии) задача
+# останавливается в rejected с объяснением — без новых задач и без бесконечного круга.
+MAX_REQUEUE = MAX_FIX_ROUNDS_HARD
+
+
+def review_requeue_enabled() -> bool:
+    """[platform.review_requeue] enabled — по умолчанию включено; false возвращает старое поведение."""
+    from .goals import _load_doc
+
+    value = _load_doc().get("platform", {}).get("review_requeue", {})
+    return not (isinstance(value, dict) and value.get("enabled") is False)
+
+
+def _requeue_history(tx: Any, project: str, tz: str, revision: str) -> tuple[int, bool]:
+    """(номер этой попытки, та же ревизия, что уже была отвергнута) — с последнего accept."""
+    last_accept = int(tx.scalar(
+        "SELECT COALESCE(MAX(id),0) FROM events WHERE project=? AND tz=? AND kind='accept'",
+        (project, tz)) or 0)
+    rows = tx.query(
+        "SELECT payload FROM events WHERE project=? AND tz=? AND kind='reject' AND id>? "
+        "ORDER BY id DESC", (project, tz, last_accept))
+    attempts, identical = 0, False
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload"] or "{}"))
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict) or not payload.get("requeue"):
+            continue
+        attempts += 1
+        if revision and payload.get("revision") == revision:
+            identical = True
+    return attempts + 1, identical
+
+
+def _submitted_revision(tx: Any, project: str, tz: str) -> str:
+    seal = tx.one(
+        "SELECT payload FROM events WHERE project=? AND tz=? AND kind='claim_submission' "
+        "ORDER BY id DESC LIMIT 1", (project, tz))
+    try:
+        payload = json.loads(str(seal["payload"])) if seal else {}
+    except (TypeError, ValueError):
+        payload = {}
+    value = payload.get("revision") if isinstance(payload, dict) else ""
+    return value if isinstance(value, str) else ""
 
 FINAL_MARK = "[fleet-final]"
 FINAL_REVIEW_NOTE = (
@@ -199,6 +245,9 @@ def _blind_submission_sealed(tx: Any, original: Any) -> bool:
 
 
 def _review_body(row: Any) -> str:
+    from .lead_admin import review_criteria
+    from .project_review import task_id as project_review_task_id
+
     acceptance = _json_list(row["acceptance"])
     lines = [
         _marker(str(row["project"]), str(row["tz"])),
@@ -210,6 +259,14 @@ def _review_body(row: Any) -> str:
     lines.extend(f"- {cmd}" for cmd in acceptance)
     if not acceptance:
         lines.append("- (acceptance-команды не заданы)")
+    criteria = review_criteria(str(row["tz"]), str(row["body"] or ""))
+    if project_review_task_id(str(row["tz"])) and not criteria:
+        raise ValueError(f"{row['tz']}: отсутствуют критерии ревью результата")
+    if criteria:
+        lines.append("Критерии независимой проверки. В note укажи, что проверил по каждому "
+                     "пункту, команды и ограничения. Для accept нужен собственный успешный "
+                     "прогон проверки по этой задаче.")
+        lines.extend(f"- {criterion}" for criterion in criteria)
     for cmd in sorted(_gate_commands(str(row["project"]), acceptance)):
         lines.append(
             f"`{cmd}` — гейт проекта: зелёный серверный прогон автора по тем же файлам зоны засчитан "
@@ -227,6 +284,11 @@ def open_review(store: Any, project: str, tz: str, *, final_note: str = "") -> s
         from dev_mcp.intents.stages import request_server_stage_check
         pending = request_server_stage_check(store,project,tz)
         if pending is not None: return pending
+        # 06.11 (LEAD-SYSTEM-DESIGN фаза 1.2): сдача ведущего без заявленного перехода O-* —
+        # прогресс, его принимает сервер; LLM-ревью открывается только вехе.
+        from .lead import progress_accept
+        progressed = progress_accept(store, project, tz)
+        if progressed is not None: return progressed
     with store.tx() as tx:
         return _open_review_tx(tx, project, tz, final_note=final_note)
 
@@ -425,6 +487,25 @@ def _payload_tree(payload: Any) -> str | None:
     return str(payload.get("tree")) if isinstance(payload, dict) and payload.get("tree") else None
 
 
+def check_lead_criteria(tx: Any, worker_id: str, review: Any, original: Any,
+                        note: str, tree: str | None = None) -> None:
+    from .lead_admin import review_criteria
+
+    if not review_criteria(str(original["tz"]), str(original["body"] or "")):
+        return
+    checked = tx.query(
+        "SELECT payload FROM events WHERE kind='run' AND rc=0 AND worker_id=? "
+        "AND project=? AND tz=? AND ts>=?",
+        (worker_id, review["project"], review["tz"], review["started_at"]),
+    )
+    if len((note or "").strip()) < 40 or not any(
+        _payload_commands(row["payload"]) and
+        (not tree or _payload_tree(row["payload"]) == tree) for row in checked
+    ):
+        raise ValueError("accept по criteria требует мотивированный note и собственный "
+                         "успешный прогон проверки по этой задаче и версии файлов")
+
+
 def _expected_run_cwd(tx: Any, worker_id: str, since: str) -> str:
     held = tx.one(
         "SELECT c.id,c.project,t.kind,p.root FROM claims c JOIN projects p ON p.name=c.project "
@@ -590,16 +671,82 @@ def _down_world_resource(tx: Any, explanation: str) -> str | None:
     return None
 
 
+def _undeclared_world_resource(review: Any, explanation: str) -> str | None:
+    """Ресурс мира, которого ревью не получило, хотя причина блока — ровно его отсутствие.
+
+    04.11.2026: телефон был подключён, а 10 ревью Nova замерли «system-blocker: нет
+    авторизованного Android/ADB-устройства, resources=[]» и ушли владельцу «подключи PHONEB».
+    Исходные ТЗ (TZ-272, TZ-282) не объявили ресурс, вся цепочка request/fix/review унаследовала
+    пустоту, а памятка честно запрещает трогать телефон без ресурса. `match` ресурса в
+    fleet-projects.toml — как ревьюеры называют его своими словами.
+    """
+    from . import world
+    have = {str(x) for x in _json_list(review["resources"])}
+    for name, info in world.config().items():
+        pattern = str(info.get("match") or "")
+        if not info.get("world") or not pattern or name in have:
+            continue
+        try:
+            if re.search(pattern, explanation, re.IGNORECASE):
+                return name
+        except re.error:
+            continue
+    return None
+
+
 def _busy_run_resource(explanation: str) -> str | None:
     """Ресурс уровня run («heavy-build»), о котором run ответил «сейчас занят»."""
     from . import world
     text = explanation.casefold()
-    if "сейчас занят" not in text:
-        return None
     for name in world.run_scoped():
         if f"«{name.casefold()}» сейчас занят" in text or f"{name.casefold()} сейчас занят" in text:
             return name
+    # 03.11.2026: ревьюеры пишут своими словами — «shared resource `heavy-build` occupied by
+    # operator check_all», «heavy-build busy», «heavy-build занят». Имя ресурса рядом со словом
+    # занятости — та же временная занятость, а не проектный блокер.
+    for name in world.run_scoped():
+        key = re.escape(name.casefold())
+        if re.search(rf"{key}\W{{0,6}}\s*(?:\S+\s+){{0,3}}?(?:занят|occupied|busy|held|locked|in use)"
+                     rf"|(?:занят|occupied|busy|held|locked)\w*\s+(?:\S+\s+){{0,3}}?\W{{0,2}}{key}", text):
+            return name
     return None
+
+
+OPERATOR_CONDITION = "operator_condition"
+INFRA_BLOCK_PREFIX = "blocked: final review infrastructure"
+
+
+def _repeat_infra_condition(tx: Any, worker_id: str, review: Any, project: str, source_tz: str,
+                            explanation: str) -> str | None:
+    """Повторный инфраструктурный блок того же ревью той же сдачи → условие у оператора (I3).
+
+    04.11.2026 (FLEET-SERVICE-WORK §4 У2, §7 шаг 4): 465 из 467 блоков финального ревью с 02.11
+    ждали `platform_deploy_after` — каждый деплой dev размораживал их все, ревью брали снова и
+    снова блокировали той же причиной (до 9 раз одно ревью): телефон и OEM-матрица, захват
+    владельца, ресурс adb, гейт с исторической приёмкой. Деплоем это не лечится. Первый блок
+    остаётся прежним (деплой мог починить платформу); второй на ту же сдачу — одна строка в
+    журнале оператора, без заявки агенту и без автоматической разморозки.
+    """
+    import hashlib
+    from . import platform_manual
+    review_project, review_tz = str(review["project"]), str(review["tz"])
+    submitted = tx.one("SELECT id FROM events WHERE project=? AND tz=? AND kind='submit' "
+                       "ORDER BY id DESC LIMIT 1", (project, source_tz))
+    since = int(submitted["id"]) if submitted is not None else 0
+    earlier = tx.one("SELECT id FROM events WHERE project=? AND tz=? AND kind='block' AND id>? "
+                     "AND json_extract(payload,'$.reason') LIKE ? LIMIT 1",
+                     (review_project, review_tz, since, INFRA_BLOCK_PREFIX + "%"))
+    if earlier is None:
+        return None
+    fingerprint = hashlib.sha256(
+        f"{review_project}/{review_tz}:{since}:infra-condition".encode()).hexdigest()[:24]
+    return platform_manual.enqueue(
+        tx, fingerprint, source_project=review_project, source_tz=review_tz,
+        title=f"Условие не выполнено: финальное ревью {project}/{source_tz} снова упёрлось в среду",
+        detail=("Ревью этой сдачи уже блокировалось инфраструктурой; деплой его не лечит. "
+                "Задача агенту не создаётся, ревью ждёт оператора: устранить условие и "
+                f"`fleet.cmd reactivate \"{review_project}\" {review_tz} \"<что сделано>\"`. "
+                "Последняя причина ревьюера: " + explanation)[:4000])
 
 
 def is_platform_blocker(explanation: str) -> bool:
@@ -761,6 +908,7 @@ def _decide(store: Any, worker_id: str, verdict: str, note: str, *,
                     "выдано, когда гейт позеленеет. reject по существу правки — можно и сейчас."
                 )
             since = str(review["started_at"])
+            check_lead_criteria(tx, worker_id, review, original, note, tree)
             missing = unproven(_missing_runs(tx, worker_id, since, acceptance))
             if missing:
                 raise ValueError(
@@ -817,9 +965,46 @@ def _decide(store: Any, worker_id: str, verdict: str, note: str, *,
                     },
                 )
                 return
+            needed = _undeclared_world_resource(review, explanation)
+            if needed:
+                from . import world
+                declared = sorted({*_json_list(review["resources"]), needed})
+                updates = [("UPDATE claims SET state='released',released_at=? WHERE id=?",
+                            (now, review["claim_id"]))]
+                for task_project, task_tz in ((project, source_tz),
+                                              (str(review["project"]), str(review["tz"]))):
+                    row = tx.one("SELECT resources FROM tasks WHERE project=? AND tz=?",
+                                 (task_project, task_tz))
+                    if row is not None:
+                        merged = sorted({*_json_list(row["resources"]), needed})
+                        updates.append(("UPDATE tasks SET resources=?,updated_at=? WHERE project=? AND tz=?",
+                                        (json.dumps(merged, ensure_ascii=False), now, task_project, task_tz)))
+                down = world.last_state(tx, needed)[0] == world.DOWN \
+                    and bool(world.config().get(needed, {}).get("sensor"))
+                updates.append((f"UPDATE tasks SET state='{'frozen' if down else 'ready'}',updated_at=? "
+                                "WHERE project=? AND tz=?", (now, review["project"], review["tz"])))
+                tx.changes(updates, event={
+                    "kind": "block" if down else "resource_declared", "worker_id": worker_id,
+                    "project": str(review["project"]), "tz": str(review["tz"]),
+                    "payload": {
+                        "reason": (f"blocked: final review infrastructure — ресурс «{needed}» "
+                                   f"объявлен, ждёт датчика: {explanation}" if down else
+                                   f"ресурс «{needed}» объявлен по причине ревьюера: {explanation}")[:2000],
+                        "resource": needed, "resources": declared, "source_tz": source_tz,
+                        "automatic": True, "origin": "fleet_auto", "author_fault": False,
+                        **({"gate": "operational",
+                            "reactivate_policy": {"kind": "world_resource_up", "target": needed,
+                                                  "authority": "world_sensor"}} if down else {}),
+                    },
+                })
+                return
             world_down = _down_world_resource(tx, explanation)
+            condition = None if world_down else _repeat_infra_condition(
+                tx, worker_id, review, project, source_tz, explanation)
             policy = ({"kind": "world_resource_up", "target": world_down,
                        "authority": "world_sensor"} if world_down else
+                      {"kind": OPERATOR_CONDITION, "target": condition,
+                       "authority": "operator"} if condition else
                       {"kind": "platform_deploy_after", "target": now,
                        "authority": "platform_guard"})
             tx.changes(
@@ -848,7 +1033,7 @@ def _decide(store: Any, worker_id: str, verdict: str, note: str, *,
                     },
                 },
             )
-            if _after is not None and not world_down:
+            if _after is not None and not world_down and not condition:
                 # A down world resource is not project work: no request an agent could do.
                 review_project, review_tz = str(review["project"]), str(review["tz"])
                 _after.append(lambda: _route_project_blocker(
@@ -857,13 +1042,18 @@ def _decide(store: Any, worker_id: str, verdict: str, note: str, *,
         # Финальный круг исправлений: при зелёной приёмке ревьюера reject не рождает ещё один
         # fix — работа принимается, а замечание становится отдельной задачей (follow-up).
         follow_up = ""
-        if (verdict == "reject" and original["kind"] == "fix"
+        from .generators import enabled as task_generators_enabled
+        if (task_generators_enabled() and verdict == "reject" and original["kind"] == "fix"
                 and FINAL_MARK in str(original["body"] or "")
                 and not (project == "Mill Works" and re.fullmatch(
                     r"fix:TZ-MR-batch-[a-z0-9]{6,40}(?::[1-9][0-9]*)?",
                     str(original["tz"])))):
             since = str(review["started_at"])
-            green = bool(acceptance) and not unproven(_missing_runs(tx, worker_id, since, acceptance)) and not (
+            from .lead_admin import review_criteria
+
+            green = (not review_criteria(source_tz, str(original["body"] or ""))
+                     and bool(acceptance)
+                     and not unproven(_missing_runs(tx, worker_id, since, acceptance))) and not (
                 tree and unproven(_missing_runs(tx, worker_id, since, acceptance, tree))
             )
             if green:  # цвет ствола вердикт не держит (п.3 плана консорциума)
@@ -935,6 +1125,8 @@ def _decide(store: Any, worker_id: str, verdict: str, note: str, *,
         fix_tz: str | None = None
         follow_tz: str | None = None
         final_round, hard_round, rounds = False, False, 0
+        lead_attempt = False
+        requeue: dict[str, Any] = {}
         if verdict == "accept":
             statements.append(
                 (
@@ -986,67 +1178,121 @@ def _decide(store: Any, worker_id: str, verdict: str, note: str, *,
                     )
                 )
         else:
-            if fix_source is not None:
+            from .lead import is_lead
+            lead_attempt = is_lead(root_tz)
+            requeue_mode = (not lead_attempt and not task_generators_enabled()
+                            and review_requeue_enabled())
+            if fix_source is not None and not requeue_mode:
                 statements.append(
                     (
                         "UPDATE tasks SET state='rejected',updated_at=? WHERE project=? AND tz=?",
                         (now, project, source_tz),
                     )
                 )
-            # A rejected source stays submitted while its repair is queued. This
-            # prevents the source and the repair from becoming two parallel jobs
-            # with the same ownership.
-            fix_tz = _next_tz(tx, root_project, f"fix:{root_tz}")
-            # Предохранитель от порочного круга: исправления раз за разом упираются в новые
-            # замечания — обычно это ТЗ без границ. С MAX_FIX_ROUNDS fix идёт финальным кругом
-            # (его ревью при зелёной приёмке примет работу), а после MAX_FIX_ROUNDS_HARD
-            # следующий fix становится крупным diagnostic/end-to-end repair вместо freeze.
-            rounds = int(
-                tx.scalar(
-                    "SELECT COUNT(*) FROM tasks WHERE project=? AND kind='fix' AND (tz=? OR tz LIKE ?)",
-                    (root_project, f"fix:{root_tz}", f"fix:{root_tz}:%"),
+            if lead_attempt:
+                # Return the existing charter after a rejected milestone regardless
+                # of generator policy: no new task is being generated.
+                # 08.11 (LEAD-SYSTEM-DESIGN 3.1, S6): отказ вехи ведущего — следующая попытка того же
+                # O-*, а не новая задача fix:TZ-LEAD:N. Раунды теряли письма (адресованы закрытому
+                # раунду) и копили замороженные ревью; причина отказа видна ведущему в брифе
+                # («Чем кончились последние вехи»), устав возвращается в работу сам.
+                rounds = int(tx.scalar(
+                    "SELECT COUNT(*) FROM events WHERE project=? AND kind='reject' AND "
+                    "json_extract(payload,'$.lead_attempt')=1 AND id>COALESCE((SELECT MAX(id) FROM events "
+                    "WHERE project=? AND kind='accept' AND (tz=? OR tz LIKE ?)),0)",
+                    (root_project, root_project, root_tz, f"fix:{root_tz}%")) or 0)
+                statements.append(
+                    ("UPDATE tasks SET state='ready',updated_at=? WHERE project=? AND tz=?",
+                     (now, root_project, root_tz)))
+            elif requeue_mode:
+                # №118: та же задача (исторический fix: — сам fix, корень остаётся submitted)
+                # возвращается в ready; новых задач нет. Причина отказа видна следующему
+                # исполнителю в брифе fleet_take (briefing._reject_history_lines по events).
+                revision_now = _submitted_revision(tx, project, source_tz)
+                attempt, identical = _requeue_history(tx, project, source_tz, revision_now)
+                exhausted = identical or attempt > MAX_REQUEUE
+                requeue = {"requeue": 1, "attempt": attempt, "revision": revision_now,
+                           "requeue_exhausted": bool(exhausted)}
+                if exhausted:
+                    requeue["exhausted_reason"] = (
+                        "та же ревизия сдана повторно после отказа" if identical else
+                        f"{attempt - 1} отказов подряд без принятия")
+                    statements.append(
+                        ("UPDATE tasks SET state='rejected',updated_at=? WHERE project=? AND tz=?",
+                         (now, project, source_tz)))
+                    if fix_source is not None:
+                        statements.append(
+                            ("UPDATE tasks SET state='rejected',updated_at=? WHERE project=? AND tz=?",
+                             (now, root_project, root_tz)))
+                else:
+                    statements.append(
+                        ("UPDATE tasks SET state='ready',updated_at=? WHERE project=? AND tz=?",
+                         (now, project, source_tz)))
+            elif not task_generators_enabled():
+                # Non-lead repairs are new generated tasks and remain disabled.
+                statements.append(
+                    ("UPDATE tasks SET state='rejected',updated_at=? WHERE project=? AND tz=?",
+                     (now, root_project, root_tz)))
+                fix_tz = None
+            else:
+                # A rejected source stays submitted while its repair is queued. This
+                # prevents the source and the repair from becoming two parallel jobs
+                # with the same ownership.
+                fix_tz = _next_tz(tx, root_project, f"fix:{root_tz}")
+                # Предохранитель от порочного круга: исправления раз за разом упираются в новые
+                # замечания — обычно это ТЗ без границ. С MAX_FIX_ROUNDS fix идёт финальным кругом
+                # (его ревью при зелёной приёмке примет работу), а после MAX_FIX_ROUNDS_HARD
+                # следующий fix становится крупным diagnostic/end-to-end repair вместо freeze.
+                rounds = int(
+                    tx.scalar(
+                        "SELECT COUNT(*) FROM tasks WHERE project=? AND kind='fix' AND (tz=? OR tz LIKE ?)",
+                        (root_project, f"fix:{root_tz}", f"fix:{root_tz}:%"),
+                    )
+                    or 0
                 )
-                or 0
-            )
-            final_round = rounds >= MAX_FIX_ROUNDS
-            hard_round = rounds >= MAX_FIX_ROUNDS_HARD
-            body_lines = [
-                f"[fleet-fix] source={root_project}/{root_tz}",
-                f"Вердикт ревьюера {worker_id}: reject.",
-                f"Что исправить: {(note or '').strip() or '(причина не уточнена)'}",
-                "После исправления заново прогони acceptance исходной задачи.",
-            ]
-            if final_round:
-                body_lines.append(f"Это {rounds + 1}-й отказ подряд. " + FINAL_FIX_NOTE)
-            if hard_round:
-                body_lines.append(HARD_FIX_NOTE)
-            body = "\n".join(body_lines)
-            statements.append(
-                (
-                    "INSERT INTO tasks("
-                    "project,tz,title,state,priority,kind,spec_path,spec_sha,needs,owns,"
-                    "resources,acceptance,author_worker,body,created_at,updated_at"
-                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                final_round = rounds >= MAX_FIX_ROUNDS
+                hard_round = rounds >= MAX_FIX_ROUNDS_HARD
+                body_lines = [
+                    f"[fleet-fix] source={root_project}/{root_tz}",
+                    f"Вердикт ревьюера {worker_id}: reject.",
+                    f"Что исправить: {(note or '').strip() or '(причина не уточнена)'}",
+                    "После исправления заново прогони acceptance исходной задачи.",
+                ]
+                if final_round:
+                    body_lines.append(f"Это {rounds + 1}-й отказ подряд. " + FINAL_FIX_NOTE)
+                if hard_round:
+                    body_lines.append(HARD_FIX_NOTE)
+                from .lead_admin import criteria_block, review_criteria
+
+                body = "\n".join(body_lines) + criteria_block(
+                    review_criteria(root_tz, str(root["body"] or ""))
+                )
+                statements.append(
                     (
-                        root_project,
-                        fix_tz,
-                        f"Fix {root_tz}",
-                        "ready",
-                        int(root["priority"]),
-                        "fix",
-                        str(root["spec_path"] or ""),
-                        str(root["spec_sha"] or ""),
-                        "[]",
-                        str(root["owns"] or "[]"),
-                        str(root["resources"] or "[]"),
-                        str(root["acceptance"] or "[]"),
-                        None,
-                        body,
-                        now,
-                        now,
-                    ),
+                        "INSERT INTO tasks("
+                        "project,tz,title,state,priority,kind,spec_path,spec_sha,needs,owns,"
+                        "resources,acceptance,author_worker,body,created_at,updated_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            root_project,
+                            fix_tz,
+                            f"Fix {root_tz}",
+                            "ready",
+                            int(root["priority"]),
+                            "fix",
+                            str(root["spec_path"] or ""),
+                            str(root["spec_sha"] or ""),
+                            "[]",
+                            str(root["owns"] or "[]"),
+                            str(root["resources"] or "[]"),
+                            str(root["acceptance"] or "[]"),
+                            None,
+                            body,
+                            now,
+                            now,
+                        ),
+                    )
                 )
-            )
         tx.changes(
             statements,
             event={
@@ -1062,6 +1308,8 @@ def _decide(store: Any, worker_id: str, verdict: str, note: str, *,
                     "converted_from_reject": bool(follow_up),
                     "fix_round": rounds + 1 if fix_tz is not None else 0,
                     "diagnostic_repair": bool(fix_tz is not None and hard_round),
+                    **({"lead_attempt": 1, "attempt": rounds + 1} if lead_attempt else {}),
+                    **requeue,
                 },
             },
         )
@@ -1115,6 +1363,9 @@ def open_request(
     kind = (kind or "other").strip().casefold()
     to = (to or "owner").strip()
     if kind in _ACCESS_KINDS or to.casefold() == "owner":
+        return None
+    from .generators import enabled as task_generators_enabled
+    if not task_generators_enabled():
         return None
     if not request_id.strip() or not summary.strip():
         raise ValueError("request_id and summary are required")

@@ -123,7 +123,7 @@ def _record_invalid(store: Any, project: str, root: Path, path: Path, reason: st
             )
         elif old["state"] in _OPEN_FIX:
             tx.change(
-                "UPDATE tasks SET state='ready', spec_sha=?,body=?,updated_at=datetime('now') "
+                "UPDATE tasks SET state='ready', spec_sha=?,body=?,updated_at=strftime('%Y-%m-%dT%H:%M:%f+00:00','now') "
                 "WHERE project=? AND tz=?",
                 (fingerprint, body, project, fix_id),
                 event={"kind": "draft_fix_refresh", "project": project, "tz": fix_id,
@@ -139,7 +139,7 @@ def _close_fix(store: Any, project: str, root: Path, path: Path) -> None:
         row = tx.one("SELECT state FROM tasks WHERE project=? AND tz=?", (project, fix_id))
         if row is not None and row["state"] in _OPEN_FIX:
             tx.change(
-                "UPDATE tasks SET state='accepted',updated_at=datetime('now') WHERE project=? AND tz=?",
+                "UPDATE tasks SET state='accepted',updated_at=strftime('%Y-%m-%dT%H:%M:%f+00:00','now') WHERE project=? AND tz=?",
                 (project, fix_id),
                 event={"kind": "draft_fix_resolved", "project": project, "tz": fix_id,
                        "payload": {"draft": rel}},
@@ -191,6 +191,9 @@ def register_drafts(
     result: dict[str, Any] = {
         "registered": [], "invalid": {}, "waiting": {}, "commit_errors": {}, "deferred": {},
     }
+    from .generators import enabled as task_generators_enabled
+    if not task_generators_enabled():
+        return result
     with store.read() as tx:
         projects = [(str(r["name"]), Path(str(r["root"])).resolve())
                     for r in tx.query("SELECT name,root FROM projects WHERE active=1")]
@@ -202,6 +205,10 @@ def register_drafts(
             result["invalid"][f"{project}/ToDo/tz-drafts"] = "unsafe_symlink_directory"
             continue
         paths = sorted(drafts.glob("TZ-*.md"))
+        if not paths:
+            # 05.11.2026: an empty drafts folder still scanned and parsed every spec of the
+            # project (_registered_ids, known) each 30 s — nothing to register, nothing to read.
+            continue
         # A draft may exist on disk but fail parsing/validation. Dependants
         # must wait for its repair, not report that its TZ is missing.
         # Unsafe symlinks never count as a present draft dependency.

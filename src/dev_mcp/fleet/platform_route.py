@@ -35,6 +35,8 @@ _PLATFORM_DEFECT = re.compile(
     r"срабатывает|совпадает|сопоставл\w*)\b", re.I
 )
 _PLATFORM_SUBJECT = re.compile(r"\b(?:fleet|dev-mcp|платформ\w*|флот\w*)\b", re.I)
+_TASK_ID = re.compile(r"\b(?:(?:fix|review|request|revalidate|styk|cross-defect):)+[\w:.-]+", re.I)
+_GUARD_ONLY = re.compile(r"страж|guard", re.I)
 _SHA = re.compile(r"^[a-f0-9]{40}$")
 _MARK = "[platform-route]"
 _COUNT = re.compile(r"затронуто задач: \d+")
@@ -61,10 +63,18 @@ def is_platform_request(*, summary: str, detail: str = "", path: str = "") -> bo
     raw_path = path.replace("\\", "/")
     if _PLATFORM_PATH.search(raw_path):
         return True
+    # 05.11.2026: Nova fix:TZ-LEAD:6 asked for a semantic guard in its own ops/lead —
+    # «fix» from its task id counted as a defect word and «guard» as the platform topic,
+    # so a project request froze as a manual platform repair. Task ids are not words, and
+    # «guard» is the platform's only next to fleet/platform (a common word in projects).
+    summary, detail = _TASK_ID.sub(" ", summary), _TASK_ID.sub(" ", detail)
     if not _PLATFORM_DEFECT.search(summary):
         return False
-    return bool(_PLATFORM_TEXT.search(summary) or
-                (_PLATFORM_SUBJECT.search(summary) and _PLATFORM_TEXT.search(detail)))
+    subject = bool(_PLATFORM_SUBJECT.search(summary) or _PLATFORM_SUBJECT.search(detail))
+    text = _PLATFORM_TEXT.search(summary)
+    if text and _GUARD_ONLY.fullmatch(text.group(0)) and not subject:
+        return False  # «guard» — частое слово проектов; страж платформы только рядом с fleet
+    return bool(text or (_PLATFORM_SUBJECT.search(summary) and _PLATFORM_TEXT.search(detail)))
 
 
 def _topic(text: str) -> str:
@@ -186,6 +196,26 @@ def require_request_allowed(store: Any, project: str, tz: str) -> None:
         )
 
 
+_CLAIM_REF = re.compile(r"\bclaim(?:_id)?\s*[=:#№]?\s*(\d{3,})\b", re.I)
+
+
+def refused_source(tx: Any, worker_id: str | None, project: str, tz: str,
+                   text: str) -> tuple[str, str]:
+    """№48 B2: заявка привязывается к задаче, чью операцию отказали, а не к текущему захвату чата.
+
+    08.11 W9087: отказ FLEET_FOREIGN_PROJECT по fix Beta App (claim 31488) был заявлен уже
+    из захвата TSPU/TZ-LEAD (claim 31494) — и заморозил TSPU чужим хвостом. Явная ссылка
+    `claim_id=N` на собственный захват того же агента определяет настоящий источник."""
+    if not worker_id:
+        return project, tz
+    for match in _CLAIM_REF.finditer(text or ""):
+        row = tx.one("SELECT project,tz FROM claims WHERE id=? AND worker_id=?",
+                     (int(match.group(1)), worker_id))
+        if row is not None:
+            return str(row["project"]), str(row["tz"])
+    return project, tz
+
+
 def route_request(
     store: Any, *, source_project: str, source_tz: str,
     summary: str, detail: str = "", path: str = "", worker_id: str | None = None,
@@ -208,6 +238,8 @@ def route_request(
     target_ref = f"{PLATFORM}/{tz}"
 
     with store.tx() as tx:
+        source_project, source_tz = refused_source(
+            tx, worker_id, source_project, source_tz, f"{summary}\n{detail}")
         source = tx.one(
             "SELECT state FROM tasks WHERE project=? AND tz=?",
             (source_project, source_tz),
@@ -223,6 +255,14 @@ def route_request(
             manual = platform_manual.enqueue(tx,digest,title=summary,detail=detail,
                                              source_project=source_project,source_tz=source_tz,
                                              owns=[relative])
+            from .lead import is_lead
+            if is_lead(source_tz):
+                # №48 §G/B1: ведущий не замораживается платформенной ошибкой — заявка живёт
+                # у оператора отдельно, захват и проект остаются у ведущего.
+                tx.record_event(kind='platform_route_lead_kept',project=source_project,tz=source_tz,
+                                payload={'platform_task':manual,'fingerprint':digest})
+                return RouteResult('created',manual,1,
+                                   'платформу исправляет оператор; ведущий продолжает независимые шаги')
             tx.record_event(kind='platform_route_wait',project=source_project,tz=source_tz,
                             payload={'fingerprint':digest,'platform_task':manual,
                                      'source_project':source_project,'source_tz':source_tz})

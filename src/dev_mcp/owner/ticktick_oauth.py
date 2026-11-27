@@ -17,6 +17,7 @@ import os
 import secrets as _secrets
 import time
 from pathlib import Path
+from dev_mcp.json_book import read_json, write_json
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse, parse_qs
@@ -132,15 +133,13 @@ def exchange(meta: dict, client_id: str, redirect_uri: str, code: str, verifier:
 def save(grant: dict, path: Path | None = None) -> None:
     path = path or SECRET_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(grant), encoding="utf-8")
-    os.replace(tmp, path)
+    write_json(path, grant)
 
 
 def load(path: Path | None = None) -> dict | None:
     path = path or SECRET_PATH
     try:
-        grant = json.loads(path.read_text(encoding="utf-8"))
+        grant = read_json(path, strict=True)
     except (OSError, ValueError):
         return None
     return grant if isinstance(grant, dict) and isinstance(grant.get("access_token"), str) else None

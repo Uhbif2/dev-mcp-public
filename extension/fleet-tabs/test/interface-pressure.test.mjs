@@ -22,6 +22,15 @@ test('existing healthy idle tabs also obey four-interface cap and retain chat UR
   assert.equal(rows.length-p.close.length,4);
 });
 
+test('lazy unowned placeholders do not force healthy interfaces closed after profile restore',()=>{
+  const cold=Array.from({length:6},(_,i)=>({id:100+i,own:false,dormant:true}));
+  const active=Array.from({length:4},(_,i)=>({id:i,label:'f'+i,own:true,
+    url:'https://chatgpt.com/c/abcdefab-'+i,page:{composerEmpty:true,generating:false}}));
+  const p=interfacePlan([...cold,...active],active.map(r=>({label:r.label,task:'P/TZ-1'})));
+  assert.deepEqual(p.close,[]);
+  assert.equal(p.degraded,false);
+});
+
 test('visible reopened chats and corrupt queue entries cannot hold admission forever',()=>{
   const rows=[{id:1,label:'f1',own:true,url:'https://chatgpt.com/c/abcdefab-1',page:{composerEmpty:true}}];
   const workers=['f1','f2'].map(label=>({label,task:'P/TZ-1'}));

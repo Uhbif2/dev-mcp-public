@@ -115,14 +115,56 @@ def recover(audit) -> bool:
         kernel.CloseHandle(handle)
 
 
+def normalize_transport_priority(audit) -> bool:
+    """The HTTP hop serves the same interactive requests as this backend.
+
+    The transport inherited BelowNormal/low-I/O while only the backend restored
+    its serving priority. Normalize only our verified dev ancestor so every
+    local request hop has the same class; background children keep theirs.
+    """
+    if sys.platform != 'win32':
+        return False
+    import psutil
+    state = json.loads(STATE.read_text(encoding='utf-8'))
+    parents = psutil.Process().parents()[:8]
+    ancestors = [{'pid': p.pid, 'command': subprocess.list2cmdline(p.cmdline())}
+                 for p in parents]
+    pid = recovery_pid(state, ancestors)
+    process = next((p for p in parents if p.pid == pid), None)
+    if process is None or not process.is_running():
+        return False
+    cpu, io = process.nice(), process.ionice()
+    low_cpu = cpu in (psutil.IDLE_PRIORITY_CLASS, psutil.BELOW_NORMAL_PRIORITY_CLASS)
+    low_io = io in (psutil.IOPRIO_VERYLOW, psutil.IOPRIO_LOW)
+    if not low_cpu and not low_io:
+        return False
+    if json.loads(STATE.read_text(encoding='utf-8')) != state or not process.is_running():
+        return False
+    if low_cpu:
+        process.nice(psutil.NORMAL_PRIORITY_CLASS)
+    if low_io:
+        process.ionice(psutil.IOPRIO_NORMAL)
+    audit.record('dev_transport_priority',
+                 {'pid': pid, 'before': {'cpu': int(cpu), 'io': int(io)},
+                  'after': {'cpu': int(process.nice()), 'io': int(process.ionice())}},
+                 decision='allow', reason='verified own dev transport serves interactive MCP requests')
+    return True
+
+
 def watch(stop: threading.Event, audit, *, probe=port_up, repair=recover,
-          interval_s: float = 10) -> None:
+          interval_s: float = 10, normalize=None) -> None:
     seen = False
     failures = 0
     while not stop.is_set():
         try:
             if probe():
                 seen, failures = True, 0
+                if normalize is not None:
+                    try:
+                        normalize(audit)
+                    except Exception:
+                        # Priority permissions must never disable listener recovery.
+                        pass
             elif seen:
                 failures += 1
                 if failures >= 3:
@@ -140,5 +182,6 @@ def start(home: Path, policy_path: str, audit, stop: threading.Event) -> None:
     if (sys.platform != 'win32' or installed is None or home.resolve() != installed.resolve()
             or Path(policy_path).resolve() != (installed/'policy.toml').resolve()):
         return
-    threading.Thread(target=watch, args=(stop, audit), daemon=True,
+    threading.Thread(target=watch, args=(stop, audit),
+                     kwargs={'normalize': normalize_transport_priority}, daemon=True,
                      name='dev-mcp-listener-guard').start()

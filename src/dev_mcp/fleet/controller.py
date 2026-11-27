@@ -906,6 +906,17 @@ class Controller:
                 destination = self.intent_project(change)
                 if not isinstance(destination, IntentProject):
                     raise TypeError("intent_project must return trusted IntentProject")
+                from .stage_history import intent_to_instruction, is_lead_project
+                if is_lead_project(self.store, destination.project_name):
+                    # 08.11 (LEAD-SYSTEM-DESIGN 2.1): у проекта с ведущим дерево стадий — история;
+                    # намерение владельца — поручение ведущему, а не новое дерево.
+                    intent_to_instruction(
+                        self.store, destination.project_name, raw_intent=row["raw_intent"],
+                        source=f"intent:{row['source_id']}/{row['external_id']}@{row['revision']}")
+                    with self.store.tx():
+                        registry.ack_change(row["event_id"])
+                    consumed += 1
+                    continue
                 spawn_project(
                     self.store, change, parent=destination.parent,
                     project_name=destination.project_name, size=destination.size,
@@ -1105,7 +1116,7 @@ class Controller:
                 if violation.code == "wait_cycle" and violation.outcome_id != first_cycle_node:
                     continue
                 if violation.code == "no_next_step" and tx.scalar(
-                    "SELECT COUNT(*) FROM outcome_work w JOIN tasks t "
+                    "SELECT COUNT(*) FROM outcome_work w CROSS JOIN tasks t "  # 08.11: от связей задачи, не от 15 тыс. принятых (1 с → <1 мс)
                     "ON t.project=w.project AND t.tz=w.tz "
                     "WHERE w.outcome_id=? AND t.state='accepted'",
                     (violation.outcome_id,),
@@ -1144,7 +1155,7 @@ class Controller:
                     (t.kind='triage' AND t.state IN ('ready','frozen')
                      AND t.body LIKE '%[fleet-controller] outcome=%')
                     THEN 1 ELSE 0 END) AS blocking
-                FROM outcome_work w JOIN tasks t ON t.project=w.project AND t.tz=w.tz
+                FROM outcome_work w CROSS JOIN tasks t ON t.project=w.project AND t.tz=w.tz
                 GROUP BY w.outcome_id""")
             for item in completed:
                 row = rows.get(item["outcome_id"])
@@ -1451,149 +1462,6 @@ def run_daily_drill_scheduler(stop_event: threading.Event, *,
         stop_event.wait(remaining)
 
 
-def _cross_review_followups(store: Store, reports: list[dict[str, Any]]) -> int:
-    """Turn validated P0/P1 Gemini hypotheses into reviewable defect work.
-
-    Never auto-accept or close a source task. A stale SHA cannot create work.
-    """
-    from . import evidence
-
-    created = 0
-    for report in reports:
-        if report.get("state") != "issues":
-            continue
-        with store.read() as tx:
-            request = tx.one(
-                "SELECT project,tz,payload FROM events "
-                "WHERE id=? AND kind='cross_review_requested'",
-                (report.get("request_id"),),
-            )
-            if request is None:
-                continue
-            result = tx.one(
-                "SELECT payload FROM events WHERE kind='cross_review_result' "
-                "AND project=? AND tz=? AND id>? ORDER BY id DESC LIMIT 1",
-                (request["project"], request["tz"], report["request_id"]),
-            )
-        if result is None:
-            continue
-        try:
-            pinned = json.loads(request["payload"])
-            model = json.loads(result["payload"])
-            if (model["state"] != "issues" or model["tree_sha"] != pinned["tree_sha"]
-                    or report["tree_sha"] != pinned["tree_sha"]
-                    or not isinstance(model["obstacles"], list)):
-                continue
-            claim_id = int(pinned["claim_id"])
-            current = lambda: evidence.tree_hash(evidence.claim_paths(store, claim_id))
-            if current() != pinned["tree_sha"]:
-                continue  # Stale source, cannot turn old model text into repair.
-            for defect in model["obstacles"][:30]:
-                if (not isinstance(defect, dict) or defect.get("kind") != "defect"
-                        or defect.get("next_work") != "fix" or defect.get("source") != "model_hypothesis"
-                        or defect.get("severity") not in {"P0", "P1"}
-                        or defect.get("tree_sha") != pinned["tree_sha"]
-                        or defect.get("snapshot_sha") != model["snapshot_sha"]
-                        or defect.get("project") != request["project"]
-                        or defect.get("task") != request["tz"]
-                        or not isinstance(defect.get("finding_id"), str)
-                        or not isinstance(defect.get("testcase"), str)
-                        or not isinstance(defect.get("proof_refs"), list)
-                        or not defect["proof_refs"]):
-                    continue
-                fingerprint = hashlib.sha256(json.dumps([
-                    request["project"], request["tz"], model["snapshot_sha"],
-                    defect["finding_id"],
-                ], separators=(",", ":"), ensure_ascii=True).encode("ascii")).hexdigest()[:20]
-                tz = f"cross-defect:{fingerprint}"
-                body = (
-                    f"[fleet-cross-review] source={request['project']}/{request['tz']}\n"
-                    f"Gemini hypothesis, not independent acceptance: {defect['severity']}\n"
-                    f"Tree SHA: {pinned['tree_sha']}\n"
-                    f"Snapshot SHA: {model['snapshot_sha']}\n"
-                    f"Finding: {str(defect.get('explanation', ''))[:900]}\n"
-                    f"Reproduction: {defect['testcase'][:900]}\n"
-                    "References: " + json.dumps(defect["proof_refs"][:20], ensure_ascii=True)
-                )
-                if current() != pinned["tree_sha"]:
-                    break
-                stamp = _now()
-                with store.tx() as tx:
-                    inserted = tx.change(
-                        "INSERT OR IGNORE INTO tasks(project,tz,title,state,priority,kind,"
-                        "spec_path,spec_sha,needs,owns,resources,acceptance,author_worker,"
-                        "body,created_at,updated_at) VALUES(?,?,?,'ready',2,'triage',"
-                        "'','','[]','[]','[]','[]',NULL,?,?,?)",
-                        (request["project"], tz,
-                         f"Проверить {defect['severity']} Gemini: {request['tz']}",
-                         body, stamp, stamp), event="controller.cross_review_defect",
-                    )
-                    created += int(inserted.rowcount > 0)
-        except (KeyError, ValueError, TypeError, OverflowError):
-            continue
-    return created
-
-
-def _cross_review_independent_outcomes(store: Store, *, limit: int = 32) -> int:
-    """Calibrate model hypotheses only from later server-issued reviewer verdicts."""
-    from . import cross_review
-
-    with store.read() as tx:
-        reviews = tx.query(
-            "SELECT e.id,e.project,e.tz,e.worker_id,e.kind FROM events e "
-            "WHERE e.kind IN ('accept','reject') "
-            "AND EXISTS (SELECT 1 FROM events r WHERE r.kind='cross_review_requested' "
-            "AND r.project=e.project AND r.tz=e.tz AND r.id<e.id) "
-            "ORDER BY e.id DESC LIMIT ?", (limit,),
-        )
-    updated = 0
-    for event in reviews:
-        proof_id = f"event:{event['id']}"
-        with store.read() as tx:
-            existing = tx.query("SELECT payload FROM events "
-                                "WHERE kind='cross_review_outcome' AND project=? AND tz=?",
-                                (event["project"], event["tz"]))
-            requested = tx.one(
-                "SELECT payload FROM events WHERE kind='cross_review_requested' "
-                "AND project=? AND tz=? AND id<? ORDER BY id DESC LIMIT 1",
-                (event["project"], event["tz"], event["id"]),
-            )
-            owner = tx.one("SELECT author_worker FROM tasks WHERE project=? AND tz=?",
-                           (event["project"], event["tz"]))
-        if requested is None or (owner is not None and owner["author_worker"] == event["worker_id"]):
-            continue
-        if any(json.loads(row["payload"]).get("proof_id") == proof_id for row in existing):
-            continue
-        try:
-            snapshot = cross_review._submitted_snapshot(
-                store, event["project"], event["tz"], json.loads(requested["payload"])
-            )
-            cross_review.record_outcome(
-                store, snapshot, independent_clear=event["kind"] == "accept",
-                source="fleet_review", proof_id=proof_id,
-            )
-            updated += 1
-        except (ValueError, KeyError, TypeError, OSError):
-            continue  # No current tree proof, no calibration.
-    return updated
-
-
-def run_cross_review_worker(store: Store, stop_event: threading.Event, *,
-                            interval_s: float = 30,
-                            ask: Callable[..., Any] | None = None) -> None:
-    """One model attempt per wake, outside Controller.tick and all submit txs."""
-    from . import cross_review
-
-    while not stop_event.is_set():
-        try:
-            attempts = cross_review.process_pending(store, ask=ask, limit=1)
-            _cross_review_followups(store, attempts)
-            _cross_review_independent_outcomes(store)
-        except Exception:
-            LOG.exception("cross-review worker failed, retrying on next wake")
-        stop_event.wait(max(1.0, interval_s))
-
-
 def _production_handoff_route(
     db_path: Path, *, repository_root: Path | None = None,
     profile_root: Path | None = None,
@@ -1638,7 +1506,7 @@ def _production_handoff_route(
             # A running Chrome is not proof that *this* extension is running.
             # Require an actual DevTools target owned by the expected ID.
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open("http://127.0.0.1:9223/json", timeout=0.5) as response:
+            with opener.open("http://localhost:9223/json", timeout=0.5) as response:
                 targets = json.loads(response.read(262144))
             return isinstance(targets, list) and any(
                 isinstance(target, dict) and isinstance(target.get("url"), str)
@@ -1719,6 +1587,32 @@ def run_claim_maintenance_worker(
 
     while not stop_event.is_set():
         started = time.perf_counter()
+        try:
+            from .temp_gc import sweep as _temp_sweep
+            _temp_sweep()  # брошенные fleet-* в %TEMP%: в группе остаются 2 свежие
+        except Exception:  # noqa: BLE001 — уборка не должна ронять обслуживание
+            pass
+        # 15.11: the owner explicitly requested a dry-run of existing
+        # generated tasks, NOT retirement. Keep them pending until an explicit
+        # fleet.cmd retire operation is authorized.
+        from .generators import enabled as _task_generators_enabled
+        if _task_generators_enabled():
+            try:
+                from .stage_history import retire as _retire_stages
+                _retire_stages(store)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from .rudiments import retire as _retire_rudiments
+                _retire_rudiments(store)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            from . import field as _field
+            from .goals import project_info as _project_info
+            _field.tick(store, _project_info)  # 08.11 (3.4): сигналы поля → поручения ведущему
+        except Exception:  # noqa: BLE001
+            pass
         try:
             with store.read() as tx:
                 projects = [str(r["name"]) for r in tx.query(
@@ -1913,13 +1807,37 @@ def run_controller(db_path: str | Path, stop_event: threading.Event, *,
         LOG.warning("controller routes unprovisioned (fail closed): %s", route_state)
     threading.Thread(target=run_daily_drill_scheduler, args=(stop_event,),
                      daemon=True, name="dev-mcp-daily-synthetic-drills").start()
+    # Pilot (16.11.2026): read-only quick audits and a morning Markdown digest.
+    # Project review has its own opt-in per mode, independent of fix generators.
+    # Never launch real quick agents from a synthetic/test controller Store.
+    live_db = Path(__file__).resolve().parents[3] / "data" / "fleet" / "fleet.sqlite"
+    if Path(db_path).resolve() == live_db.resolve():
+        from .nightly_review import scheduler as run_nightly_review_scheduler
+        threading.Thread(target=run_nightly_review_scheduler, args=(stop_event,),
+                         kwargs={"store": store},
+                         daemon=True, name="dev-mcp-nightly-readonly-review").start()
+        # Keep the existing read-only ambientd warm independently of agent
+        # briefs and Claude sessions. A cold launch must never block take/quick.
+        from .memory_rules import run_daemon_keeper
+        threading.Thread(target=run_daemon_keeper, args=(stop_event,),
+                         daemon=True, name="dev-mcp-ambient-memory-keeper").start()
     if policy is not None and draft_runner is not None:
+        from .results import run_worker as run_results
+        threading.Thread(target=run_results, args=(store,stop_event), daemon=True,
+                         name='dev-mcp-owner-results').start()
         from .owner_notices import run_worker as run_owner_notices
         threading.Thread(target=run_owner_notices, args=(store,stop_event), daemon=True,
                          name='dev-mcp-owner-notices').start()
-        from dev_mcp.owner.ticktick_board import run_worker as run_ticktick_board
-        threading.Thread(target=run_ticktick_board, args=(store,stop_event), daemon=True,
-                         name='dev-mcp-ticktick-board').start()
+        # 07.11.2026 (владелец): TickTick выключен ([platform] ticktick = false), карточки
+        # владельцу идут в Telegram (owner_telegram.py).
+        from .goals import _load_doc
+        if bool((_load_doc().get('platform') or {}).get('ticktick', True)):
+            from dev_mcp.owner.ticktick_board import run_worker as run_ticktick_board
+            threading.Thread(target=run_ticktick_board, args=(store,stop_event), daemon=True,
+                             name='dev-mcp-ticktick-board').start()
+        from .owner_telegram import run_worker as run_owner_telegram
+        threading.Thread(target=run_owner_telegram, args=(store,stop_event), daemon=True,
+                         name='dev-mcp-owner-telegram').start()
         from .storage_guard import run_worker as run_storage_guard
         threading.Thread(target=run_storage_guard, args=(store,stop_event), daemon=True,
                          name='dev-mcp-storage-guard').start()
@@ -1933,8 +1851,6 @@ def run_controller(db_path: str | Path, stop_event: threading.Event, *,
         threading.Thread(target=run_draft_registration_worker,
                          args=(store, policy, draft_runner, stop_event), daemon=True,
                          name='dev-mcp-draft-registration').start()
-    threading.Thread(target=run_cross_review_worker, args=(store, stop_event),
-                     daemon=True, name="dev-mcp-gemini-cross-review").start()
     # Share the production controller lifecycle and shutdown event. Regater uses
     # the same per-project RLock as Integrator._gate to avoid parallel gates.
     threading.Thread(target=run_regater, args=(db_path, stop_event),
@@ -1981,6 +1897,46 @@ def run_controller(db_path: str | Path, stop_event: threading.Event, *,
                     })
             except Exception:
                 LOG.exception("stall watchdog error could not be recorded")
+        try:
+            # 06.11 (фаза 1.1): сначала снять препятствия, чей предикат выполнился, и обновить
+            # карточки владельцу — затем готовность устава в lead.reopen.
+            from . import obstacles
+            obstacles.tick(store)
+        except Exception:
+            LOG.exception("lead obstacles tick failed")
+        try:
+            from . import lead_focus
+            lead_focus.tick(store)
+        except Exception:
+            LOG.exception("lead focus maintenance failed")
+        try:
+            from . import lead
+            lead.reopen(store)
+        except Exception:
+            LOG.exception("lead reopen failed")
+        try:
+            from . import witness
+            witness.tick(store)
+        except Exception:
+            LOG.exception("witness tick failed")
+        try:
+            # LEAD-SYSTEM-DESIGN 3.2: суточный read-only аудит; находки — строки брифа, не задачи.
+            from . import arbiter
+            arbiter.run(store)
+        except Exception:
+            LOG.exception("arbiter run failed")
+        try:
+            from . import platform_manual
+            if platform_manual.enabled():
+                platform_manual.recheck(store)
+        except Exception as exc:
+            LOG.exception("operator backlog recheck failed")
+            try:
+                with store.tx() as tx:
+                    tx.record_event(kind="manual_platform_recheck_error",
+                                    payload={"error": type(exc).__name__})
+            except Exception:
+                LOG.exception("operator backlog recheck error could not be recorded")
         try:
             _controller_guard_watch_step(store, db_path)
         except Exception as exc:

@@ -154,8 +154,11 @@ def _command(raw: str, root: Path | None = None) -> tuple[tuple[str, ...], str |
             doc_check = (len(argv) > start + 1
                          and argv[start].replace('\\', '/').casefold() == 'tools/tzcheck.py'
                          and _safe_document_check(argv[start + 1:]))
+            # 05.11: `py -3 ops/lead/ledger_check.py --selftest` отвергался как «невозможная
+            # приёмка» — устав ведущего не регистрировался. Флаг самопроверки — не программа.
+            flags_only = all(_FLAG.fullmatch(arg) for arg in argv[start + 1:])
             if (len(argv) < start + 1 or not _safe_relative_file(argv[start], (".py",))
-                    or len(argv) != start + 1 and not doc_check):
+                    or len(argv) != start + 1 and not doc_check and not flags_only):
                 return argv, "python_without_allowlisted_module"
         else:
             if midx + 1 >= len(argv) or argv[midx + 1] not in _SAFE_MODULES:
@@ -296,6 +299,9 @@ def _safe_relative_file(raw: str, suffixes: tuple[str, ...]) -> bool:
     )
 
 
+_FLAG = re.compile(r"--selftest|--check|-q|--quiet")  # только флаги самопроверки, не режимы записи
+
+
 def _executable_exists(argv: tuple[str, ...], root: Path) -> bool:
     token = argv[0].replace("\\", "/")
     if "/" in token or token.startswith("."):
@@ -409,10 +415,16 @@ def preflight_task(
         if not any(_covered(path, owned) for owned in canonical_owns):
             blocked_path(raw, "outside_declared_owns")
 
+    from .lead import is_lead
     for owner in owners:
         if (owner.project.casefold(), owner.tz.casefold()) == (
             task.project.casefold(), task.tz.casefold()
         ):
+            continue
+        # 28.10 и снова 05.11: устав ведущего (зона — весь проект) отвергался за пересечение с
+        # профильными задачами, и «ремонт источника» урезал ему зону. Зона ведущего уступает им
+        # в страже записи (guard) — пересечение с ведущим в обе стороны задумано.
+        if is_lead(task.tz) or is_lead(owner.tz):
             continue
         # Урок 50: закрытая задача (accepted/rejected) зону не держит. Иначе две
         # принятые заявки с owns=tests/fleet навсегда отвергали любой черновик,

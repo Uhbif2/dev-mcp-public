@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.0 — 2026-11-27
+
+### Added
+- Scoped quick agents for coding operators, with session identifiers, dependency-aware starts, run/wait, first/all-result waiting, explicit scope and lifecycle reporting.
+- Optional supervision of owner conversations: goal-focused progress classification, protected delivery, blocker/owner escalation, idempotent decisions and handoff across long chats.
+- Optional nightly reviews of code changes, product gaps and documentation, with separate scheduling and read-only review agents. Unprocessed candidates carry over; final reports identify admitted candidates.
+- Agent-first Windows onboarding, bilingual user guide and a portable coding-agent template; authenticated tunnel onboarding and a local smoke-test workflow.
+- Lead decision routing with confidence checks, owner escalation and reversible decisions.
+- Bounded image reading and staged preflight; task dependencies can open on submission and re-block on rejection.
+
+### Changed
+- Fleet Tabs through 0.19.66: updated ChatGPT interface adapter, quick/overseer tab support, live badge and status counts, more reliable delivery confirmation, recovery and handoff. Account and verification limits remain hard stops.
+- Faster queue/event access, incremental bootstrap and persistent work copies, cached scans and short transactions; reduced background CPU and repeated report writes.
+- Clearer evidence for actual writes, acceptance, reviews and integration; rejected tasks return to the same queue item and are not given to the previous reviewer.
+- Improved quick-agent delivery receipts, waiting and parking, cleanup, and stable identifiers. Improved Windows long-path handling and locks.
+- Independent nightly code/gap/docs scheduling, separate failure handling, candidate ID reporting and reliable final-summary collection.
+
+### Security
+- Multi-file patch atomicity, ownership checks for process listing/stopping, guarded redirect handling and atomic download writes.
+- Audit records summarize file content by length and hash; secret masking, restricted nightly reads and bounded resource admission.
+- Fail-closed delivery and publication boundaries, junction/reparse checks and protection against stale gate evidence.
+- Public export remains allowlist-only with a privacy audit. Private policies, local settings, credentials, replay data and dated operational records are excluded.
+
+The server and browser extension remain experimental and Windows-first. Optional external backends and account authorizations are supplied by each operator. Release packaging and live installation must be verified before publication.
+
 ## 0.1.0 / Fleet Tabs 0.19.6 — 2026-10-22
 
 First complete experimental public release of the policy-bounded Windows MCP

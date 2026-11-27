@@ -70,15 +70,13 @@ def test_ladder_wake_retry_then_give_up(env) -> None:
     assert wake.order_lines(first)[0].startswith(f"разбудить: f-a {URL} :: Продолжай P/TZ-1")
     # Через минуту — не повторяем.
     assert wake.orders(store, book, now=T0 + timedelta(minutes=6)) == []
-    # Ещё 8 мин тишины — приказ №2, после него приказов нет.
-    second = wake.orders(store, book, now=T0 + timedelta(minutes=13, seconds=30))
-    assert [o["attempt"] for o in second] == [2]
-    assert wake.orders(store, book, now=T0 + timedelta(minutes=40)) == []
-    # Не сдаёмся раньше 8 мин после последнего приказа.
-    assert wake.give_up(store, book, now=T0 + timedelta(minutes=15)) == []
+    # 28.10: второго приказа нет (MAX_ORDERS=1) — он оживлял 14% чатов ценой ~8 мин простоя.
+    assert wake.orders(store, book, now=T0 + timedelta(minutes=13, seconds=30)) == []
+    # Не сдаёмся раньше 8 мин после приказа.
+    assert wake.give_up(store, book, now=T0 + timedelta(minutes=12)) == []
     assert state(store, "TZ-1") == ("taken", None)
     # Потом задача уходит в очередь с сохранённой работой, воркер отозван.
-    assert "P/TZ-1" in wake.give_up(store, book, now=T0 + timedelta(minutes=22))
+    assert "P/TZ-1" in wake.give_up(store, book, now=T0 + timedelta(minutes=14))
     task_state, revoked = state(store, "TZ-1")
     assert task_state == "ready" and revoked
 

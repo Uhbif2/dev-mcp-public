@@ -39,36 +39,40 @@ async function readMessage(response) {
 
 export async function callTool(url, name, args = {}, { timeoutMs = 15000 } = {}) {
   const signal = AbortSignal.timeout(timeoutMs);
+  let phase = "initialize", session;
   const base = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
   };
-  const init = await fetch(url, {
-    method: "POST",
-    headers: base,
-    signal,
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-03-26",
-        capabilities: {},
-        clientInfo: { name: "fleet-tabs", version: "0.1.0" },
-      },
-    }),
-  });
-  if (!init.ok) throw new Error(`initialize: HTTP ${init.status}`);
-  const session = init.headers.get("mcp-session-id");
-  const headers = session ? { ...base, "mcp-session-id": session } : base;
+  let headers = base;
   try {
+    const init = await fetch(url, {
+      method: "POST",
+      headers: base,
+      signal,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "fleet-tabs", version: "0.1.0" },
+        },
+      }),
+    });
+    if (!init.ok) throw new Error(`initialize: HTTP ${init.status}`);
+    session = init.headers.get("mcp-session-id");
+    headers = session ? { ...base, "mcp-session-id": session } : base;
     await readMessage(init);
+    phase = "notifications/initialized";
     await fetch(url, {
       method: "POST",
       headers,
       signal,
       body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
     });
+    phase = `tools/call ${name}`;
     const call = await fetch(url, {
       method: "POST",
       headers,
@@ -85,6 +89,11 @@ export async function callTool(url, name, args = {}, { timeoutMs = 15000 } = {})
     if (message?.error) throw new Error(`${name}: ${message.error.message || "ошибка MCP"}`);
     const content = message?.result?.content || [];
     return content.map((item) => item.text || "").join("\n");
+  } catch (error) {
+    if (signal.aborted) {
+      throw new Error(`MCP ${phase}: таймаут ${timeoutMs / 1000} с`, { cause: error });
+    }
+    throw error;
   } finally {
     if (session) {
       // Cleanup must not occupy Chrome's small per-origin connection pool
@@ -270,8 +279,15 @@ export async function fleetState(url = DEFAULT_MCP_URL, launcher = null) {
       }
     }
   }
-  const text = await callTool(url, "fleet_list", args);
+  // 20.11.2026: 15 с не хватало перегруженному хосту (ответы 20–37 с) — значок мигал «?»/«!».
+  const text = await callTool(url, "fleet_list", args, { timeoutMs: 30_000 });
   const agentStates = parseAgentStates(text);
+  // Ответ-ошибка (например, «cannot begin fleet read») — неудача связи, а не пустой флот:
+  // иначе fleetAgentStates затирался null и значок становился «?».
+  if (!agentStates && !parseQueue(text).known &&
+      /cannot begin fleet|FleetUnavailable|реестр флота|ошибк|error/i.test(String(text).slice(0, 400))) {
+    throw new Error(`fleet_list: сервер ответил ошибкой: ${String(text).trim().slice(0, 160)}`);
+  }
   // fleet_list остаётся чистым серверным чтением. Локальный снимок нужен
   // popup, который живёт отдельно от background service worker.
   if (globalThis.chrome?.storage?.local?.set) {

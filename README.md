@@ -1,5 +1,19 @@
 # dev-mcp
 
+**Give this link to your coding agent (Claude Code or Codex):**
+
+> `Set up dev-mcp from <this repository URL> following AGENT-SETUP.md`
+
+The agent follows [AGENT-SETUP.md](AGENT-SETUP.md), performs the installation, and verifies a smoke task. You only need to:
+
+1. Answer its startup questions and approve installation and any optional settings.
+2. Sign in to your own ChatGPT account in the opened FleetChrome window.
+3. Load the unpacked extension in Chrome and approve its permissions.
+4. Complete the authorized tunnel and custom connector steps in the browser.
+5. Resolve any remaining account/permission choice; enter secrets directly in the official UI or prescribed local credential file.
+
+[User guide](GUIDE.md) · [Русский](README.ru.md) · [Manual installation](INSTALL.md)
+
 A narrow MCP server that lets a remote agent (ChatGPT or any remote-MCP client) work on code on a
 Windows machine — read, write, search, run tests — strictly inside folders an explicit policy file
 allows. On top of the core sits **`fleet`**: a task registry, queue, blind review, acceptance and git
@@ -37,11 +51,19 @@ for the client in that tree. The binary list prevents accidents and keeps the au
 the real perimeter is the gateway token plus the list of `exec_roots`. The spawned process is not
 sandboxed (network or filesystem outside its cwd).
 
-## Fleet
+## Fleet (0.2.0)
+
+- Scoped quick agents for small jobs; the queue remains the path for independent review and acceptance.
+- Optional nightly code, product-gap and documentation review; results and proposed tasks remain under operator control.
+- Optional conversation overseer with an authorized decision backend, disabled when none is configured: [overview](docs/OVERSEER.md).
+- Improved task prerequisites, acceptance evidence, browser status and recovery, and queue/runtime efficiency.
 
 Many ChatGPT conversations act as workers: they take tasks (`fleet_take`), work inside a claimed
 zone of files, hand in with green acceptance commands, and are reviewed blindly by another worker.
-Accepted work is committed by the integrator after the project's gate. Frozen tasks thaw only on
+Accepted candidates are validated before integration. Where enabled, they are committed and a full
+gate checks an immutable checkout of the resulting Git revision. The owner can then retrieve an
+immutable result bundle through the dashboard or `fleet.cmd result`; artifact availability,
+deployment and owner approval are tracked separately. Frozen tasks thaw only on
 trusted evidence (a deployment receipt, a world-resource sensor, an accepted dependency) — never
 on a timer or a free-text note. Design and protocol live in `docs/`
 (`FLEET-PROTOCOL.md`, `ROUTING.md`, `OUTCOMES.md`, `TICKTICK-BOARD.md`, …).
@@ -87,7 +109,7 @@ history or production configuration. A small set of tests requiring the
 maintainer's production configuration carries the `production` marker and is
 explicitly skipped by the public `conftest.py`.
 
-Expose it to a remote client through any MCP proxy/gateway you trust; never without a token.
+For remote access use the authenticated Secure MCP Tunnel in [INSTALL.md](INSTALL.md) or an explicitly configured authenticated gateway. Never expose the process-executing server without authorization.
 For a local stdio client, adapt [mcp-client.example.json](mcp-client.example.json).
 Every call is logged to `logs/audit.jsonl` (allow/deny, reason, duration; file contents are not
 logged). The gateway, proxy launcher, model relays and personal integrations

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -24,8 +25,142 @@ try:
 except Exception:
     pass
 
+# --- bootstrap из пульта владельца в dev-mcp (fleet_owner) -----------------------------------
+# Сервер зовёт `fleet.py --db БАЗА bootstrap ...` со сроком 30 с (tools.OWNER_PULT_TIMEOUT_S) и
+# убивает процесс по сроку. Bootstrap с пробой приёмки идёт 1–3 мин на ТЗ, и 20.11.2026 его
+# обрывало на стадии snapshot, до записи в реестр: ТЗ не регистрировались вовсе. Поэтому в
+# этом режиме пульт до тяжёлых импортов переносит работу в отдельный процесс без срока, ждёт
+# его не дольше OWNER_BOOTSTRAP_WAIT_S и отдаёт ход; повтор с теми же аргументами показывает
+# ход или итог того же процесса, а не запускает второй. Локальный fleet.cmd в консоли
+# (stdout — терминал) и вызовы main() из кода работают как раньше, синхронно.
+_STARTED = time.monotonic()
+FOREGROUND_ENV = "FLEET_BOOTSTRAP_FOREGROUND"
+RC_FILE_ENV = "FLEET_BOOTSTRAP_RC_FILE"
+OWNER_BOOTSTRAP_WAIT_S = 15.0
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        import ctypes
+
+        kernel = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ok = kernel.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel.CloseHandle(handle)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    except Exception:
+        return False
+
+
+def _bootstrap_tail(path: str, limit: int = 4000) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").rstrip()[-limit:]
+    except OSError:
+        return ""
+
+
+def _bootstrap_progress(err: str) -> str:
+    lines = [line.strip() for line in _bootstrap_tail(err, 20000).splitlines()
+             if line.strip().startswith("bootstrap")]
+    return "\n".join(lines[-6:])
+
+
+def _bootstrap_finished(marker: Path, job: dict[str, Any], rc: int) -> int:
+    text = "\n".join(part for part in (_bootstrap_tail(job["out"]), _bootstrap_tail(job["err"]))
+                     if part)
+    print(text)
+    try:
+        marker.unlink()
+    except OSError:
+        pass
+    return rc
+
+
+def _owner_bootstrap_detach(args: list[str], *, command: list[str] | None = None,
+                            folder: Path | None = None,
+                            wait_s: float | None = None) -> int | None:
+    """None — не режим сервера, работать как обычно; иначе код выхода для сервера."""
+    if os.environ.get(FOREGROUND_ENV) == "1":
+        return None
+    if command is None and not (len(args) >= 3 and args[0] == "--db" and args[2] == "bootstrap"):
+        return None
+    if command is None and sys.stdout is not None and sys.stdout.isatty():
+        return None
+    import hashlib
+    import subprocess
+
+    folder = folder or REPO / "logs" / "owner-bootstrap"
+    folder.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(json.dumps(args, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    marker = folder / f"{key}.json"
+    job: dict[str, Any] | None = None
+    try:
+        job = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        job = None
+    if job is not None:
+        rc_path = Path(job["rc"])
+        if rc_path.exists():
+            rc_text = rc_path.read_text(encoding="utf-8").strip()
+            print(f"bootstrap завершён фоном (запущен {job.get('at', '?')}), итог:")
+            return _bootstrap_finished(marker, job, int(rc_text) if rc_text.lstrip("-").isdigit() else 1)
+        if _pid_alive(int(job.get("pid", 0))):
+            progress = _bootstrap_progress(job["err"])
+            print(f"bootstrap ещё идёт фоном (запущен {job.get('at', '?')}; второй процесс не "
+                  "запущен). ТЗ попадут в реестр сами; итог — тот же вызов через 1–2 мин."
+                  + (f"\nХод:\n{progress}" if progress else ""))
+            return 0
+        print(f"прошлый фоновый bootstrap оборвался без итога; журнал: {job['err']}. Запускаю заново.",
+              file=sys.stderr)
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+
+    stem = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + key
+    out, err, rc = (folder / f"{stem}.{ext}" for ext in ("out", "err", "rc"))
+    env = {**os.environ, FOREGROUND_ENV: "1", RC_FILE_ENV: str(rc), "PYTHONIOENCODING": "utf-8"}
+    argv = command or [sys.executable, str(Path(__file__).resolve()), *args]
+    base = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    with out.open("wb") as fout, err.open("wb") as ferr:
+        try:
+            proc = subprocess.Popen(argv, cwd=str(REPO), env=env, stdin=subprocess.DEVNULL,
+                                    stdout=fout, stderr=ferr,
+                                    creationflags=base | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0))
+        except OSError:
+            proc = subprocess.Popen(argv, cwd=str(REPO), env=env, stdin=subprocess.DEVNULL,
+                                    stdout=fout, stderr=ferr, creationflags=base)
+    job = {"pid": proc.pid, "out": str(out), "err": str(err), "rc": str(rc), "args": args,
+           "at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}
+    tmp = marker.with_suffix(".tmp")
+    tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, marker)
+    budget = OWNER_BOOTSTRAP_WAIT_S if wait_s is None else wait_s
+    try:
+        code = proc.wait(timeout=max(0.5, budget - (time.monotonic() - _STARTED)))
+    except subprocess.TimeoutExpired:
+        progress = _bootstrap_progress(str(err))
+        print("bootstrap запущен фоном и не прерывается сроком вызова (проба приёмки — 1–3 мин "
+              "на ТЗ). ТЗ попадут в реестр сами по завершении. Итог — тот же fleet_owner bootstrap "
+              "с теми же аргументами через 1–2 мин (второй процесс не запустится); "
+              "проверка — active ПРОЕКТ." + (f"\nХод:\n{progress}" if progress else ""))
+        return 0
+    rc_text = rc.read_text(encoding="utf-8").strip() if rc.exists() else str(code)
+    return _bootstrap_finished(marker, job, int(rc_text) if rc_text.lstrip("-").isdigit() else code)
+
+
+if __name__ == "__main__":
+    _detached_rc = _owner_bootstrap_detach(sys.argv[1:])
+    if _detached_rc is not None:
+        sys.stdout.flush()
+        raise SystemExit(_detached_rc)
+
 from dev_mcp.fleet.report import (  # noqa: E402
-    _age_label, claimed_vs_done, exception_items, exceptions, metrics,
+    _age_label, claimed_vs_done, claim_write_status, exception_items, exceptions, metrics,
 )
 from dev_mcp.fleet.spec import sync_selected  # noqa: E402
 from dev_mcp.fleet import flow as flow_metrics  # noqa: E402
@@ -43,10 +178,11 @@ DEFAULT_DB: Path | None = None
 
 
 def chatgpt_owner_alert(db_path: Path) -> str:
-    """Latest unresolved ChatGPT outage, from the sensor's durable alert log."""
+    """Latest unresolved egress alert, reclassified using *current* Chrome evidence."""
     parent = db_path.parent
     path = (parent.parent if parent.name.lower() == "fleet" else parent) / "owner-alerts.jsonl"
     message = ""
+    active = None
     try:
         with path.open(encoding="utf-8") as stream:
             for line in stream:
@@ -58,11 +194,27 @@ def chatgpt_owner_alert(db_path: Path) -> str:
                     continue
                 if item.get("kind") == "chatgpt_unreachable" and item.get("state") == "active":
                     message = str(item.get("message") or "")[:500]
+                    active = item
                 elif item.get("kind") == "chatgpt_reachable" and item.get("state") == "resolved":
                     message = ""
+                    active = None
     except (OSError, UnicodeError):
         pass
-    return message
+    if active is None:
+        return message
+    # Old alerts may contain an imperative from before the routes were separated.
+    # Never replay an old VPN command without checking live Chrome receipts.
+    from dev_mcp.fleet import net_sensor
+    browser = net_sensor.BrowserRoute("unknown")
+    if db_path.is_file():
+        browser = net_sensor._browser_route(db_path)
+    egress = str(active.get("server_egress") or world.UNKNOWN)
+    result = net_sensor.Result(
+        world.DOWN, str(active.get("cause") or "network_error"),
+        bool(active.get("proxy_enabled")), bool(active.get("proxy_listening")),
+        str(active.get("exit_ip") or ""), str(active.get("loc") or ""),
+        server_egress_state=egress)
+    return net_sensor._message(result, browser)
 # 08.10.2026 проект Oracle переезжает в пульт; старый путь — пока переезд не завершён.
 PROXY_STATE = machine.PROXY_STATE
 GATEWAY_HEALTH = "https://gateway.example.net/healthz"
@@ -158,10 +310,12 @@ def _mcp_call(url: str, tool: str, arguments: dict[str, Any], timeout: float) ->
 
 
 _BOOTSTRAP_LOCK = REPO / "data" / "fleet" / "bootstrap.lock"
-_BOOTSTRAP_WAIT_S = 40 * 60
+# Bootstrap is an OS-lock queue, not a time-limited try-lock: a busy host may
+# legitimately have several queued projects. Keep the process waiting its turn.
+_BOOTSTRAP_WAIT_S = None
 
 
-def _bootstrap_slot() -> None:
+def _bootstrap_slot() -> float:
     """One bootstrap per host at a time; others wait their turn.
 
     Each bootstrap preflights acceptance in an in-memory snapshot (0.2–0.8 GB). 19.10.2026
@@ -171,19 +325,17 @@ def _bootstrap_slot() -> None:
     """
     import msvcrt
 
+    started = time.monotonic()
     _BOOTSTRAP_LOCK.parent.mkdir(parents=True, exist_ok=True)
     handle = open(_BOOTSTRAP_LOCK, "a+b")  # noqa: SIM115 — kept open until exit
-    deadline = time.monotonic() + _BOOTSTRAP_WAIT_S
     told = False
     while True:
         try:
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             globals()["_BOOTSTRAP_HANDLE"] = handle
-            return
+            return time.monotonic() - started
         except OSError:
-            if time.monotonic() > deadline:
-                raise SystemExit("bootstrap: другой bootstrap идёт дольше 40 мин — повтори позже")
             if not told:
                 print("bootstrap: жду очереди — на хосте уже идёт другой bootstrap (по одному)",
                       file=sys.stderr, flush=True)
@@ -251,6 +403,43 @@ def memory_state(core_up: bool, *, now: float | None = None, probe: Callable[[],
     return line
 
 
+def fleet_rules_state(*, now: datetime | None = None,
+                      probe: Callable[[], bool] | None = None,
+                      path: Path | None = None) -> str:
+    """Separate fleet *delivery* signal from the memory_service/core health probe.
+
+    A green core/Neo4j probe does not prove that the ambientd hook delivered
+    applicable rules to actual fleet briefs. Metadata only, no rule bodies.
+    """
+    up = (probe or (lambda: _port_open(11437)))()
+    source = path if path is not None else REPO / "logs" / "memory-rules.jsonl"
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(hours=24)
+    attempts = with_rules = unavailable = 0
+    try:
+        with source.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    entry = json.loads(line)
+                    ts = datetime.fromisoformat(entry["at"].replace("Z", "+00:00"))
+                    if ts < cutoff:
+                        continue
+                    attempts += 1
+                    with_rules += int(entry.get("rules", 0) > 0)
+                    unavailable += int(bool(entry.get("unavailable")))
+                except (ValueError, TypeError, KeyError):
+                    continue
+    except OSError:
+        pass
+    transport = "ambientd:11437 жив" if up else "ambientd:11437 НЕ СЛУШАЕТ"
+    state = ("правила флота НЕДОСТУПНЫ" if not up else
+             "правила флота СБОЙ ДОСТАВКИ" if attempts and unavailable > attempts // 2
+             else "правила флота")
+    if not attempts:
+        return f"{state}: {transport}, нет измерений за 24 ч"
+    return (f"{state}: {transport}, за 24 ч {with_rules}/{attempts} с правилами, "
+            f"{unavailable} недоступны")
+
+
 def platform_line(health_timeouts: tuple[float, ...] = (4, 8)) -> str:
     """Одна строка про ПЛАТФОРМУ поверх отчёта о работе.
 
@@ -307,8 +496,9 @@ def platform_line(health_timeouts: tuple[float, ...] = (4, 8)) -> str:
         )
     else:
         parts.append("шлюз НЕ ОТВЕЧАЕТ")
-    # Память на выполнение задач не влияет: её поломка не «[!] платформа», но видна рядом.
-    memory = memory_state(core_up)
+    # Independent paths: core/memory_service can be green while the ambientd-based
+    # fleet rule delivery is timing out. Do not present one as proof of the other.
+    memory = f"memory_service/core: {memory_state(core_up)}; {fleet_rules_state()}"
 
     # The controller has its own heartbeat. A green transport is not enough if
     # queue maintenance has stopped for more than five minutes.
@@ -527,6 +717,159 @@ def _cmd_recover(
     )
 
 
+def _cmd_quick(db_path: Path, ns: Any) -> tuple[int, str]:
+    """Быстрые агенты Claude Code (fleet/quick.py, владелец 15.11): new | say | show | list | close | wait."""
+    from dev_mcp.fleet import overseer, quick
+    book = quick.Book(Path(db_path).parent)
+    owner = quick.claude_owner(os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    words = list(ns.words or [])
+    text = " ".join(words)
+    if len(words) == 1 and text.startswith("@") and ns.action in ("new", "run"):
+        source = Path(text[1:])
+        try:
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            return 2, f"quick {ns.action}: не удалось прочитать файл {source}: {exc}"
+    dependencies = getattr(ns, "after", None) if ns.action == "new" else None
+    if ns.action == "new" and dependencies:
+        dependencies = [item.strip() for item in dependencies.split(",")]
+        if not all(dependencies):
+            return 2, "quick new --after: нужны ID через запятую"
+    if ns.action == "wait" and getattr(ns, "after", None) is not None:
+        try:
+            ns.after = int(ns.after)
+            if ns.after < 0:
+                raise ValueError()
+        except ValueError:
+            return 2, "quick wait --after: нужен неотрицательный номер ответа"
+    if ns.action == "run" and getattr(ns, "after", None) is not None:
+        return 2, "quick run --after не поддерживается; используй quick new --after и quick wait ID"
+    ns.wait_answer = ns.action == "run"  # run = new + wait: один вызов, ответ на выходе
+    if ns.action in ("new", "run") and text:
+        root = ""
+        if ns.project:
+            with _open_existing(db_path) as conn:
+                row = conn.execute("SELECT root FROM projects WHERE name=?", (ns.project,)).fetchone()
+            if row is None:
+                return 2, f"проекта {ns.project!r} во флоте нет"
+            root = str(row["root"])
+
+        def register(tag: str, label: str) -> None:
+            now = _now()
+            conn = _open_write(db_path)
+            try:
+                if conn.execute("SELECT 1 FROM workers WHERE id=?", (tag,)).fetchone() is None:
+                    conn.execute("INSERT INTO workers(id,label,kind,first_seen,last_seen,revoked_at,revoke_reason)"
+                                 " VALUES (?,?,'quick',?,?,NULL,'')", (tag, label, now, now))
+                    _event(conn, "quick_new", worker_id=tag, payload={"label": label, "owner": owner})
+            finally:
+                conn.close()
+
+        job = quick.create(book, owner=owner, prompt=text, project=ns.project, root=root,
+                           scope=list(ns.scope or []), register=register, home=ns.home,
+                           after=dependencies)
+        head = (f"{job['id']} (agent {job['tag']}) поставлен: " +
+                ("ожидает " + ", ".join(job["after"]) + "; чат пока не открывается."
+                 if job["state"] == "waiting" else "чат откроет расширение fleet-tabs.")
+                + (f" Права оператора: {', '.join(map(str, quick.operator_roots(job)))}."
+                   if quick.operator_roots(job) else ""))
+        if not ns.wait_answer:
+            return 0, (f"{head}\nждать ответ: fleet.cmd quick wait {job['id']}; "
+                       f"ход: fleet.cmd quick show {job['id']}")
+        print(head, flush=True)
+        words, ns.after = [job["id"]], 0
+    elif ns.action in ("new", "run"):
+        return 2, f"quick {ns.action}: нужен текст задачи"
+    if ns.action == "adopt":
+        if len(words) != 1:
+            return 2, "quick adopt: нужен один полный ID qN-сессия"
+        job = quick.adopt(book, words[0], owner=owner, force=getattr(ns, "force", False))
+        return 0, f"{job['id']}: владелец {job['owner']}; передача записана в книгу"
+    if ns.action == "say":
+        if len(words) < 2:
+            return 2, "quick say ID ТЕКСТ|@файл (для многострочного текста нужен @файл)"
+        message = " ".join(words[1:])
+        if len(words) == 2 and words[1].startswith("@"):
+            source = Path(words[1][1:])
+            try:
+                message = source.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                return 2, f"quick say: не удалось прочитать файл {source}: {exc}"
+        job = quick.say(book, words[0], message, owner=owner)
+        return 0, f"{job['id']}: в очереди чата {len(job['outbox'])}"
+    if ns.action == "close":
+        job = quick.close(book, text, owner=owner)
+        return 0, f"{job['id']} закрыт"
+    if ns.action == "list":
+        rows = quick.listing(book, owner="*" if ns.all else owner, include_closed=ns.all)
+        return 0, "\n".join(quick.render(j, full=False).split("\n")[0] for j in rows) or "быстрых агентов нет"
+    if ns.action == "show":
+        job = quick.get(book, text, owner=owner)
+        actions = quick.first_actions(REPO / "logs", [job])
+        return 0, quick.render(quick.with_action(job, actions),
+                               overseer.agent_history(job["tag"], job["created"], any_tool=True))
+    # wait: один ответ из набора (по умолчанию) или все (--all).
+    if not words:
+        return 2, "quick wait ID [ID ...] [--all]"
+    jids = list(dict.fromkeys(quick.get(book, word, owner=owner)["id"] for word in words))
+    # None uses the durable per-job owner cursor; --after N overrides it.
+    after = ns.after if isinstance(getattr(ns, "after", None), int) else None
+    deadline = time.monotonic() + ns.timeout
+    while True:
+        completed = quick.collect_wait(book, jids, owner=owner,
+                                       after=after,
+                                       all_answers=ns.all)
+        if completed:
+            actions = quick.first_actions(REPO / "logs", completed)
+            return 0, "\n\n".join(quick.render(quick.with_action(job, actions)) for job in completed)
+        snapshot = book.jobs()
+        current = [dict(quick.owned(snapshot.get(jid), owner)) for jid in jids]
+        closed = [job["id"] for job in current if job["state"] == "closed"]
+        if closed and (ns.all or len(closed) == len(current)):
+            return 1, "закрыты без нового ответа: " + ", ".join(closed)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 1, (f"нового ответа за {ns.timeout} с нет; ожидание: {', '.join(jids)}\n" +
+                       "\n".join(quick.render(job, full=False).split("\n")[0] for job in current))
+        time.sleep(min(3, remaining))
+
+
+def _cmd_overseer(db_path: Path, ns: Any) -> tuple[int, str]:
+    """Надзиратель хода (_todo/59 пульта): чаты под надзором, режимы, журнал."""
+    from dev_mcp.fleet import overseer
+    book = overseer.Book(Path(db_path).parent)
+    if ns.action == "add":
+        if not ns.project:
+            return 2, "нужен --project (имя проекта флота, корень берётся из реестра)"
+        entry = overseer.add(book, ns.target, ns.project, "send" if ns.send else "shadow", ns.engine)
+        return 0, (f"под надзором: {entry['url']} проект {entry['project']} режим {entry['mode']} "
+                   f"движок {entry.get('engine') or 'semantic'} тег агента {entry['tag']}")
+    if ns.action == "mode":
+        entry = overseer.set_mode(book, ns.target, ns.value, ns.engine if ns.value != "off" else None)
+        return 0, f"{entry['url']}: режим {entry['mode']}, движок {entry.get('engine') or 'semantic'}"
+    if ns.action == "list":
+        rows = []
+        for cid, e in book.chats().items():
+            card = book.card(cid) or {}
+            segs = card.get("segments") or []
+            done = sum(1 for s in segs if s.get("status") == "done")
+            rows.append(f"{e['mode']:6} {e.get('engine') or 'semantic':8} {e['url']}  {e.get('project', '')}  "
+                        f"ходов {card.get('turns', 0)}  "
+                        f"сделано {done}/{len(segs)}  последний вердикт {card.get('last_verdict') or '—'}")
+        return 0, "\n".join(rows) or "чатов под надзором нет"
+    n = int(ns.target or 20)
+    try:
+        lines = book.journal.read_text(encoding="utf-8").splitlines()[-n:]
+    except OSError:
+        return 0, "журнал пуст"
+    out = []
+    for line in lines:
+        d = json.loads(line)
+        out.append(f"{d['ts']} {d['chat'][:8]} {d['event']} {d.get('verdict', '')} "
+                   f"{(d.get('text') or '')[:160]!r}")
+    return 0, "\n".join(out)
+
+
 def _cmd_say(conn: sqlite3.Connection, body: str) -> str:
     # Только тем, кто держит задачу: отработавшие вкладки закрыты, сообщение они не
     # прочтут, а неподтверждённые копии засоряли бы пульт строками «БЕЗ ACK».
@@ -586,6 +929,85 @@ def _cmd_tell(conn: sqlite3.Connection, to: str, body: str) -> str:
     )
     _event(conn, "tell", worker_id=to_worker, payload={"message_id": mid, "to": target})
     return f"сообщение {mid} → {target} (получатель: {who})"
+
+
+def _cmd_instruct(conn: sqlite3.Connection, project: str, text: str, done_when: str,
+                  want: str = "", priority: int = 5, source: str = "") -> str:
+    """Поручение ведущему проекта — объект реестра, а не записка (LEAD-SYSTEM-DESIGN фаза 0.3).
+
+    05–06.11: ~30 писем ведущему Nova доставлены, ни одно не записано в книгу; новый чат вехи
+    о них не знал. Здесь: письмо держателю устава + событие `instruction` (что сделать, зачем,
+    критерий «сделано»). Ведущий видит его в брифе, пока не закроет fleet_lead(action='instruction')
+    статусом accepted(O-*) / declined(reason) / done(evidence).
+    """
+    text, done_when, want = text.strip(), done_when.strip(), want.strip()
+    if len(text) < 10 or len(done_when) < 5:
+        raise ValueError("нужны текст поручения (от 10 знаков) и --done-when (критерий «сделано»)")
+    if conn.execute("SELECT 1 FROM projects WHERE name=?", (project,)).fetchone() is None:
+        raise ValueError(f"проект {project!r} не найден")
+    mid = "m-" + uuid.uuid4().hex[:8]
+    iid = "i-" + mid[2:]
+    body = (text + (f"\nРезультат для человека: {want}" if want else "") + f"\nСделано, когда: {done_when}"
+            + f"\nПоручение {iid}: закрой fleet_lead(action='instruction') статусом accepted/declined/done.")
+    conn.execute(
+        """INSERT INTO messages(
+               id,dedup_key,to_worker,to_task,broadcast,from_kind,from_id,kind,body,
+               created_at,delivered_at,acked_at
+           ) VALUES(?,'',NULL,?,0,'owner','','note',?,?,NULL,NULL)""",
+        (mid, f"{project}/TZ-LEAD", body, _now()),
+    )
+    _event(conn, "instruction", project=project, tz="TZ-LEAD", payload={
+        "id": iid, "author": "owner", "text": text, "want": want, "done_when": done_when,
+        "priority": int(priority), "source": source or "fleet.cmd instruct", "msg_id": mid})
+    return f"поручение {iid} → {project}/TZ-LEAD (письмо {mid}); статус — в брифе ведущего"
+
+
+def _cmd_focus(conn: sqlite3.Connection, project: str, iid: str, tz: str) -> str:
+    """Link an open owner instruction to a real task without changing admission."""
+    from dev_mcp.fleet.instructions import CLOSED, KIND, STATUS_KIND, TARGET_KIND
+    from dev_mcp.fleet.queue import family_root
+
+    if not conn.execute("SELECT 1 FROM tasks WHERE project=? AND tz=?", (project, tz)).fetchone():
+        raise ValueError(f"{project}/{tz}: задача не найдена")
+    rows = conn.execute(
+        "SELECT kind,payload FROM events WHERE project=? AND tz='TZ-LEAD' AND kind IN (?,?) "
+        "AND json_extract(payload,'$.id')=? ORDER BY id",
+        (project, KIND, STATUS_KIND, iid),
+    ).fetchall()
+    if not rows or rows[0]["kind"] != KIND or json.loads(rows[0]["payload"]).get("author") != "owner":
+        raise ValueError(f"{project}: поручение владельца {iid} не найдено")
+    if json.loads(rows[-1]["payload"]).get("status") in CLOSED:
+        raise ValueError(f"{project}: поручение {iid} уже закрыто")
+    target = family_root(tz)
+    if not conn.execute("SELECT 1 FROM tasks WHERE project=? AND tz=?", (project, target)).fetchone():
+        raise ValueError(f"{project}/{target}: исходная задача не найдена")
+    _event(conn, TARGET_KIND, project=project, tz="TZ-LEAD", payload={"id": iid, "task": target})
+    return f"{project}/{target}: приоритет поручения {iid}"
+
+
+def _cmd_unblock(conn: sqlite3.Connection, project: str, oid: str, answer: str) -> str:
+    """Ответ владельца на карточку препятствия ведущего (LEAD-SYSTEM-DESIGN фаза 1.1).
+
+    Препятствие закрывается, ответ становится поручением ведущему — устав вернётся сам,
+    когда появится продвигаемое O-*."""
+    answer = answer.strip()
+    if len(answer) < 2:
+        raise ValueError("нужен ответ владельца")
+    row = conn.execute(
+        "SELECT id,payload FROM events WHERE kind='obstacle_open' AND project=? AND "
+        "json_extract(payload,'$.id')=? ORDER BY id DESC LIMIT 1", (project, oid)).fetchone()
+    if row is None:
+        raise ValueError(f"препятствие {oid} в {project!r} не найдено")
+    if conn.execute("SELECT 1 FROM events WHERE kind='obstacle_closed' AND project=? AND "
+                    "json_extract(payload,'$.id')=? AND id>?", (project, oid, row["id"])).fetchone():
+        raise ValueError(f"{oid} уже снято")
+    ask = str(json.loads(row["payload"] or "{}").get("ask") or "")
+    _event(conn, "obstacle_closed", project=project, tz="TZ-LEAD",
+           payload={"id": oid, "by": "owner", "answer": answer})
+    text = f"Решение владельца по {oid} («{ask[:200]}»): {answer}"
+    return f"{oid} снято. " + _cmd_instruct(
+        conn, project, text, done_when=f"решение по {oid} учтено в книге (accepted → O-*)",
+        source=f"fleet.cmd unblock {oid}")
 
 
 def _cmd_priority(conn: sqlite3.Connection, project: str, priority: int) -> str:
@@ -886,8 +1308,13 @@ def _event_text(kind: str, payload: dict[str, Any], rc: Any = None) -> str:
         return " ".join(parts) + (f" {summary}" if summary else "")
     if kind == "integrate":
         paths = payload.get("paths") or []
-        commit = str(payload.get("commit") or "?")[:12]
-        return f"коммит {commit}, путей {len(paths) if isinstance(paths, list) else paths}"
+        count = len(paths) if isinstance(paths, list) else paths
+        if payload.get("commit"):
+            return f"коммит {str(payload['commit'])[:12]}, путей {count}"
+        # 16.11: «коммит ?» скрывал, почему принятое не дошло до git.
+        why = next((str(payload[k]) for k in ("reason", "reason_code", "error", "skipped")
+                    if payload.get(k)), "причина не записана")
+        return f"НЕ закоммичено: {why[:200]}, путей {count}"
     if kind == "owner_command":
         args = payload.get("args") or []
         return " ".join([str(payload.get("command") or "")] + [str(a) for a in args]).strip()
@@ -921,6 +1348,34 @@ def _cmd_tokens(command: Any) -> str:
     return " ".join(x.strip("\"'") for x in items)
 
 
+_CHAIN_RUN_MIN = 4
+
+
+def _chain_label(tasks: list[dict]) -> str:
+    """Цепочка звеньев; подряд идущие повторы одного семейства (review:X:2…:266) — одной строкой.
+
+    05.11: у TZ-LEAD 266 ревью revalidate съедали весь бюджет вывода, итог задачи не был виден.
+    """
+    parts: list[str] = []
+    i = 0
+    while i < len(tasks):
+        family = re.sub(r":\d+$", "", str(tasks[i]["tz"]))
+        j = i
+        while j + 1 < len(tasks) and re.sub(r":\d+$", "", str(tasks[j + 1]["tz"])) == family:
+            j += 1
+        run = tasks[i:j + 1]
+        if len(run) >= _CHAIN_RUN_MIN:
+            counts: dict[str, int] = {}
+            for t in run:
+                counts[str(t["state"])] = counts.get(str(t["state"]), 0) + 1
+            states = ", ".join(f"{s} ×{n}" for s, n in counts.items())
+            parts.append(f"{run[0]['tz']} … {run[-1]['tz']} ({len(run)} звеньев: {states})")
+        else:
+            parts.extend(f"{t['tz']} ({t['state']})" for t in run)
+        i = j + 1
+    return " → ".join(parts)
+
+
 def task_result(conn: sqlite3.Connection, ident: str, cap: int = RESULT_CAP) -> str:
     """Итог задачи одним блоком — как финальный отчёт субагента: вердикт, приёмка, ход, файлы."""
     project, tz = _split_ident(conn, ident)
@@ -939,7 +1394,7 @@ def task_result(conn: sqlite3.Connection, ident: str, cap: int = RESULT_CAP) -> 
     kinds = (*CHAIN_KINDS, "run", "write")
     events = [
         dict(r) for r in conn.execute(
-            f"SELECT id,ts,kind,worker_id,tz,tool,path_norm,rc,payload FROM events "
+            f"SELECT id,ts,kind,worker_id,project,tz,tool,path_norm,rc,payload FROM events "
             f"WHERE project=? AND tz IN ({marks}) AND kind IN ({','.join('?' for _ in kinds)}) ORDER BY id",
             (project, *names, *kinds),
         )
@@ -951,7 +1406,23 @@ def task_result(conn: sqlite3.Connection, ident: str, cap: int = RESULT_CAP) -> 
     tasks.sort(key=lambda t: (first_seen.get(str(t["tz"]), 1 << 62), str(t["created_at"]), str(t["tz"])))
     main = next((t for t in tasks if t["tz"] == base), tasks[0])
     head = [f"{project}/{base} — {main['title'] or 'без названия'}"]
-    head.append(f"состояние: {main['state']} · цепочка: " + " → ".join(f"{t['tz']} ({t['state']})" for t in tasks))
+    head.append(f"состояние: {main['state']} · цепочка: " + _chain_label(tasks))
+    from types import SimpleNamespace
+    from dev_mcp.fleet.results import available
+    result_reader = SimpleNamespace(query=lambda sql, args=(): conn.execute(sql,args).fetchall())
+    # The final accepted change often belongs to fix:TZ rather than TZ itself.
+    # Preserve the whole-chain view for both root and repair identifiers.
+    published = [result for name in names
+                 for result in available(result_reader, project=project, tz=name)]
+    published.sort(key=lambda result: (int(result.get('accept_id') or 0),int(result['event_id'])),
+                   reverse=True)
+    delivery_lines: list[str] = []
+    if published:
+        result = published[0]
+        delivery_lines.append(f"результат доступен: {result['artifact']} · SHA-256 {result['sha256']}")
+        delivery_lines.append(f"версия результата: {result['revision']} · приёмка владельцем отдельно")
+    elif main['state'] == 'accepted':
+        delivery_lines.append('передача результата: подтверждённого артефакта пока нет')
 
     takes = [e for e in events if e["kind"] == "take"]
     verdicts = [e for e in events if e["kind"] in VERDICT_KINDS]
@@ -1002,13 +1473,40 @@ def task_result(conn: sqlite3.Connection, ident: str, cap: int = RESULT_CAP) -> 
                     f"  rc={last['rc']}  {_one_line(command, 200)} "
                     f"({last['tz']} {last['worker_id'] or '?'}, {_local_hm(last['ts'], with_date=True)})"
                 )
-    files = sorted({str(e["path_norm"]) for e in events if e["kind"] == "write" and e["path_norm"]})
+    # Writes belong to a *take*, not merely a worker or a task label. Use the
+    # immutable claim window and its captured owns, never today's tasks.owns.
+    claims = [dict(r) for r in conn.execute(
+        f"SELECT id,project,tz,worker_id,started_at,released_at FROM claims "
+        f"WHERE project=? AND tz IN ({marks}) ORDER BY id", (project, *names)
+    )]
+    owns_by_claim = {int(c["id"]): [str(r["path_norm"]) for r in conn.execute(
+        "SELECT path_norm FROM claim_paths WHERE claim_id=?", (c["id"],)
+    )] for c in claims}
+    files: set[str] = set()
+    outside_owns: set[str] = set()
+    unverified_files: set[str] = set()
+    for event in events:
+        if event["kind"] != "write" or not event["path_norm"]:
+            continue
+        path = str(event["path_norm"])
+        statuses = [claim_write_status(event, c, owns_by_claim[int(c["id"])])
+                    for c in claims if c["worker_id"] == event["worker_id"]
+                    and c["tz"] == event["tz"]]
+        if "owned" in statuses:
+            files.add(path)
+        elif "outside_owns" in statuses:
+            outside_owns.add(path)
+        else:
+            unverified_files.add(path)
+    files = sorted(files)
+    outside_owns = sorted(outside_owns - set(files))
+    unverified_files = sorted(unverified_files - set(files) - set(outside_owns))
 
     key_kinds = ("submit", *VERDICT_KINDS, "block", "gate")
     lifecycle = [e for e in events if e["kind"] not in ("run", "write", "take")]
     latest = lifecycle[-1] if lifecycle else None
 
-    def render(key_cap: int, other_cap: int, max_files: int) -> str:
+    def render(key_cap: int, other_cap: int, max_files: int, max_events: int = 0) -> str:
         lines = list(head)
         if verdicts:
             last = verdicts[-1]
@@ -1023,13 +1521,17 @@ def task_result(conn: sqlite3.Connection, ident: str, cap: int = RESULT_CAP) -> 
                 f"СЕЙЧАС: {latest['kind']} {latest['tz']} {latest['worker_id'] or ''} "
                 f"{_local_hm(latest['ts'], with_date=True)}" + (f" — {_one_line(text, max(key_cap, 600))}" if text else "")
             )
+        lines.extend(delivery_lines)
         if acceptance:
             lines.append("приёмка (последний запуск в цепочке):")
             lines.extend(acceptance)
         lines.append("ход работы:")
-        for event in events:
-            if event["kind"] in ("run", "write"):
-                continue
+        shown = [e for e in events if e["kind"] not in ("run", "write")]
+        # Длинная цепочка: важнее свежий ход, чем начало недельной давности.
+        if max_events and len(shown) > max_events:
+            lines.append(f"  … раньше ещё {len(shown) - max_events} событий")
+            shown = shown[-max_events:]
+        for event in shown:
             text = _event_text(event["kind"], _payload(event["payload"]), event["rc"])
             if verdicts and event["id"] == verdicts[-1]["id"]:
                 text = "(текст — в ИТОГ выше)"
@@ -1041,17 +1543,21 @@ def task_result(conn: sqlite3.Connection, ident: str, cap: int = RESULT_CAP) -> 
             if text:
                 line += " — " + _one_line(text, key_cap if event["kind"] in key_kinds else other_cap)
             lines.append(line)
-        if files:
-            lines.append(f"файлы записаны ({len(files)}):")
-            lines.extend(f"  {path}" for path in files[:max_files])
-            if len(files) > max_files:
-                lines.append(f"  … и ещё {len(files) - max_files}")
+        for label, paths in (("файлы записаны", files),
+                             ("вне owns", outside_owns),
+                             ("без подтверждённого claim/owns", unverified_files)):
+            if paths:
+                lines.append(f"{label} ({len(paths)}):")
+                lines.extend(f"  {path}" for path in paths[:max_files])
+                if len(paths) > max_files:
+                    lines.append(f"  … и ещё {len(paths) - max_files}")
         return "\n".join(lines)
 
     text = ""
-    for key_cap, other_cap, max_files in ((4000, 1000, 40), (2000, 300, 30), (1000, 160, 20),
-                                          (500, 100, 15), (250, 70, 10)):
-        text = render(key_cap, other_cap, max_files)
+    for key_cap, other_cap, max_files, max_events in ((4000, 1000, 40, 0), (2000, 300, 30, 0),
+                                                      (1000, 160, 20, 120), (500, 100, 15, 60),
+                                                      (250, 70, 10, 30), (250, 70, 10, 12)):
+        text = render(key_cap, other_cap, max_files, max_events)
         if len(text) <= cap:
             return text
     return text[: cap - 40] + f"\n… обрезано до {cap} символов"
@@ -1496,7 +2002,9 @@ def world_lines(conn: sqlite3.Connection, project: str | None = None) -> list[st
                 if nxt not in behind and nxt not in direct:
                     behind.add(nxt)
                     stack.append(nxt)
-        need = str(cfg[name].get("need") or f"нужен ресурс «{name}»")
+        need = ("маршрут Chrome→ChatGPT проверяется отдельно от egress сервера; "
+                "VPN не требуется без подтверждённого отказа обоих"
+                if name == "chatgpt-reachable" else str(cfg[name].get("need") or f"нужен ресурс «{name}»"))
         projects = ", ".join(sorted({p for p, _ in direct}))
         seen = str(_payload(row["payload"]).get("detail") or "")
         out.append(f"нет ресурса «{name}» с {_local_dm_hm(row['ts'])}: ждут {len(direct)} "
@@ -1540,7 +2048,12 @@ def stuck_lines(conn: sqlite3.Connection, project: str | None = None, limit: int
     free = 0
     for r in rows:
         row = dict(r)
-        info = index[(str(row["project"]), str(row["tz"]))]
+        key = (str(row["project"]), str(row["tz"]))
+        # Maintenance can insert a ready task between the two SELECTs. Use
+        # that row's current dependency fields instead of crashing the console.
+        info = index.get(key)
+        if info is None:
+            info = world.build_index([row])[key]
         why: list[str] = []
         unmet = world.unmet_needs(str(row["project"]), info["needs"], info["resources"], index, world_set)
         if unmet:
@@ -1794,12 +2307,58 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("reason")
     recover.add_argument("--min-silence-min", type=int, default=120)
 
+    over = sub.add_parser("overseer", help="надзиратель хода: add <url> --project X [--send] | mode <url> shadow|send|off | list | log [N]")
+    over.add_argument("action", choices=["add", "mode", "list", "log"])
+    over.add_argument("target", nargs="?", default="")
+    over.add_argument("value", nargs="?", default="")
+    over.add_argument("--project", default="")
+    over.add_argument("--send", action="store_true", help="сразу отправлять в чат (по умолчанию тень)")
+    over.add_argument("--engine", choices=["proxy", "semantic"], default="proxy",
+                      help="proxy — работать за владельца (по умолчанию), semantic — прежний судья-модель")
+
+    qk = sub.add_parser(
+        "quick",
+        help="быстрые агенты: new [--after q1,q2] ТЕКСТ|@файл | run | say | show | list | close | wait [--after N]",
+        description=("ВНИМАНИЕ: cmd.exe обрезает многострочные аргументы на первом переводе строки. "
+                     "Для многострочного сообщения используй quick say qN @файл "
+                     "(UTF-8, путь с пробелами заключи в кавычки). "
+                     "Для new/run также доступен @файл."),
+    )
+    qk.add_argument("action", choices=["run", "new", "say", "show", "list", "close", "wait", "adopt"])
+    qk.add_argument("words", nargs="*")
+    qk.add_argument("--project", default="")
+    qk.add_argument("--scope", action="append", help="область записи (путь от корня проекта), можно несколько")
+    qk.add_argument("--home", default="", help="адрес, где открыть новый чат (по умолчанию — проект флота в ChatGPT)")
+    qk.add_argument("--timeout", type=float, default=3300, help="wait: потолок ожидания, с (≤55 мин)")
+    qk.add_argument("--after", default=None,
+                    help="new: ID зависимостей через запятую (q1,q2); wait: номер ответа N")
+    qk.add_argument("--all", action="store_true", help="list: все владельцы; wait: ждать ответ каждого ID")
+    qk.add_argument("--force", action="store_true", help="adopt: передать без ожидания 30 минут")
+
     say = sub.add_parser("say", help="broadcast от владельца")
     say.add_argument("body")
 
     tell = sub.add_parser("tell", help="адресное указание воркеру (W123) или держателю задачи (Проект/TZ-7)")
     tell.add_argument("to")
     tell.add_argument("body")
+
+    instruct = sub.add_parser("instruct", help="поручение ведущему проекта: объект со статусом, закрывает ведущий")
+    instruct.add_argument("project")
+    instruct.add_argument("text", help="что сделать")
+    instruct.add_argument("--done-when", dest="done_when", required=True, help="критерий «сделано»")
+    instruct.add_argument("--want", default="", help="зачем человеку / требуемый результат")
+    instruct.add_argument("--priority", type=int, default=5)
+    instruct.add_argument("--source", default="", help="сессия или документ-источник")
+
+    focus = sub.add_parser("focus", help="дать приоритет точной задаче открытого поручения владельца")
+    focus.add_argument("project")
+    focus.add_argument("instruction")
+    focus.add_argument("tz")
+
+    unblock = sub.add_parser("unblock", help="ответ владельца на карточку препятствия ведущего (ob-…)")
+    unblock.add_argument("project")
+    unblock.add_argument("obstacle", help="id препятствия ob-…")
+    unblock.add_argument("answer", help="решение владельца")
 
     priority = sub.add_parser("priority", help="приоритет проекта")
     priority.add_argument("project")
@@ -1844,12 +2403,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     grant = sub.add_parser(
         "owner-grant",
-        help="выдать роль владельца вкладке без пароля (без W — последней вкладке с меткой owner…)",
+        help="выдать роль владельца агенту по номеру: owner-grant 123 [W124 …] (без номера — у кого роль)",
     )
-    grant.add_argument("worker", nargs="?")
-    grant.add_argument("--hours", type=float, default=12)
+    grant.add_argument("worker", nargs="*")
+    # 48 ч (владелец 20.11.2026): за ночь 12-часовая роль истекала.
+    grant.add_argument("--hours", type=float, default=48)
     grant.add_argument("--revoke", action="store_true", help="снять выдачу (без W — у всех)")
-    grant.add_argument("--pick", action="store_true", help="показать вкладки и спросить (owner-grant.cmd)")
+    grant.add_argument("--pick", action="store_true", help="спросить номер (owner-grant.cmd)")
+    grant.add_argument("--list", action="store_true", help="у кого сейчас роль")
 
     bootstrap = sub.add_parser(
         "bootstrap",
@@ -1863,6 +2424,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="явно вернуть выбранную ранее frozen-задачу в ready",
     )
+    retire = sub.add_parser(
+        "retire",
+        help="снять задачи выведенных генераторов (rudiments.py); владельца не спрашивать",
+    )
+    retire.add_argument("--dry", action="store_true", help="только счёт по классам")
+    retire.add_argument("--class", dest="classes", action="append", default=None,
+                        help="класс из rudiments.CLASSES (повторяется); по умолчанию — все")
     return parser
 
 
@@ -1979,72 +2547,91 @@ def _cmd_owner_password() -> int:
     return 0
 
 
-def _cmd_owner_grant_pick(db_path: Path, hours: float) -> int:
-    """Для двойного щелчка (owner-grant.cmd): показать свежие вкладки pult/owner и спросить."""
-    from dev_mcp.fleet.owner import grant, grants_path, read_grants, secret_path
+OWNER_GRANT_FRESH_H = 3  # список для двойного щелчка: только вкладки, звавшие сервер за эти часы
+
+
+def _worker_ids(raw: list[str] | str | None) -> list[str]:
+    """`70 W71, w72` → [W70, W71, W72]: владелец даёт номер так, как видит его в чате."""
+    items = raw if isinstance(raw, list) else [raw or ""]
+    out: list[str] = []
+    for item in items:
+        for token in str(item).replace(",", " ").split():
+            token = token.strip().upper()
+            if re.fullmatch(r"W?\d+", token):
+                out.append(token if token.startswith("W") else f"W{token}")
+            elif token:
+                out.append(token)
+    return list(dict.fromkeys(out))
+
+
+def _grant_ids(db_path: Path, ids: list[str], hours: float) -> int:
+    from dev_mcp.fleet.owner import grant, grants_path, secret_path
 
     target = grants_path(secret_path(REPO))
-    now = time.time()
-    granted = {w for w, until in read_grants(target).items() if until > now}
+    code = 0
     with _open_existing(db_path) as conn:
-        rows = conn.execute(
-            "SELECT id,label,last_seen FROM workers WHERE (lower(label) LIKE 'owner%' "
-            "OR lower(label) LIKE 'pult%') AND revoked_at IS NULL ORDER BY last_seen DESC LIMIT 10"
-        ).fetchall()
-    if not rows:
-        print("Вкладок надзирателя нет. Во вкладке ChatGPT: fleet_join(label='pult'), потом запусти снова.")
-        return 2
-    waiting = [r["id"] for r in rows if r["id"] not in granted]
-    print("Вкладки надзирателя (свежие сверху):")
-    for r in rows:
-        mark = "роль есть" if r["id"] in granted else "БЕЗ РОЛИ"
-        print(f"  {r['id']:>5}  {mark:9}  метка {r['label']}, последний вызов {r['last_seen'][:16]}")
-    answer = input(
-        "\nКому выдать роль? Номера через пробел, например: W70 W71\n"
-        f"Enter — всем без роли ({' '.join(waiting) or 'таких нет'}): "
-    ).strip()
-    picked = [w if w.upper().startswith("W") else f"W{w}" for w in answer.replace(",", " ").split()] or waiting
-    known = {r["id"] for r in rows}
-    for w in picked:
-        w = w.upper()
-        if w not in known:
-            print(f"  {w}: не вкладка надзирателя из списка — пропускаю")
-            continue
-        until = grant(target, w, int(hours * 3600))
-        print(f"  {w}: роль выдана до {time.strftime('%d.%m %H:%M', time.localtime(until))}")
-    return 0
+        for w in ids:
+            row = conn.execute("SELECT id,label,last_seen,revoked_at FROM workers WHERE id=?", (w,)).fetchone()
+            if row is None:
+                print(f"  {w}: такого номера в реестре нет — пусть агент один раз вызовет любой fleet_* инструмент")
+                code = 2
+                continue
+            restored = ""
+            if row["revoked_at"]:
+                # 20.11.2026: автовосстановление молчащих захватов отзывало номер вкладки
+                # владельца за ночь, и выдать роль снова было нельзя — агента приходилось
+                # регистрировать заново. Явная выдача владельцем на своей машине и есть
+                # доверие: снимаем отзыв тем же путём, что `fleet.cmd resume`.
+                old = conn.execute("SELECT revoke_reason FROM workers WHERE id=?", (w,)).fetchone()
+                _mutate(db_path, lambda c, w=w: _cmd_resume(c, w), intervention_command="resume")
+                restored = f"; номер был отозван ({str(old[0] or '')[:80]}) — восстановлен"
+            until = grant(target, w, int(hours * 3600))
+            print(f"  {w}: роль владельца до {time.strftime('%d.%m %H:%M', time.localtime(until))} "
+                  f"(метка {row['label'] or '—'}, последний вызов {str(row['last_seen'])[:16]}){restored}")
+    return code
 
 
-def _cmd_owner_grant(db_path: Path, worker: str | None, hours: float, revoke: bool) -> int:
-    """Роль владельца вкладке без пароля в чате: доверие даёт эта машина, а не секрет.
+def _cmd_owner_grant_pick(db_path: Path, hours: float) -> int:
+    """Двойной щелчок (owner-grant.cmd): номер из чата → роль. Заявки и метки не нужны (15.11)."""
+    from dev_mcp.fleet.owner import grants_path, read_grants, secret_path
+
+    now = time.time()
+    granted = {w: u for w, u in read_grants(grants_path(secret_path(REPO))).items() if u > now}
+    if granted:
+        print("Роль владельца сейчас у: " + ", ".join(
+            f"{w} (до {time.strftime('%d.%m %H:%M', time.localtime(u))})" for w, u in sorted(granted.items())))
+    answer = input("\nНомер агента (из его чата: W123 или просто 123), можно несколько; Enter — выйти: ").strip()
+    ids = _worker_ids(answer)
+    if not ids:
+        print("ничего не выдано")
+        return 0
+    return _grant_ids(db_path, ids, hours)
+
+
+def _cmd_owner_grant(db_path: Path, workers: list[str] | None, hours: float, revoke: bool,
+                     show: bool = False) -> int:
+    """Роль владельца по номеру агента — любому воркеру, без заявки и без метки (владелец, 15.11).
 
     23.09.2026: пароль в аргументе fleet_owner_unlock ChatGPT не пропускал ни разу и после
-    этого блокировал весь чат. Без W берётся последняя вкладка с меткой owner…
+    этого блокировал весь чат — доверие даёт эта машина. 15.11: требование метки pult/owner
+    и «выдай роль» от агента сняты: выдача копила старые вкладки, а номер владелец и так видит.
     """
-    from dev_mcp.fleet.owner import grant, grants_path, revoke_grant, secret_path
+    from dev_mcp.fleet.owner import grants_path, read_grants, revoke_grant, secret_path
 
     target = grants_path(secret_path(REPO))
+    ids = _worker_ids(workers)
     if revoke:
-        gone = revoke_grant(target, worker)
+        gone = [g for w in (ids or [None]) for g in revoke_grant(target, w)]
         print(f"роль владельца снята: {', '.join(gone) or 'выдач не было'}")
         return 0
-    with _open_existing(db_path) as conn:
-        if worker:
-            row = conn.execute("SELECT id,label,last_seen FROM workers WHERE id=?", (worker,)).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT id,label,last_seen FROM workers WHERE (lower(label) LIKE 'owner%' "
-                "OR lower(label) LIKE 'pult%') AND revoked_at IS NULL ORDER BY last_seen DESC LIMIT 1"
-            ).fetchone()
-    if row is None:
-        print("вкладка не найдена: сначала во вкладке fleet_join(label='owner', kind='owner'), "
-              "потом эта команда (или укажи W явно)")
-        return 2
-    until = grant(target, row["id"], int(hours * 3600))
-    print(f"роль владельца выдана {row['id']} (метка {row['label'] or '—'}, последний вызов "
-          f"{row['last_seen']}) до {time.strftime('%d.%m %H:%M', time.localtime(until))}. "
-          "Переживает перезапуск dev-mcp. Снять: fleet.cmd owner-grant --revoke")
-    return 0
+    if show or not ids:
+        now = time.time()
+        live = {w: u for w, u in read_grants(target).items() if u > now}
+        print("роль владельца: " + (", ".join(
+            f"{w} до {time.strftime('%d.%m %H:%M', time.localtime(u))}" for w, u in sorted(live.items()))
+            or "ни у кого") + "\nвыдать: fleet.cmd owner-grant <номер> [<номер> …] [--hours N]")
+        return 0
+    return _grant_ids(db_path, ids, hours)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2094,7 +2681,12 @@ def main(argv: list[str] | None = None) -> int:
 
         project, _, tz = ns.task.rpartition("/")
         try:
-            print(undo_default(Store.open(str(path)), project, tz))
+            if tz.startswith("lead-decision:"):
+                from dev_mcp.fleet.lead_decision import undo as undo_lead_decision
+                print(undo_lead_decision(Store.open(str(path)), project,
+                                         tz.removeprefix("lead-decision:")))
+            else:
+                print(undo_default(Store.open(str(path)), project, tz))
         except ValueError as exc:
             print(f"undo: {exc}", file=sys.stderr)
             return 1
@@ -2117,7 +2709,7 @@ def main(argv: list[str] | None = None) -> int:
     if ns.command == "owner-grant":
         if ns.pick:
             return _cmd_owner_grant_pick(path, ns.hours)
-        return _cmd_owner_grant(path, ns.worker, ns.hours, ns.revoke)
+        return _cmd_owner_grant(path, ns.worker, ns.hours, ns.revoke, ns.list)
     try:
         if ns.command == "watch":
             return _cmd_watch(path, ns.stream, ns.since, ns.project)
@@ -2160,12 +2752,28 @@ def main(argv: list[str] | None = None) -> int:
                     print(platform_line())
                     print()
                     print(claimed_vs_done(conn, ns.project))
+                    from dev_mcp.fleet.delivery_gap import summary_lines
+                    try:  # воронка доставки — дополнение; пустой/старый реестр не роняет отчёт
+                        for line in summary_lines(conn, ns.project):
+                            print(line)
+                    except sqlite3.Error as exc:
+                        print(f"воронка доставки недоступна: {exc}")
                 elif ns.command == "metrics":
                     _print_metrics(metrics(conn, ns.since))
                 else:
                     print(platform_line())
+                    # 20.11.2026: сразу под строкой транспорта — однозначный итог и смысл флагов:
+                    # агенты с ролью владельца читали autostart=off/extension=stale как «флот не работает».
+                    from dev_mcp.fleet.status_brief import safe_brief_lines
+                    for line in safe_brief_lines(conn, Path(path), REPO / "logs"):
+                        print(line)
                     print()
                     items, hidden = split_alarms(exception_items(conn), ns.show_all)
+                    from dev_mcp.fleet import quick
+                    book = quick.Book(path.parent)
+                    actions = quick.first_actions(REPO / "logs", book.jobs().values())
+                    print(quick.recent_summary(book, actions))
+                    items.extend(quick.pause_alarms(book, actions=actions))
                     for item in items:
                         print("! " + item)
                     if not items:
@@ -2174,8 +2782,39 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"скрыто {hidden} старых тревог (старше {int(STALE_ALARM_H)} ч; --all)")
             return 0
 
+        if ns.command == "retire":
+            # 08.11 (решение владельца): рудименты выведенных механизмов снимает платформа сама.
+            from dev_mcp.fleet import rudiments
+            result = rudiments.retire(Store.open(str(path)), names=tuple(ns.classes or ()) or None,
+                                      dry=bool(ns.dry))
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return 0
+
         if ns.command == "bootstrap":
-            _bootstrap_slot()
+            started = time.perf_counter()
+            run_id = uuid.uuid4().hex[:12]
+            events: list[dict[str, Any]] = []
+            journal = REPO / "logs" / "bootstrap-timing.jsonl"
+
+            def record(stage: str, seconds: float, details: dict[str, Any]) -> None:
+                entry = {
+                    "at": datetime.now(timezone.utc).isoformat(), "run_id": run_id,
+                    "project": ns.project, "tz": list(ns.tz), "stage": stage,
+                    "seconds": round(seconds, 3), **details,
+                }
+                events.append(entry)
+                extra = (" " + json.dumps(details, ensure_ascii=False, sort_keys=True)
+                         if details else "")
+                print(f"bootstrap: {stage} {seconds:.2f} с{extra}", file=sys.stderr,
+                      flush=True)
+                try:
+                    journal.parent.mkdir(parents=True, exist_ok=True)
+                    with journal.open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                except OSError as exc:
+                    print(f"bootstrap: журнал замеров недоступен: {exc}", file=sys.stderr)
+
+            record("lock", _bootstrap_slot(), {})
             result = sync_selected(
                 Store.open(str(path)),
                 ns.project,
@@ -2183,13 +2822,36 @@ def main(argv: list[str] | None = None) -> int:
                 ns.tz,
                 reactivate=bool(ns.reactivate),
                 policy=Policy.load(str(REPO / "policy.toml")),
+                timing=record,
             )
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
             if not result.get("errors"):
                 # bootstrap owns its Store transaction; record its successful
                 # manual CLI invocation separately instead of wrapping a
                 # foreign transaction inside the console's sqlite connection.
+                event_started = time.perf_counter()
                 _mutate(path, lambda _conn: "bootstrap", intervention_command="bootstrap")
+                record("intervention", time.perf_counter() - event_started, {})
+            record("total", time.perf_counter() - started,
+                   {"errors": bool(result.get("errors"))})
+            def stage_total(stage: str) -> float:
+                return sum(entry["seconds"] for entry in events if entry["stage"] == stage)
+            runs = [entry for entry in events if entry["stage"] == "acceptance"]
+            slow = max(runs, key=lambda entry: entry["seconds"]) if runs else None
+            slow_label = (f"{slow['command'][:100]}: {slow['seconds']:.2f} с, "
+                          f"rc={slow['rc']}" if slow else "нет")
+            print(
+                f"bootstrap {','.join(ns.tz)}: всего {stage_total('total'):.2f} с — "
+                f"замок {stage_total('lock'):.2f}, разбор {stage_total('parse'):.2f}, "
+                f"снимок {stage_total('snapshot'):.2f}, "
+                f"копия {stage_total('workspace'):.2f}, "
+                f"коллекция {stage_total('collection'):.2f}, "
+                f"приёмка {stage_total('acceptance'):.2f} "
+                f"(самая долгая команда {slow_label}), "
+                f"запись {stage_total('registry') + stage_total('intervention'):.2f}",
+                file=sys.stderr,  # stdout — машиночитаемый JSON bootstrap; замер времени — в stderr
+                flush=True,
+            )
             return 2 if result.get("errors") else 0
 
         if ns.command == "revoke":
@@ -2202,11 +2864,28 @@ def main(argv: list[str] | None = None) -> int:
                 lambda c: _cmd_recover(c, ns.project, ns.tz, ns.reason, ns.min_silence_min),
                 intervention_command="recover",
             )
+        elif ns.command == "overseer":
+            code, message = _cmd_overseer(path, ns)
+        elif ns.command == "quick":
+            code, message = _cmd_quick(path, ns)
         elif ns.command == "say":
             code, message = _mutate(path, lambda c: _cmd_say(c, ns.body))
         elif ns.command == "tell":
             code, message = _mutate(path, lambda c: _cmd_tell(c, ns.to, ns.body),
                                     intervention_command="tell")
+        elif ns.command == "instruct":
+            code, message = _mutate(
+                path, lambda c: _cmd_instruct(c, ns.project, ns.text, ns.done_when, ns.want,
+                                              ns.priority, ns.source),
+                intervention_command="instruct")
+        elif ns.command == "focus":
+            code, message = _mutate(
+                path, lambda c: _cmd_focus(c, ns.project, ns.instruction, ns.tz),
+                intervention_command="focus")
+        elif ns.command == "unblock":
+            code, message = _mutate(
+                path, lambda c: _cmd_unblock(c, ns.project, ns.obstacle, ns.answer),
+                intervention_command="instruct")
         elif ns.command == "priority":
             code, message = _mutate(path, lambda c: _cmd_priority(c, ns.project, ns.value),
                                     intervention_command="priority")
@@ -2234,6 +2913,15 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _code = 1
+    try:
+        _code = main()
+    finally:
+        if os.environ.get(RC_FILE_ENV):
+            try:
+                Path(os.environ[RC_FILE_ENV]).write_text(str(_code), encoding="utf-8")
+            except OSError:
+                pass
+    raise SystemExit(_code)
 
 

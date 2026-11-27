@@ -138,7 +138,6 @@ def test_trusted_route_hung_operator_has_hard_deadline_and_durable_receipt(
     assert ready.wait(3)
 
     monkeypatch.setattr(controller, "run_daily_drill_scheduler", lambda _stop: None)
-    monkeypatch.setattr(controller, "run_cross_review_worker", lambda _store, _stop: None)
     monkeypatch.setattr(controller, "run_regater", lambda *_: None)
     stop = threading.Event()
     original_tick = controller.Controller.tick

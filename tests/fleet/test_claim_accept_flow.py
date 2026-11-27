@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from dev_mcp.fleet import goals, queue, review
+from dev_mcp.fleet import goals, live_deploy, queue, review
 from dev_mcp.fleet.claim_accept_flow import (
     ClaimAcceptError, ClaimAcceptFlow, _path, _within_owner, release_ready,
 )
@@ -153,6 +153,40 @@ def test_accepted_only_ff_gate_evidence_idempotent(world):
     assert "claim_integration_prepared" in kinds
     assert "claim_integrated" in kinds
     assert "claim_trunk_gate" in kinds
+
+
+@pytest.mark.parametrize("gate_rc,late_red,expected", [
+    (0, "", True), (1, "", False),
+    (0, "claim_trunk_gate", False), (0, "gate", False),
+])
+def test_live_tick_enforces_real_release_ready(world, monkeypatch, gate_rc, late_red, expected):
+    root, store = world
+    claim, _, sub = accepted_one(world)
+    result = flow(store, gate=lambda _: gate_rc).on_accept(claim, sub.revision)
+    assert (result.status == "integrated") == (gate_rc == 0)
+    head = git(root, "rev-parse", "HEAD")
+    if late_red:
+        assert release_ready(store, claim, sub.revision)
+        with store.tx() as tx:
+            tx.record_event(kind=late_red, project="Unit", payload={
+                "claim_id": claim, "submission_revision": sub.revision,
+                "integrated_sha": head, "tested_revision": head, "rc": 1})
+    monkeypatch.setattr(live_deploy, "_git_head", lambda _: (head, 1000.0))
+    calls = []
+    monkeypatch.setattr(live_deploy, "deploy", lambda *args: calls.append(args) or {
+        "ok": True, "detail": "ok"})
+    info = {"commit": True, "claim_trees": True, "live": {
+        "instance": "lib", "port": 8768, "probe": "Unit", "every_min": 10}}
+    responses = live_deploy.tick(store, lambda _: info, now=1700.0)
+    assert (len(responses) == 1) == expected
+    assert (len(calls) == 1) == expected
+    assert live_deploy.tick(store, lambda _: info, now=2400.0) == []
+    assert len(calls) == int(expected)
+    if not expected:
+        with store.read() as tx:
+            last = tx.one("SELECT payload FROM events WHERE kind='live_deployed' "
+                          "AND project='Unit' ORDER BY id DESC LIMIT 1")
+        assert "красный" in json.loads(last["payload"])["detail"]
 
 
 def test_controller_delivery_defers_until_exact_gated_trunk(world, tmp_path, monkeypatch):

@@ -1,5 +1,8 @@
 # First installation on Windows
 
+For a coding agent performing installation on your behalf, use
+[AGENT-SETUP.md](AGENT-SETUP.md). This page is the manual reference.
+
 Use a separate checkout and a directory you own. The commands below never
 replace an existing policy. Python 3.11+ and Git are required; `uv` is optional.
 
@@ -39,7 +42,8 @@ client running. Verify `policy_info` from the intended ChatGPT conversation.
 Tunnel authorization and browser sign-in are separate from local readiness.
 
 An existing authenticated HTTPS gateway is also supported. Keep production
-gateway credentials private; never copy another operator's credentials.
+gateway credentials private; never copy another operator's credentials. Never
+expose this process-executing server through an unauthenticated public tunnel.
 
 ## Fleet browser and optional integrations
 

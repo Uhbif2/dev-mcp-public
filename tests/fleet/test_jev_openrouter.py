@@ -74,11 +74,3 @@ def test_typesafe_billing_error_disables_it(monkeypatch):
     assert jev.configured() is False
 
 
-def test_gemini_backend_off_unless_enabled_and_parses_reply(tmp_path):
-    reply = {'candidates': [{'content': {'parts': [{'text': '{"o": {"noul": 0.2}}'}]}}]}
-    opener = _Opener(reply)
-    assert jev._ask_gemini({}, {'o': jev.OWNER_GATE_QUESTION}, 5, opener=opener, data=tmp_path) is None
-    (tmp_path / 'jev-gemini.json').write_text('{"enabled": true}', encoding='utf-8')
-    answers = jev._ask_gemini({}, {'o': jev.OWNER_GATE_QUESTION}, 5, opener=opener, data=tmp_path)
-    assert jev.noul(answers, 'o') == 0.2
-    assert opener.calls[0]['generationConfig']['thinkingConfig'] == {'thinkingBudget': 0}

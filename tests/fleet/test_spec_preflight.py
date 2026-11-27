@@ -451,3 +451,25 @@ def test_closed_task_does_not_hold_its_owns(tmp_path, state):
     report = preflight_task(candidate, tmp_path, existing_tasks=[closed])
     assert not report.obstacles
     assert report.dependencies == ()
+
+
+def test_lead_charter_overlaps_by_design_and_selftest_flag_is_allowed(tmp_path, monkeypatch):
+    """28.10 и 05.11: устав ведущего отвергался (зона пересекает профильные задачи; флаг
+    --selftest) — «ремонт источника» урезал ему зону."""
+    from dev_mcp.fleet import spec_preflight
+    real_which = spec_preflight.shutil.which
+    monkeypatch.setattr(spec_preflight.shutil, "which",
+                        lambda name, *args, **kwargs: "py.exe" if name == "py"
+                        else real_which(name, *args, **kwargs))
+    (tmp_path / "ops" / "lead").mkdir(parents=True)
+    (tmp_path / "ops" / "lead" / "ledger_check.py").write_text("print(1)\n", encoding="utf-8")
+    lead = task(tmp_path, tz="TZ-LEAD", owns=("src/**", "ops/**"),
+                acceptance=("py -3 ops/lead/ledger_check.py --selftest", "py -3 ops/lead/ledger_check.py"))
+    profile = task(tmp_path, tz="TZ-B", owns=("src/a.py",), state="taken")
+    report = preflight_task(lead, tmp_path, existing_tasks=[profile])
+    assert report.action == "register" and not report.obstacles, report.to_dict()
+    # и профильная задача не ждёт ведущего, чья зона — весь проект
+    back = preflight_task(task(tmp_path, tz="TZ-C", owns=("src/a.py",)), tmp_path,
+                          existing_tasks=[replace(lead, state="taken")])
+    assert back.action == "register" and not back.obstacles
+    assert _command("py -3 scripts/tool.py --write")[1] is not None

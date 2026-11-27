@@ -28,13 +28,14 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from dev_mcp.json_book import read_json, write_json
 from typing import Any
 
 WAKE_AFTER_MIN = float(os.environ.get("DEV_MCP_FLEET_WAKE_AFTER_MIN", "4"))
 RETRY_AFTER_MIN = float(os.environ.get("DEV_MCP_FLEET_WAKE_RETRY_MIN", "8"))
 GIVE_UP_AFTER_MIN = float(os.environ.get("DEV_MCP_FLEET_WAKE_GIVE_UP_MIN", "8"))
 NO_CHAT_GIVE_UP_MIN = float(os.environ.get("DEV_MCP_FLEET_WAKE_NO_CHAT_MIN", "20"))
-MAX_ORDERS = 2
+MAX_ORDERS = 1  # 28.10: второй будильник оживлял 14% чатов (21 из 154 за 3 дня) ценой ~8 мин простоя; возврат сохраняет работу
 ORDERS_PER_CALL = 2  # расширение исполняет по одному действию аккаунта в минуту
 GENERATING_LIMIT_MIN = 45.0
 
@@ -63,11 +64,8 @@ class ChatBook:
         self.path = Path(path)
 
     def load(self) -> dict[str, dict[str, str]]:
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
+        data = read_json(self.path, default={}, strict=True)
+        return data if isinstance(data, dict) else {}
 
     def remember(self, raw: str, now: datetime | None = None) -> int:
         """raw — строки «label url». Возвращает число принятых записей."""
@@ -87,9 +85,7 @@ class ChatBook:
             for label, url in seen.items():
                 book[label] = {"url": url, "seen_at": now_s}
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(book, ensure_ascii=False, indent=0), encoding="utf-8")
-            os.replace(tmp, self.path)
+            write_json(self.path, book, indent=0)
         return len(seen)
 
     def url(self, label: str) -> str:
@@ -238,11 +234,30 @@ def report_state(store: Any, *, wake_id: str, state: str,
     return True
 
 
-def wake_text(item: dict[str, Any]) -> str:
+def wake_text(item: dict[str, Any], store: Any = None) -> str:
     """Текст будки. Токен wake доказывает доставку: агент приходит с ним в fleet_resume, и сервер
     отличает «разбудили» от «работал и так» (эксперимент E3). Следующий шаг — из контрольной точки."""
     step = str(item.get("next_step") or "").strip()
     step_line = f" Следующий шаг по твоей контрольной точке: {step[:300]}" if step else ""
+    from .lead import focus_lines, is_lead
+    if is_lead(str(item.get("tz") or "")):
+        from .goals import goal_block
+        focus = focus_lines(str(item["project"]), store)
+        # 28.10: «доведи до fleet_submit» заставило ведущего сдать долгую задачу.
+        # 05.11: «сдавать не нужно — только когда цель достигнута» пережило переход на вехи (03.11):
+        # чат читал будку как слова владельца и 7 ч держал fix:TZ-LEAD:7 (≈230 правок) без вехи —
+        # «не сдавать TZ-LEAD, пока цель продукта не достигнута, по указанию владельца».
+        return (
+            "\n".join([goal_block(str(item["project"])).partition("\n")[0],
+                       *focus, ""])
+            + f"Продолжай {item['project']}/{item['tz']} — ты ведущий проекта, твой ход прервался. "
+            f"Первым вызовом fleet_resume(agent='{item['worker_id']}', wake='{item.get('wake', '')}'), "
+            + ("затем начни с указанного результата." if focus else
+               "затем ToDo/lead/PROTOCOL.md и ToDo/lead/STATE.md.") + step_line + " " +
+            "Продолжи проверку результата в месте использования как оркестратор: "
+            "независимые части передай через fleet_quick new, длинную работу — через fleet_lead(action='issue'). "
+            "Проверь независимые свидетельства и запиши первый пользовательский разрыв в контрольной точке."
+        )
     return (
         f"Продолжай {item['project']}/{item['tz']} — твой ход прервался посреди задачи. "
         f"Первым вызовом fleet_resume(agent='{item['worker_id']}', wake='{item.get('wake', '')}'): "
@@ -318,6 +333,10 @@ def give_up(store: Any, book: ChatBook, *, now: datetime | None = None) -> list[
     with store.read() as rx:  # пустой случай — без замка записи
         if not _silent_claims(rx, now, WAKE_AFTER_MIN):
             return []
+    from .owner import owner_ids_for_store
+    # Вкладку владельца с действующей выдачей роли не отзываем (20.11.2026): иначе после ночи
+    # роль нельзя было выдать снова тем же номером.
+    owners = owner_ids_for_store(store)
     with store.tx() as tx:
         by_claim = _orders_by_claim(tx, now)
         for item in _silent_claims(tx, now, WAKE_AFTER_MIN):
@@ -356,14 +375,16 @@ def give_up(store: Any, book: ChatBook, *, now: datetime | None = None) -> list[
                     ("UPDATE claims SET state='requeued',released_at=? WHERE id=?", (ts, item["claim_id"])),
                     ("UPDATE tasks SET state='ready',updated_at=? WHERE project=? AND tz=?",
                      (ts, item["project"], item["tz"])),
-                    ("UPDATE workers SET revoked_at=COALESCE(revoked_at,?),revoke_reason=? WHERE id=?",
-                     (ts, reason, item["worker_id"])),
+                    ("UPDATE workers SET revoked_at=COALESCE(revoked_at,?),revoke_reason=? "
+                     "WHERE id=? AND ?=0",
+                     (ts, reason, item["worker_id"], int(str(item["worker_id"]) in owners))),
                 ],
                 event={
                     "kind": "requeue", "worker_id": str(item["worker_id"]),
                     "project": str(item["project"]), "tz": str(item["tz"]),
                     "payload": {"automatic_recovery": True, "preserved_work": True, "why": why,
-                                "wake_orders": len(stamps), "generating_expired": generating_expired},
+                                "wake_orders": len(stamps), "generating_expired": generating_expired,
+                                "owner_kept": str(item["worker_id"]) in owners},
                 },
             )
             released.append(f"{item['project']}/{item['tz']}")

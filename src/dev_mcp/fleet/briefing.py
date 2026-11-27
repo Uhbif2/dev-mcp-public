@@ -29,20 +29,10 @@ def _current_blind_digest(root: str, batch: str, attempt_id: str | None = None) 
     raw = manifest.read_bytes()
     if not raw or len(raw) > 1024 * 1024:
         return None
-    text = raw.decode("utf-8")
-    start, end = "<!-- MILL_MANIFEST_JSON", "MILL_MANIFEST_JSON -->"
-    if text.count(start) != 1 or text.count(end) != 1:
-        return None
-    data = json.loads(text.split(start, 1)[1].split(end, 1)[0])
-    entries = data.get("entries") if isinstance(data, dict) else None
-    if not isinstance(entries, dict):
-        return None
-    candidates = sorted(
-        cid for cid, entry in entries.items()
-        if isinstance(cid, str) and isinstance(entry, dict)
-        and entry.get("outcome") == "candidate"
-    )
-    if not candidates:
+    from .blind_manifest import blind_case_ids
+    try:
+        candidates = blind_case_ids(raw, base, batch)
+    except (ValueError, TypeError, UnicodeError, OSError):
         return None
     review = base / "data" / "reviews" / batch
     if attempt_id is not None:
@@ -323,8 +313,105 @@ def _dependency_lines(store: Any, task: Task) -> list[str]:
             detail = (f"; accept event {accepted['id']}, reviewer {accepted['worker_id']}, {accepted['ts']}"
                       if accepted else "; квитанции accept нет")
             lines.append(f"  - {reference}: {row['state'] if row else 'не зарегистрирована'}{detail}")
+            if reference.endswith('#submitted') and row and row['state'] == 'rejected':
+                lines.append(f"  ВНИМАНИЕ: {tz} отклонена после сдачи кода; "
+                             "уже взятая задача продолжается, проверь изменения и согласуй исправления.")
     lines.append('Подробный результат: run argv=["fleet.cmd", "result", "<проект>/<TZ>"].')
     return lines
+
+
+_LEAD_BRIEF_LIMIT = 2500
+
+
+def _lead_brief(store: Any, worker_id: str, task: Task, rules: str, spec: str,
+                memory: str = "") -> str:
+    """First screen only: a verified O-ID stage, blocker/owner and single next step.
+
+    Long instructions, project history, permissions and dependencies remain in
+    their canonical files and fleet tools; they must not flood a new lead chat.
+    """
+    from . import goals, lead
+
+    goal = goals.goal_block(task.project).strip().splitlines()
+    window = lead.window_lines(store, task.project)
+    # A checkpoint's free-form blocker/action may mention several other O-IDs.
+    # Keep precisely the selected obligation in the first-screen summary.
+    selected = re.search(r"\bO-[\w.\-]+\b", window[0])
+    blocker = window[1]
+    if selected:
+        from . import obstacles
+        relevant = [item for item in obstacles.open_items(store, task.project)
+                    if selected.group() in (item.get("obligations") or [])]
+        if relevant:
+            item = max(relevant, key=lambda entry: int(entry.get("event_id") or 0))
+            actor = {"owner": "владелец", "operator": "оператор",
+                     "external": "внешняя сторона"}.get(str(item.get("actor")), "не указан")
+            blocker = (f"Блокер: {item.get('ask') or item.get('option') or item['id']}; "
+                       f"владелец: {actor}.")
+
+    def brief_field(value: str, limit: int = 440) -> str:
+        value = " ".join(str(value).split())
+        if selected:
+            value = re.sub(r"\bO-[\w.\-]+\b", "текущее обязательство", value)
+        return value[:limit].rstrip()
+
+    lines = [
+        brief_field(goal[0], 230) if goal else f"Цель проекта {task.project}: см. устав.",
+        f"Ведущий {task.project} · {task.tz} · worker {worker_id}",
+        window[0][:320],
+        brief_field(blocker),
+        brief_field(window[2]),
+        "Оркестрация: fleet_quick new/say для быстрых задач; "
+        "fleet_lead(action='issue') для ТЗ; fleet_lead(action='ask') для выбора. "
+        "Результат проверяй по независимым уликам; владельцу передавай только решения вне полномочий.",
+        f"Устав: {spec[:200]}; правила: {rules[:200]}",
+        "Остальное по запросу: ToDo/lead/STATE.md, ToDo/lead/PROTOCOL.md, "
+        "ToDo/lead/LEDGER.json; fleet_lead, fleet_checkpoint, fleet_quick show.",
+    ]
+    if memory:
+        lines.append("Правила памяти (полный текст — по запросу): " +
+                     brief_field(memory, 380))
+    return "\n".join(lines)[:_LEAD_BRIEF_LIMIT]
+
+
+def _reject_history_lines(store: Any, task: Task) -> list[str]:
+    """Full reviewer verdicts for the source and its fix rounds, newest first.
+
+    Events are the durable source; do not rely on a manually amended task body.
+    Blind tasks are handled before calling this function.
+    """
+    from .owner_grants import task_root
+
+    root = task_root(task.tz)
+    with store.read() as tx:
+        events = tx.query(
+            "SELECT id,ts,tz,worker_id,payload FROM events WHERE project=? AND kind='reject' "
+            "ORDER BY id DESC", (task.project,),
+        )
+        accepts = tx.query(
+            "SELECT id,tz FROM events WHERE project=? AND kind='accept' ORDER BY id DESC",
+            (task.project,),
+        )
+    # №118: отказы до последнего accept этой задачи — история, не текущая причина.
+    last_accept = max((int(a["id"]) for a in accepts if task_root(str(a["tz"] or "")) == root),
+                      default=0)
+    matches = []
+    for event in events:
+        if task_root(str(event["tz"] or "")) != root or int(event["id"]) < last_accept:
+            continue
+        try:
+            payload = json.loads(event["payload"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        note = payload.get("note") if isinstance(payload, dict) else None
+        who = f", ревьюер {event['worker_id']}" if event["worker_id"] else ""
+        rev = payload.get("revision") if isinstance(payload, dict) else ""
+        rev_text = f", ревизия {str(rev)[:12]}" if rev else ""
+        matches.append(
+            f"  {event['ts']} {event['tz']} [reject #{event['id']}{who}{rev_text}]: "
+            f"{str(note).strip() if note else '(причина не указана)'}"
+        )
+    return ["", "История отказов ревью (полный текст; новые сначала):", *matches] if matches else []
 
 
 def briefing(store: Any, worker_id: str, task: Task | None) -> str:
@@ -342,18 +429,39 @@ def briefing(store: Any, worker_id: str, task: Task | None) -> str:
     if blind_batch is not None:
         return _blind_brief(store, worker_id, task, blind_batch)
 
+    from . import lead, memory_rules
+    role = "lead" if lead.is_lead(task.tz) else "review" if task.kind == "review" else "executor"
+    memory = memory_rules.render(task.project, f"{task.tz}: {task.title}\n{task.body}",
+                                 role)
+    memory_prefix = memory + "\n\n" if memory else ""
     root = _project_root(store, task.project)
     rules = _project_rules(root)
     spec = str(Path(root) / task.spec_path) if root and task.spec_path else task.spec_path
+    if lead.is_lead(task.tz):
+        return _lead_brief(store, worker_id, task, rules, spec, memory)
     neighbors = _neighbors(store, task)
 
     lines = [
         f"worker: {worker_id}",
         f"задача: {task.project}/{task.tz} [{task.kind}/{task.state}]",
         "",
+    ]
+    from .lead_focus import settings
+
+    if settings(task.project).get("orchestrated"):
+        lines.extend(lead.focus_lines(task.project, store))
+        if task.kind == "review":
+            lines.append("Сверь результат с исходным поручением. Назови закрытый пункт и "
+                         "свидетельство на проверенной версии. Более срочный разрыв передай "
+                         "ведущему отдельно, с наблюдением и влиянием на результат.")
+        else:
+            lines.append("Начни с ожидаемого пользовательского эффекта и проверки из своего ТЗ. "
+                         "Если факт меняет постановку, передай ведущему наблюдение и следующий шаг.")
+        lines.append("")
+    lines.extend([
         "Прочитать:",
         f"  - {rules} — действующий корневой регламент проекта; правила здесь намеренно не пересказываются.",
-    ]
+    ])
     if spec and task.owns:
         lines.append(
             f"  - {spec} — ТЗ и раздел «Итог». Файл входит в твою зону: сюда же строка "
@@ -379,6 +487,8 @@ def briefing(store: Any, worker_id: str, task: Task | None) -> str:
         [
             "",
             "Рабочая памятка:",
+            "  - тест приёмки веди через продуктовую точку входа из раздела «Путь продукта» ТЗ, а не через изолированный класс или заготовленный ответ;",
+            "  - перед submit временно внеси контрпример из «Путь продукта», убедись, что тест падает, затем полностью верни исходный код и повтори приёмку;",
             f"  - ориентируйся на {Path(rules).name} для git, чужих зон/заявок и закрытия по rc;",
             "  - детерминированные границы выше — это данные очереди, а не копия регламента.",
         ]
@@ -405,11 +515,22 @@ def briefing(store: Any, worker_id: str, task: Task | None) -> str:
         cp = None
     if cp:
         lines.extend(["", checkpoint.render(cp, "Контрольная точка — продолжай с неё")])
+    try:
+        if task.kind == "review":
+            sample = lead.review_lines(store, task.project, task.tz)
+            if sample:
+                from . import witness
+                lines.extend(["", *sample, *witness.lead_lines(store, task.project),
+                              *lead.progress_lines(store, task.project)])
+    except Exception:
+        pass
+    if task.kind != "review":
+        lines.extend(_reject_history_lines(store, task))
     if task.body:
         lines.extend(["", "Тело задачи:", task.body])
     if task.kind == "review":
         lines.extend(["", *_review_lines(store, task)])
-    return "\n".join(lines)
+    return memory_prefix + "\n".join(lines)
 
 
 def _review_source_lines(store: Any, task: Task) -> list[str]:
@@ -452,6 +573,7 @@ def _review_lines(store: Any, task: Task) -> list[str]:
     """Что сделал автор и по каким правилам его принимать."""
     lines = [
         "Правила ревью:",
+        "  - СНАЧАЛА проверь раздел «Путь продукта»: тест идёт через указанную продуктовую точку входа и падает на указанном контрпримере; иначе reject с указанием раздела и непроверенного дефекта;",
         "  - во время ревью файлы задачи НЕ правь: любая запись после твоего прогона",
         "    обесценивает его, accept засчитывает только прогоны по текущему состоянию;",
         "  - rc=0 не доказывает, что тесты проверяют то же, что раньше, — смотри сигналы и diff;",
@@ -462,9 +584,8 @@ def _review_lines(store: Any, task: Task) -> list[str]:
         "  - reject — только за содержание: пункт «Что сделать» не сделан или сделан неправильно",
         "    (в note — какой и чем проверено). Форма отчёта, нет сопоставления в «Итог» — не повод:",
         "    сам проверил, что всё сделано, — accept, недочёт формы одной строкой в note.",
-        '  - кадры UI: fleet_look; если инструмента нет в схеме клиента, вызови run',
-        '    argv=["fleet.cmd", "look", "docs/screens/...png", "--rubric", "критерии"].',
-        "    Это тот же серверный просмотр проекта через Gemini; наличие PNG не является оценкой.",
+        "  - кадры UI оценивай сам: открой изображение и сравни с эталоном; наличие PNG не является оценкой.",
+        "  - визуальные пункты (скриншоты, PNG) смотри инструментом read_image / read_images; вердикт по визуалу без просмотра не выноси.",
     ]
     lines.extend(["", *_review_source_lines(store, task)])
     try:

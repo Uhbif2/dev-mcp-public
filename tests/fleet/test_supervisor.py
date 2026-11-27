@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import json
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dev_mcp.fleet.model import norm_path
 from dev_mcp.fleet.store import Store
 from dev_mcp.fleet import supervisor
+from dev_mcp.fleet import browser_storage
+
+
+@pytest.fixture(autouse=True)
+def no_live_storage_commands(monkeypatch):
+    monkeypatch.setattr(browser_storage, 'storage_command', lambda *args: {'state': 'unknown'})
 
 
 def _store(tmp_path: Path) -> Store:
@@ -71,6 +78,15 @@ def test_chrome_args_use_dedicated_profile_and_debug_port() -> None:
     assert "--remote-debugging-port=9223" in args
     assert "--restore-last-session" in args
     assert "https://chatgpt.com/" in args
+
+
+def test_profile_restore_does_not_append_another_unowned_homepage(tmp_path):
+    sessions = tmp_path / 'FleetChrome/Default/Sessions'
+    sessions.mkdir(parents=True)
+    (sessions / 'Session_123').write_text('persisted session')
+    args = supervisor.chrome_argv(Path('chrome.exe'), str(tmp_path))
+    assert '--restore-last-session' in args
+    assert 'https://chatgpt.com/' not in args
 
 
 class _Audit:
@@ -138,7 +154,7 @@ def test_stop_targets_only_dedicated_devtools_listener() -> None:
     def fake_run(argv, **_kwargs):
         calls.append(list(argv))
         if argv[0] == "netstat.exe":
-            return _Done("  TCP    127.0.0.1:9223    0.0.0.0:0    LISTENING    4242\n")
+            return _Done("  TCP    localhost:9223    0.0.0.0:0    LISTENING    4242\n")
         return _Done()
 
     assert supervisor.listener_pid(run=fake_run) == 4242
@@ -146,7 +162,7 @@ def test_stop_targets_only_dedicated_devtools_listener() -> None:
     assert ["taskkill.exe", "/F", "/T", "/PID", "4242"] in calls
 
 
-def test_supervisor_restarts_browser_when_extension_lease_is_stale(
+def test_stale_lease_and_unavailable_probe_preserves_browser(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -186,20 +202,15 @@ def test_supervisor_restarts_browser_when_extension_lease_is_stale(
         extension_reloader=lambda: False,
     )
 
-    assert stopped == [4242]
-    assert started == [4343]
-    assert any(
-        kind == "fleet_chrome_supervisor"
-        and meta.get("decision") == "allow"
-        and "extension reload" in meta.get("reason", "")
-        for kind, _args, meta in audit.rows
-    )
+    assert stopped == []
+    assert started == []
+    assert audit.rows == []
     line = supervisor.status_line(store)
     assert "browser=up" in line
-    assert "supervisor=extension-backoff" in line
+    assert "supervisor=extension-unobserved" in line
 
 
-def test_supervisor_prefers_extension_reload_before_browser_restart(
+def test_hundred_second_cycle_with_stale_lease_needs_no_recovery(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -213,7 +224,6 @@ def test_supervisor_prefers_extension_reload_before_browser_restart(
     status_path.write_text(json.dumps(data), encoding="utf-8")
 
     monkeypatch.setattr(supervisor, "EXTENSION_BOOT_GRACE_S", 0.0)
-    monkeypatch.setattr(supervisor, "EXTENSION_RELOAD_GRACE_S", 60.0)
     audit = _Audit()
     stop = _Stop()
     reloaded: list[bool] = []
@@ -229,22 +239,18 @@ def test_supervisor_prefers_extension_reload_before_browser_restart(
         probe=lambda: True,
         starter=lambda: started.append(True) or 4343,
         stopper=lambda: stopped.append(True) or 4242,
-        tick_age_finder=lambda: None,
+        tick_age_finder=lambda: 104.0,
+        extension_waker=lambda: reloaded.append("wake") or True,
         extension_reloader=lambda: reloaded.append(True) or True,
     )
 
-    assert reloaded == [True]
+    assert reloaded == []
     assert stopped == []
     assert started == []
-    assert any(
-        kind == "fleet_chrome_supervisor"
-        and meta.get("decision") == "allow"
-        and "extension reload requested through DevTools" in meta.get("reason", "")
-        for kind, _args, meta in audit.rows
-    )
+    assert audit.rows == []
     line = supervisor.status_line(store)
     assert "browser=up" in line
-    assert "supervisor=waiting-extension-reload" in line
+    assert "supervisor=control-unreachable" in line
 
 
 def _run_down(tmp_path: Path, *, alive, steps: int, clock):
@@ -292,7 +298,7 @@ def test_supervisor_does_not_open_second_window_while_chrome_alive(tmp_path: Pat
     assert kills == []  # срок молчания DevTools ещё не вышел
 
 
-def test_supervisor_kills_silent_chrome_after_grace_then_restarts(tmp_path: Path) -> None:
+def test_missing_devtools_never_kills_a_live_browser(tmp_path: Path) -> None:
     t = {"v": 0.0}
 
     def clock() -> float:
@@ -300,11 +306,14 @@ def test_supervisor_kills_silent_chrome_after_grace_then_restarts(tmp_path: Path
         return t["v"]
 
     starts, kills, audit = _run_down(tmp_path, alive=[777], steps=6, clock=clock)
-    assert kills and kills[0] == [777]
-    assert any("DevTools молчит" in str(meta.get("reason")) for _k, _a, meta in audit.rows)
+    assert starts == []
+    assert kills == []
+    assert audit.rows == []
+    assert "supervisor=devtools-unreachable" in supervisor.status_line(tmp_path / "data/fleet/fleet.sqlite")
+    assert "browser=unobserved" in supervisor.status_line(tmp_path / "data/fleet/fleet.sqlite")
 
 
-def test_fresh_lease_but_stalled_tick_triggers_extension_reload(
+def test_fresh_lease_but_stalled_tick_wakes_before_reload(
     tmp_path: Path, monkeypatch,
 ) -> None:
     store = _store(tmp_path)
@@ -321,12 +330,13 @@ def test_fresh_lease_but_stalled_tick_triggers_extension_reload(
         interval_s=0,
         probe=lambda: True,
         tick_age_finder=lambda: supervisor.EXTENSION_TICK_STALE_S + 120,
+        extension_waker=lambda: reloaded.append("wake") or True,
         extension_reloader=lambda: reloaded.append(True) or True,
         stopper=lambda: restarted.append(True) or 4242,
     )
-    assert reloaded == [True]
+    assert reloaded == ["wake"]
     assert restarted == []
-    assert "supervisor=waiting-extension-reload" in supervisor.status_line(store)
+    assert "supervisor=waiting-extension-wake" in supervisor.status_line(store)
     assert any("tick stale" in str(meta.get("reason", "")) for _, _, meta in audit.rows)
 
 
@@ -387,23 +397,20 @@ def test_missing_extension_tick_probes_as_stalled_without_touching_browser(
         interval_s=0,
         probe=lambda: True,
         tick_age_finder=lambda: float("inf"),
+        extension_waker=lambda: reloads.append("wake") or True,
         extension_reloader=lambda: reloads.append(True) or True,
     )
-    assert reloads == [True]
+    assert reloads == ["wake"]
 
 
-def test_stalled_tick_escalates_to_browser_restart_after_reload_grace(
+def test_stalled_tick_reloads_only_extension_after_wake_grace(
     tmp_path: Path, monkeypatch,
 ) -> None:
     store = _store(tmp_path)
     supervisor.record_extension_heartbeat(store, version="0.18.1", tabs=2, pending=0)
     monkeypatch.setattr(supervisor, "EXTENSION_BOOT_GRACE_S", 0.0)
-    monkeypatch.setattr(supervisor, "EXTENSION_RELOAD_GRACE_S", 0.1)
-    clock = {"t": 100.0}
-    def advance() -> float:
-        clock["t"] += 0.25
-        return clock["t"]
-    monkeypatch.setattr(supervisor.time, "monotonic", advance)
+    supervisor._record_recovery(store, wake_at=(datetime.now(timezone.utc) -
+        timedelta(seconds=supervisor.EXTENSION_WAKE_GRACE_S + 1)).isoformat())
     reloads: list[bool] = []
     stops: list[int] = []
     starts: list[int] = []
@@ -415,14 +422,15 @@ def test_stalled_tick_escalates_to_browser_restart_after_reload_grace(
         start_timeout_s=1,
         probe=lambda: True,
         tick_age_finder=lambda: supervisor.EXTENSION_TICK_STALE_S + 5,
+        extension_waker=lambda: (_ for _ in ()).throw(AssertionError("wake already sent")),
         extension_reloader=lambda: reloads.append(True) or True,
         stopper=lambda: stops.append(4242) or 4242,
         starter=lambda: starts.append(4343) or 4343,
     )
     assert reloads == [True]
-    assert stops == [4242]
-    assert starts == [4343]
-    assert "supervisor=restarted-for-extension" in supervisor.status_line(store)
+    assert stops == []
+    assert starts == []
+    assert "supervisor=extension-backoff" in supervisor.status_line(store)
 
 
 def test_unavailable_tick_probe_keeps_legacy_lease_behaviour(
@@ -443,3 +451,165 @@ def test_unavailable_tick_probe_keeps_legacy_lease_behaviour(
     )
     assert reloads == []
     assert "supervisor=healthy" in supervisor.status_line(store)
+
+
+def test_recovery_budget_survives_supervisor_restart_and_failed_reload(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    monkeypatch.setattr(supervisor, "EXTENSION_BOOT_GRACE_S", 0.0)
+    supervisor._record_recovery(store, wake_at=(datetime.now(timezone.utc) -
+        timedelta(seconds=supervisor.EXTENSION_WAKE_GRACE_S + 1)).isoformat())
+    actions = []
+    def fail_reload():
+        actions.append("reload")
+        raise TimeoutError("CDP reply lost")
+    for _ in range(3):
+        supervisor.supervise(
+            store.path, _Audit(), _Stop(), interval_s=0, probe=lambda: True,
+            tick_age_finder=lambda: 800.0,
+            extension_waker=lambda: actions.append("wake") or True,
+            extension_reloader=fail_reload,
+            stopper=lambda: actions.append("stop") or 1,
+            starter=lambda: actions.append("start") or 1,
+        )
+    assert actions == ["reload"]
+    assert "supervisor=extension-backoff" in supervisor.status_line(store)
+
+
+def test_progress_after_wake_cancels_escalation(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    monkeypatch.setattr(supervisor, "EXTENSION_BOOT_GRACE_S", 0.0)
+    ages = iter([500.0, 2.0])
+    actions = []
+    supervisor.supervise(
+        store.path, _Audit(), _Stop(), interval_s=0, probe=lambda: True,
+        tick_age_finder=lambda: next(ages),
+        extension_waker=lambda: actions.append("wake") or True,
+        extension_reloader=lambda: actions.append("reload") or True,
+    )
+    assert actions == ["wake"]
+    data = json.loads(Path(store.path).with_name(supervisor.STATUS_FILE).read_text())
+    assert data["recovery"]["wake_at"] is None
+    assert "supervisor=control-unreachable" in supervisor.status_line(store)
+
+
+def test_tick_age_helper_distinguishes_unobserved_and_missing_progress(monkeypatch):
+    monkeypatch.setattr(supervisor.shutil, 'which', lambda name: 'node' if name in ('node', 'node.exe') else None)
+    import subprocess
+    for output, code, expected in [
+        ("extension_tick_age_s=104\n", 0, 104.0),
+        ("extension_tick_age_s=missing\n", 0, float("inf")),
+        ("extension_reload=error\n", 1, None),
+    ]:
+        assert supervisor.extension_tick_age_s(run=lambda *a, **k:
+            subprocess.CompletedProcess(a, code, output)) == expected
+
+
+def test_alarm_wake_helper_requires_acknowledgement(monkeypatch):
+    monkeypatch.setattr(supervisor.shutil, 'which', lambda name: 'node' if name in ('node', 'node.exe') else None)
+    import subprocess
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "extension_wake=requested\n")
+    assert supervisor.wake_fleet_extension(run=run)
+    assert calls[0][-1] == "--wake"
+    assert not supervisor.wake_fleet_extension(run=lambda *a, **k:
+        subprocess.CompletedProcess(a, 0, ""))
+
+
+def test_independent_windows_launch_quotes_argv_and_rejects_missing_pid():
+    import base64
+    import subprocess
+    import pytest
+    calls = []
+    argv = [r"C:\Program Files\O'Brien\chrome.exe", r"--profile=C:\Local Folder", "a'$(bad)"]
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "1234\n")
+    assert supervisor.start_windows_independent_process(argv, run=run, show_window=7) == 1234
+    script = base64.b64decode(calls[0][0][-1]).decode("utf-16-le")
+    assert "Win32_Process').Create(" in script
+    assert subprocess.list2cmdline(argv).replace("'", "''") in script
+    assert "$startup.CreateFlags=150994944" in script
+    assert "$startup.ShowWindow=7" in script
+    assert calls[0][1]["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    with pytest.raises(RuntimeError, match="independent Windows launch failed"):
+        supervisor.start_windows_independent_process(argv, run=lambda *a, **k:
+            subprocess.CompletedProcess(a, 0, ""))
+
+
+def test_chrome_and_priority_keeper_both_use_independent_windows_launch(monkeypatch):
+    import pytest
+    if supervisor.os.name != "nt":
+        pytest.skip("Windows independent launcher")
+    calls = []
+    def broker(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return 1234
+    def forbidden_popen(*args, **kwargs):
+        raise AssertionError("must not inherit the server's job")
+    assert supervisor.start_fleet_chrome(binary=Path(r"C:\Chrome\chrome.exe"),
+        independent_starter=broker, popen=forbidden_popen) == 1234
+    assert calls[0][0][0] == r"C:\Chrome\chrome.exe"
+    assert calls[0][1] == {"show_window": 7}
+    # 17.11.2026: держатель приоритета выключен — второго запуска нет; фоновых флагов тоже.
+    assert len(calls) == 1
+    assert not any("backgrounding" in a or "throttling" in a for a in calls[0][0])
+
+
+def test_storage_io_failure_uses_verified_repair_even_during_reload_backoff(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    monkeypatch.setattr(supervisor, 'EXTENSION_BOOT_GRACE_S', 0)
+    supervisor._record_recovery(store, reload_at=datetime.now(timezone.utc).isoformat())
+    repairs, reloads, stops = [], [], []
+    audit = _Audit()
+    supervisor.supervise(store.path, audit, _Stop(), interval_s=0, probe=lambda: True,
+        tick_age_finder=lambda: float('inf'),
+        storage_probe=lambda: {'state': 'io-error', 'detail': 'FILE_ERROR_NO_SPACE'},
+        storage_repairer=lambda: repairs.append(True) or {'state': 'repaired'},
+        extension_reloader=lambda: reloads.append(True), stopper=lambda: stops.append(True))
+    assert repairs == [True]
+    assert reloads == [] and stops == []
+    assert 'supervisor=storage-repair-backoff' in supervisor.status_line(store)
+    assert any(kind == 'fleet_browser_storage_repair' and meta['decision'] == 'allow'
+               for kind, args, meta in audit.rows)
+
+
+def test_low_disk_storage_repair_retries_when_space_returns_without_reload_loop(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    monkeypatch.setattr(supervisor, 'EXTENSION_BOOT_GRACE_S', 0)
+    results = iter([{'state': 'waiting-space'}, {'state': 'repaired'}])
+    repairs = []
+    def repair():
+        repairs.append(True)
+        return next(results)
+    supervisor.supervise(store.path, _Audit(), _Stop(), interval_s=0, probe=lambda: True,
+        tick_age_finder=lambda: float('inf'),
+        storage_probe=lambda: {'state': 'io-error', 'detail': 'FILE_ERROR_NO_SPACE'},
+        storage_repairer=repair)
+    assert repairs == [True, True]
+    assert 'supervisor=storage-repaired' in supervisor.status_line(store)
+
+
+def test_storage_repair_cooldown_survives_supervisor_restart(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    monkeypatch.setattr(supervisor, 'EXTENSION_BOOT_GRACE_S', 0)
+    repairs = []
+    for _ in range(2):
+        supervisor.supervise(store.path, _Audit(), _Stop(), interval_s=0, probe=lambda: True,
+            tick_age_finder=lambda: float('inf'),
+            storage_probe=lambda: {'state': 'io-error', 'detail': 'FILE_ERROR_NO_SPACE'},
+            storage_repairer=lambda: repairs.append(True) or {'state': 'verification-failed'})
+    assert repairs == [True]
+    assert 'supervisor=storage-repair-backoff' in supervisor.status_line(store)
+
+
+@pytest.mark.parametrize('storage_state,expected', [('unknown', 0), ('io-error', 1)])
+def test_missing_timing_only_authorizes_repair_with_proved_storage_failure(tmp_path, monkeypatch, storage_state, expected):
+    store = _store(tmp_path)
+    monkeypatch.setattr(supervisor, 'EXTENSION_BOOT_GRACE_S', 0)
+    repairs = []
+    supervisor.supervise(store.path, _Audit(), _Stop(), interval_s=0, probe=lambda: True,
+        tick_age_finder=lambda: None, storage_probe=lambda: {'state': storage_state},
+        storage_repairer=lambda: repairs.append(True) or {'state': 'repaired'})
+    assert len(repairs) == expected

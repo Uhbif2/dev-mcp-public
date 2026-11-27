@@ -10,6 +10,25 @@ from dev_mcp.fleet.integrate import Integrator
 from dev_mcp.fleet.store import Store
 
 
+def test_candidate_runs_with_missing_renamed_base_executable(tmp_path, monkeypatch):
+    """Production runs as py-dev-mcp.exe; CPython invents an absent base alias."""
+    root = tmp_path / "renamed-runtime"
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.name", "Fleet Test")
+    _git(root, "config", "user.email", "fleet@example.invalid")
+    (root / "probe.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _git(root, "add", "probe.py")
+    _git(root, "commit", "-q", "-m", "baseline")
+    monkeypatch.setattr(sys, "_base_executable", str(tmp_path / "absent-alias.exe"))
+    engine = Integrator(None, tmp_path / "unused.json", project_info=lambda _: {})
+    assert engine._candidate(str(root), ["probe.py"], "P") == (True, "")
+    # Choosing a working runtime must not skip compilation of the candidate.
+    (root / "probe.py").write_text("def broken(:\n", encoding="utf-8")
+    ok, reason = engine._candidate(str(root), ["probe.py"], "P")
+    assert not ok and reason.startswith("py_compile:")
+
+
 def _git(root: Path, *argv: str) -> str:
     result = subprocess.run(
         ["git", *argv], cwd=root, check=True, capture_output=True,

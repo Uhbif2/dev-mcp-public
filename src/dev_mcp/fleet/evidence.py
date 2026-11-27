@@ -24,6 +24,8 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
+from dev_mcp.json_book import write_json
+
 from .model import norm_path
 
 SKIP_DIRS = {
@@ -178,10 +180,7 @@ def capture(store: Any, claim_id: int) -> bool:
             blob = blobs / sha
             if len(data) <= MAX_BLOB_BYTES and not blob.exists():
                 blob.write_bytes(data)
-        manifest_path.write_text(
-            json.dumps({"files": manifest, "truncated": truncated}, ensure_ascii=False, indent=1),
-            encoding="utf-8",
-        )
+        write_json(manifest_path, {"files": manifest, "truncated": truncated}, indent=1)
         return True
     except Exception:
         return False
@@ -214,14 +213,8 @@ def extend_capture(store: Any, claim_id: int, added_paths: Iterable[str]) -> boo
             blob = blobs / sha
             if len(raw) <= MAX_BLOB_BYTES and not blob.exists():
                 blob.write_bytes(raw)
-        manifest_path.write_text(
-            json.dumps(
-                {"files": manifest, "truncated": bool(data.get("truncated")) or truncated},
-                ensure_ascii=False,
-                indent=1,
-            ),
-            encoding="utf-8",
-        )
+        write_json(manifest_path, {"files": manifest,
+                                   "truncated": bool(data.get("truncated")) or truncated}, indent=1)
         return True
     except Exception:
         return False

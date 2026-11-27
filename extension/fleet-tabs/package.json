@@ -3,8 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test test/place.test.mjs test/package.test.mjs test/policy.test.mjs test/recovery.test.mjs test/runtime.test.mjs test/content.test.mjs test/fleet-report.test.mjs test/fleet-status.test.mjs test/dashboard-interventions.test.mjs test/research.test.mjs test/owner-notices.test.mjs test/modules-load.test.mjs test/interface-pressure.test.mjs test/browser-halt.test.mjs",
-    "test:dom": "node --test test/content.test.mjs",
+    "test": "node --test test/browser-halt.test.mjs test/composer-key.test.mjs test/connection-state.test.mjs test/dashboard-interventions.test.mjs test/extension-health.test.mjs test/fleet-report.test.mjs test/fleet-status.test.mjs test/fleet-ui-state.test.mjs test/full-handoff.test.mjs test/interface-pressure.test.mjs test/limit-reload.test.mjs test/liveness.test.mjs test/memory-guard.test.mjs test/modules-load.test.mjs test/overseer.test.mjs test/owner-notices.test.mjs test/package.test.mjs test/place.test.mjs test/policy.test.mjs test/recovery.test.mjs test/research.test.mjs test/runtime.test.mjs test/session-export.test.mjs test/storage-health.test.mjs test/overseer-tabs.test.mjs",
+    "test:dom": "node --test test/content.test.mjs test/chat-handoff.test.mjs test/quick-composer.test.mjs",
     "test:config": "node --test test/config.test.mjs",
     "test:all": "npm test && npm run test:config"
   }

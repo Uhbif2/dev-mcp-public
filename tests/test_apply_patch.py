@@ -69,6 +69,40 @@ async def test_patch_is_all_or_nothing(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_patch_rolls_back_existing_and_new_files_when_later_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dev_mcp.server as server_mod
+
+    server, root = make_server(tmp_path)
+    original = root / 'pkg' / 'a.py'
+    original.write_bytes(b'original\r\n')
+    final = root / 'pkg' / 'fail.py'
+    final.write_bytes(b'last = 1\n')
+    before = original.read_bytes()
+    write = server_mod._write_keep_eol
+
+    def fail_third(target, text, eol):
+        if target == final:
+            raise OSError('injected disk failure')
+        return write(target, text, eol)
+
+    monkeypatch.setattr(server_mod, '_write_keep_eol', fail_third)
+    patch = (
+        '*** Begin Patch\n'
+        '*** Update File: pkg/a.py\n-original\n+modified\n'
+        '*** Add File: pkg/new.py\n+x = 5\n'
+        '*** Update File: pkg/fail.py\n-last = 1\n+last = 2\n'
+        '*** End Patch'
+    )
+    text = await call(server, 'apply_patch', {'patch': patch, 'root': str(root)})
+    assert text.startswith('Отказано:'), text
+    assert original.read_bytes() == before
+    assert not (root / 'pkg' / 'new.py').exists()
+    assert final.read_bytes() == b'last = 1\n'
+
+
+@pytest.mark.asyncio
 async def test_patch_respects_roots(tmp_path: Path) -> None:
     server, root = make_server(tmp_path)
     outside = tmp_path / 'outside.py'

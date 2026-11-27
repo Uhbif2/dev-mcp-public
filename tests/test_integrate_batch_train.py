@@ -161,9 +161,11 @@ def test_unfinished_foreign_write_is_not_part_of_shared_train(fleet):
 
     assert runner.candidates == [("part0.txt", "part2.txt")], output
     assert by_tz["TZ-0"].get("commit") and by_tz["TZ-2"].get("commit")
-    assert by_tz["TZ-1"]["waiting_for"] == ["TZ-WIP"]
-    assert git(root, "rev-list", "--count", f"{base}..HEAD") == "2"
-    assert git(root, "show", "HEAD:part1.txt") == "baseline"
+    # 06.11 (f2b1845): незавершённый чужой писатель не держит принятую сдачу — её байты
+    # коммитятся по снимку печати отдельно от поезда; поздние байты писателя в коммит не идут.
+    assert by_tz["TZ-1"].get("route") == "snapshot" and by_tz["TZ-1"].get("commit"), by_tz["TZ-1"]
+    assert git(root, "rev-list", "--count", f"{base}..HEAD") == "3"
+    assert git(root, "show", "HEAD:part1.txt") == "approved-1"
     assert len(heads) == 1
 
 
@@ -182,3 +184,38 @@ def test_non_pytest_project_gate_also_validates_a_single_shared_train(fleet):
     assert sum(bool(e.get("payload", {}).get("commit")) for e in events) == 3
     assert git(root, "rev-list", "--count", f"{base}..HEAD") == "4"
     assert len(heads) == 1
+
+
+@pytest.mark.parametrize('reason',['resource_busy','validation_timeout','launch_error'])
+def test_execution_obstacle_does_not_bisect_or_assign_a_code_repair(fleet,monkeypatch,reason):
+    root,store,integ,runner,heads,base=fleet
+    for i in range(3):
+        (root/f'part{i}.txt').write_text(f'approved-{i}\n',encoding='utf-8')
+    accepted(store,root,[f'part{i}.txt' for i in range(3)])
+    probes=[]
+    def candidate(*args,**kwargs):
+        probes.append(args[1])
+        return False,reason
+    monkeypatch.setattr(integ,'_candidate',candidate)
+    output=integ.tick()
+    deferred=[e['payload'] for e in output if e['kind']=='integrate']
+    assert len(probes)==1
+    assert len(deferred)==3 and all(p['reason_code']==reason for p in deferred)
+    assert git(root,'rev-parse','HEAD')==base
+    with store.read() as tx:
+        assert tx.scalar("SELECT COUNT(*) FROM tasks WHERE kind='request'")==0
+
+
+def test_lead_accept_is_not_planned_into_shared_train(fleet):
+    # 08.11 (LEAD-SYSTEM-DESIGN 3.1): ведущий не едет в поезде — его веха идёт поштучно.
+    root, store, integ, runner, heads, base = fleet
+    for i in range(3):
+        (root / f"part{i}.txt").write_text(f"approved-{i}\n", encoding="utf-8")
+    accepted(store, root, [f"part{i}.txt" for i in range(3)])
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET tz='TZ-LEAD' WHERE project='P' AND tz='TZ-0'", (),
+                  event={"kind": "setup"})
+        tx.change("UPDATE events SET tz='TZ-LEAD' WHERE project='P' AND tz='TZ-0'", (),
+                  event={"kind": "setup"})
+    integ.tick()
+    assert runner.candidates and runner.candidates[0] == ("part1.txt", "part2.txt")

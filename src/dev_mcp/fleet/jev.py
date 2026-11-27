@@ -19,12 +19,8 @@ System One — есть `typesafe/jev-router`, обычный chat completion, �
 `OPENROUTER_API_KEY` из окружения. Траты считаются по `usage.cost` ответа в
 `data/fleet/jev-spend.json`; достигнут дневной лимит → None, флот ведёт себя как без Jev.
 
-Бесплатный бэкенд (17.10.2026): локальный релей ai-relay `127.0.0.1:8790` (пул ключей Gemini,
-денег не тратит) — те же вопросы промптом, ответ JSON. ВЫКЛЮЧЕН: замер 17.10 — flash-lite
-отвечает 0.9 на всё (при пороге 0.85 это ложные заморозки), квота gemini-2.5-flash в пуле
-кончается за пару вызовов, gemini-3.8-flash — 8–12 с. Включать только после проверки калибровки
-на исторических отказах: `data/fleet/jev-gemini.json` → `{"enabled": true}`. Порядок: TypeSafe
-(если есть кредиты) → Gemini → OpenRouter (только с бюджетом владельца).
+Бэкенд Gemini удалён владельцем 05.11.2026. Порядок: TypeSafe (если есть кредиты) → OpenRouter
+(только с бюджетом владельца).
 """
 from __future__ import annotations
 
@@ -36,6 +32,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from dev_mcp.json_book import read_json, write_json
 
 URL = 'https://api.typesafe.ai/v1/systemone'
 TIMEOUT_S = float(os.environ.get('DEV_MCP_JEV_TIMEOUT_S', 4))
@@ -96,24 +94,27 @@ def _today() -> str:
 
 
 def spent_today(data: Path | None = None) -> float:
+    path = (data or _DATA) / 'jev-spend.json'
+    ledger = read_json(path, default={}, strict=True)
+    if not isinstance(ledger, dict):
+        raise RuntimeError(f'Jev spend book invalid: {path}')
     try:
-        ledger = json.loads(((data or _DATA) / 'jev-spend.json').read_text(encoding='utf-8'))
         return float(ledger.get(_today(), 0.0))
-    except (OSError, ValueError, TypeError, AttributeError):
-        return 0.0
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(f'Jev spend book invalid: {path}') from exc
 
 
 def _record_spend(usd: float, data: Path | None = None) -> None:
     path = (data or _DATA) / 'jev-spend.json'
     with _SPEND_LOCK:
+        ledger = read_json(path, default={}, strict=True)
+        if not isinstance(ledger, dict):
+            raise RuntimeError(f'Jev spend book invalid: {path}')
         try:
-            ledger = json.loads(path.read_text(encoding='utf-8'))
-            if not isinstance(ledger, dict):
-                ledger = {}
-        except (OSError, ValueError):
-            ledger = {}
-        ledger[_today()] = round(float(ledger.get(_today(), 0.0)) + max(0.0, usd), 6)
-        path.write_text(json.dumps(dict(sorted(ledger.items())[-60:]), indent=1), encoding='utf-8')
+            ledger[_today()] = round(float(ledger.get(_today(), 0.0)) + max(0.0, usd), 6)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError(f'Jev spend book invalid: {path}') from exc
+        write_json(path, dict(sorted(ledger.items())[-60:]), indent=1)
 
 
 def _openrouter_budget(data: Path | None = None) -> float:
@@ -125,7 +126,10 @@ def _openrouter_budget(data: Path | None = None) -> float:
         cap = float(cfg.get('daily_usd', 0))
     except (TypeError, ValueError):
         return 0.0
-    return max(0.0, cap - spent_today(data))
+    try:
+        return max(0.0, cap - spent_today(data))
+    except RuntimeError:
+        return 0.0  # Corrupt ledger must disable spending, never reset the limit.
 
 
 def _openrouter_prompt(state: Any, questions: dict[str, Any]) -> str:
@@ -191,21 +195,6 @@ def _typesafe_alive() -> bool:
     return bool(_key()) and time.monotonic() >= _typesafe_dead_until
 
 
-GEMINI_URL = os.environ.get('DEV_MCP_JEV_GEMINI_URL', 'http://127.0.0.1:8790/v1beta')
-GEMINI_MODEL = os.environ.get('DEV_MCP_JEV_GEMINI_MODEL', 'gemini-2.5-flash')
-_gemini_dead_until = 0.0
-
-
-def _gemini_enabled(data: Path | None = None) -> bool:
-    import time
-    try:
-        cfg = json.loads(((data or _DATA) / 'jev-gemini.json').read_text(encoding='utf-8'))
-    except (OSError, ValueError):
-        cfg = {}
-    return (isinstance(cfg, dict) and cfg.get('enabled') is True and
-            time.monotonic() >= _gemini_dead_until)
-
-
 def _parse_json_answer(text: str) -> dict[str, Any] | None:
     try:
         text = text.strip()
@@ -215,40 +204,8 @@ def _parse_json_answer(text: str) -> dict[str, Any] | None:
     return answers if isinstance(answers, dict) else None
 
 
-def _ask_gemini(state: Any, questions: dict[str, Any], timeout_s: float,
-                *, opener: Any = None, data: Path | None = None) -> dict[str, Any] | None:
-    global _gemini_dead_until
-    if not _gemini_enabled(data):
-        return None
-    body = json.dumps({
-        'contents': [{'parts': [{'text': _openrouter_prompt(state, questions)}]}],
-        # 17.10, замер на 6 размеченных отказах: flash-lite отвечает 0.9 на всё (ложные
-        # заморозки при пороге 0.85); flash без рассуждений различает. thinkingBudget 0 —
-        # иначе рассуждения съедают maxOutputTokens и JSON обрывается.
-        'generationConfig': {'responseMimeType': 'application/json', 'temperature': 0,
-                             'maxOutputTokens': 400, 'thinkingConfig': {'thinkingBudget': 0}},
-    }).encode('utf-8')
-    req = urllib.request.Request(f'{GEMINI_URL}/models/{GEMINI_MODEL}:generateContent', data=body,
-                                 method='POST', headers={'content-type': 'application/json'})
-    try:
-        with (opener or _opener).open(req, timeout=timeout_s) as resp:
-            reply = json.loads(resp.read())
-    except urllib.error.URLError as exc:
-        if isinstance(getattr(exc, 'reason', None), ConnectionRefusedError):
-            import time
-            _gemini_dead_until = time.monotonic() + 300.0  # релей не поднят — не долбить
-        return None
-    except Exception:  # noqa: BLE001 — оракул необязателен
-        return None
-    try:
-        return _parse_json_answer(reply['candidates'][0]['content']['parts'][0]['text'])
-    except (KeyError, IndexError, TypeError):
-        return None
-
-
 def _fallback(state: Any, questions: dict[str, Any], timeout_s: float) -> dict[str, Any] | None:
-    answers = _ask_gemini(state, questions, timeout_s)
-    return answers if answers is not None else _ask_openrouter(state, questions, timeout_s)
+    return _ask_openrouter(state, questions, timeout_s)
 
 
 def ask(state: Any, questions: dict[str, Any], *, timeout_s: float = TIMEOUT_S) -> dict[str, Any] | None:
@@ -285,7 +242,7 @@ def noul(answers: dict[str, Any] | None, name: str) -> float | None:
 
 def configured() -> bool:
     """Есть ли ключ. Отличает «оракула нет совсем» (работаем без него) от «сеть моргнула» (повторим)."""
-    return _typesafe_alive() or _gemini_enabled() or _openrouter_budget() > 0
+    return _typesafe_alive() or _openrouter_budget() > 0
 
 
 def choice(answers: dict[str, Any] | None, name: str) -> tuple[str, float] | None:

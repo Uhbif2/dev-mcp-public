@@ -106,6 +106,11 @@ function renderHuman(human = {}) {
     const card = node("article", null, "human-card");
     card.append(node("h3", value(item.title) || "Результат"));
     card.append(node("p", value(item.text) || "Готово", "human-main"));
+    if (item.artifact) {
+      const links = node("div", null, "human-links");
+      links.append(localLink(item.artifact, "Архив изменений"), localLink(item.folder, "Открыть папку"));
+      card.append(links);
+    }
     refs.humanDone.append(card);
   }
   const fleet = human?.fleet || {};
@@ -143,6 +148,11 @@ function renderInterventions(metrics) {
   section.append(node("h3", "Ручные вмешательства · последние 7 дней"));
   if (!metrics || metrics.available === false) {
     section.append(node("p", "Учёт вмешательств пока недоступен", "meta"));
+    return section;
+  }
+  if (metrics.collection === "disabled" || metrics.collection === "stale") {
+    section.append(node("p", metrics.collection === "disabled" ? "Сбор отключён" : "Данные устарели", "meta"));
+    section.append(node("p", `Операторских команд сегодня: ${Number(metrics.operator_today) || 0} · вчера: ${Number(metrics.operator_yesterday) || 0}`, "meta"));
     return section;
   }
   const number = (n) => Number.isSafeInteger(n) && n >= 0 ? n : null;

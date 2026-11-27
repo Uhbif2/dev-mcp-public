@@ -33,8 +33,16 @@ import threading
 import time
 import tomllib
 from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Делегирование оператора (владелец, 15.11.2026): быстрый агент Claude Code получает права
+# оператора на явно названные пути (`fleet.cmd quick new --scope …`), в том числе в tree_deny
+# и вне write_roots/exec_roots. Значение ставит сервер на время одного вызова инструмента
+# по `agent` открытого задания (fleet/quick.py → operator_roots); закрыл задание — права нет.
+# Deny-маски секретов и страж флота действуют как обычно.
+DELEGATED_ROOTS: ContextVar[tuple[Path, ...]] = ContextVar('dev_mcp_delegated_roots', default=())
 
 
 # Отказ без пути дальше обрывает ход агента (07.10.2026: rg → deny → конец хода). Говорим, чем можно.
@@ -141,7 +149,15 @@ def _which_real(name: str) -> str | None:
                 return str(Path(os.path.realpath(cand)))
     if is_stub:
         return None
-    return str(Path(os.path.realpath(found))) if found else None
+    if not found:
+        return None
+    real = str(Path(os.path.realpath(found)))
+    # 09.11.2026 (TSPU W9199): cargo.exe rustup is a link to rustup.exe; the multi-call proxy
+    # picks its behaviour from the argv[0] name, so the resolved rustup.exe treated `cargo test`
+    # as `rustup test`. Same file, original name: keep the found path.
+    if Path(real).stem.lower() != Path(found).stem.lower():
+        return str(Path(found))
+    return real
 
 
 def scrub_env(source: dict[str, str] | None = None) -> dict[str, str]:
@@ -213,6 +229,12 @@ class Policy:
     max_write_bytes: int = 400_000
     max_list_entries: int = 500
     max_search_results: int = 200
+    # Runtime can quarantine missing directories instead of killing every tool.
+    # The default loader and --check remain strict. Quarantine survives directory
+    # reappearance/retargeting until a successful explicit policy reload.
+    unavailable_roots: list[str] = field(default_factory=list)
+    _unavailable_paths: list[Path] = field(default_factory=list, repr=False)
+    _allow_unavailable_roots: bool = field(default=False, repr=False)
     # {имя_бинаря: абсолютный путь} — заполняется на загрузке через shutil.which.
     _exec_bin_resolved: dict[str, str] = field(default_factory=dict)
     _exec_bin_missing: list[str] = field(default_factory=list)
@@ -229,7 +251,7 @@ class Policy:
     # ---------- загрузка ----------
 
     @classmethod
-    def load(cls, config_path: str | os.PathLike[str]) -> 'Policy':
+    def load(cls, config_path: str | os.PathLike[str], *, allow_unavailable_roots: bool = False) -> 'Policy':
         try:
             text = Path(config_path).read_text(encoding='utf-8')
         except OSError as exc:
@@ -241,12 +263,25 @@ class Policy:
             # tomllib уже содержит «(at line N, column M)».
             raise PolicyError(f'синтаксис TOML сломан — {exc}') from exc
 
-        roots: list[Path] = []
-        for item in raw.get('roots', []):
-            resolved = Path(os.path.realpath(os.path.abspath(os.path.expanduser(item))))
+        unavailable_roots: list[str] = []
+        unavailable_paths: list[Path] = []
+
+        def configured_root(item: str, label: str, parents: list[Path] | None = None) -> Path:
+            lexical = Path(os.path.abspath(os.path.expanduser(item)))
+            resolved = cls._real(lexical)
+            if not resolved.exists() and allow_unavailable_roots:
+                unavailable_roots.append(f'{label}: {item}')
+                unavailable_paths.extend((lexical, resolved))
+                return resolved
+            if parents is not None:
+                return cls._resolve_inside_roots(item, parents, label)
             if not resolved.exists():
                 raise PolicyError(f'корень из policy.toml не существует: {item}')
-            roots.append(resolved)
+            return resolved
+
+        roots: list[Path] = []
+        for item in raw.get('roots', []):
+            roots.append(configured_root(item, 'root'))
         if not roots:
             raise PolicyError('в policy.toml не задан ни один корень — сервер бесполезен')
 
@@ -254,7 +289,7 @@ class Policy:
         # только здесь. Это дешевле глобального allow_write, потому что открывает
         # ровно рабочую папку, а не весь корень с исходниками.
         write_roots = [
-            cls._resolve_inside_roots(item, roots, 'write_root')
+            configured_root(item, 'write_root', roots)
             for item in raw.get('write_roots', [])
         ]
 
@@ -263,16 +298,16 @@ class Policy:
         # для клиента в этом дереве (записал .py в граф импортов → запустил).
         # Поэтому решение о каждой папке принимается осознанно и отдельно.
         exec_roots = [
-            cls._resolve_inside_roots(item, roots, 'exec_root')
+            configured_root(item, 'exec_root', roots)
             for item in raw.get('exec_roots', [])
         ]
 
         tree_roots = [
-            cls._resolve_inside_roots(item, roots, 'tree_root')
+            configured_root(item, 'tree_root', roots)
             for item in raw.get('tree_roots', [])
         ]
         for root in tree_roots:
-            if not root.is_dir():
+            if root.exists() and not root.is_dir():
                 raise PolicyError(f'tree_root должен быть каталогом: {root}')
         tree_deny: list[Path] = []
         for item in raw.get('tree_deny', []):
@@ -336,6 +371,9 @@ class Policy:
 
         policy = cls(
             roots=roots,
+            unavailable_roots=unavailable_roots,
+            _unavailable_paths=unavailable_paths,
+            _allow_unavailable_roots=allow_unavailable_roots,
             write_roots=write_roots,
             exec_roots=exec_roots,
             tree_roots=tree_roots,
@@ -376,8 +414,11 @@ class Policy:
         успешный результат копируется — старая (рабочая) политика продолжает
         действовать до следующей исправленной правки.
         """
-        fresh = Policy.load(config_path)
+        fresh = Policy.load(config_path, allow_unavailable_roots=self._allow_unavailable_roots)
         with self._reload_lock:
+            # Close newly unavailable paths before replacing grants. Keep the
+            # previous quarantine until all validated fields have been copied.
+            self._unavailable_paths = [*self._unavailable_paths, *fresh._unavailable_paths]
             for attr in (
                 'roots', 'write_roots', 'exec_roots', 'tree_roots', 'tree_deny', 'exec_allowed_bin',
                 'exec_args_unrestricted', 'exec_bin_project_local', 'deny_patterns',
@@ -386,8 +427,10 @@ class Policy:
                 'exec_timeout_cap_s', 'exec_sync_budget_s', 'max_read_bytes', 'max_write_bytes',
                 'max_list_entries', 'max_search_results',
                 '_exec_bin_resolved', '_exec_bin_missing',
+                'unavailable_roots',
             ):
                 setattr(self, attr, getattr(fresh, attr))
+            self._unavailable_paths = fresh._unavailable_paths
             # Маски сменились — скомпилированные regex'ы больше не описывают
             # политику. Чистим кэш, следующий вызов соберёт их заново.
             self._name_res.clear()
@@ -420,6 +463,13 @@ class Policy:
         return (not strict and target_norm == root_norm) or target_norm.startswith(
             root_norm.rstrip(os.sep) + os.sep
         )
+
+    def _delegated(self, *paths: Path) -> Path | None:
+        """Область оператора, делегированная текущему вызову (DELEGATED_ROOTS), которой накрыт путь."""
+        for root in DELEGATED_ROOTS.get():
+            if all(self._within(p, root) for p in paths):
+                return root
+        return None
 
     def _tree_denied(self, path: Path) -> bool:
         return any(self._within(path, denied) for denied in self.tree_deny)
@@ -492,6 +542,11 @@ class Policy:
         """Каким exec_root накрыт путь (сам путь или его предок), либо None."""
         lexical = real
         real = self._real(real)
+        if self._unavailable(lexical) or self._unavailable(real):
+            return None
+        delegated = self._delegated(lexical, real)
+        if delegated is not None:
+            return delegated
         if self._tree_denied(lexical) or self._tree_denied(real):
             return None
         if self._tree_root_owner_only(lexical) or self._tree_root_owner_only(real):
@@ -509,6 +564,9 @@ class Policy:
     def _validate_tasks(self) -> None:
         """cwd задачи обязан лежать внутри корня — иначе задача обходит границу."""
         for task in self.tasks.values():
+            cwd = Path(os.path.abspath(os.path.expanduser(task.cwd)))
+            if self._unavailable(cwd) or self._unavailable(self._real(cwd)):
+                continue  # Listed as blocked by task_status; other tasks still run.
             try:
                 self.resolve(task.cwd, for_write=False)
             except PolicyError as exc:
@@ -526,6 +584,9 @@ class Policy:
         """
         if not task.argv:
             return False, 'у задачи пустой argv'
+        cwd = Path(os.path.abspath(os.path.expanduser(task.cwd)))
+        if self._unavailable(cwd) or self._unavailable(self._real(cwd)):
+            return False, 'каталог политики недоступен; доступ закрыт до успешного policy_reload'
         try:
             self.resolve(task.cwd, for_write=True)
         except PolicyError:
@@ -570,6 +631,8 @@ class Policy:
 
         candidate = Path(os.path.abspath(os.path.expanduser(text)))
         real = self._real(candidate)
+        if self._unavailable(candidate) or self._unavailable(real):
+            raise PolicyError('каталог политики недоступен; доступ закрыт до успешного policy_reload')
 
         root = self._owning_root(real)
         if root is None:
@@ -580,11 +643,12 @@ class Policy:
         self._assert_not_denied(rel, real)
 
         if for_write:
-            if self._tree_denied(candidate) or self._tree_denied(real):
+            delegated = self._delegated(candidate, real) is not None
+            if not delegated and (self._tree_denied(candidate) or self._tree_denied(real)):
                 raise PolicyError('tree_deny: запись в защищённом поддереве запрещена')
-            if self._tree_root_owner_only(candidate) or self._tree_root_owner_only(real):
+            if not delegated and (self._tree_root_owner_only(candidate) or self._tree_root_owner_only(real)):
                 raise PolicyError('файлы корня правит владелец')
-            if not self._may_write(real):
+            if not delegated and not self._may_write(real):
                 if self.write_roots or self.tree_roots:
                     allowed = ', '.join(str(r) for r in [*self.write_roots, *self.tree_roots])
                     raise PolicyError(f'сюда писать нельзя. Запись разрешена только в: {allowed}')
@@ -611,6 +675,8 @@ class Policy:
         write_root всё равно закрыт — точечное право записи не делает дырку
         в маске.
         """
+        if self._unavailable(real):
+            return False
         if self.allow_write:
             return True
         if any(self._within(real, root, strict=True) for root in self.tree_roots):
@@ -646,6 +712,9 @@ class Policy:
         for part in reversed(tail):
             base = base / part
         return base
+
+    def _unavailable(self, path: Path) -> bool:
+        return any(self._within(path, blocked) for blocked in self._unavailable_paths)
 
     def _owning_root(self, real: Path) -> Path | None:
         target = os.path.normcase(str(real))
@@ -851,6 +920,8 @@ class Policy:
         stack: list[Path] = [root]
         while stack:
             current = stack.pop()
+            if self._unavailable(current):
+                continue
             try:
                 with os.scandir(current) as it:
                     entries = sorted(it, key=lambda e: e.name)
@@ -870,6 +941,8 @@ class Policy:
                 except OSError:
                     continue
                 path = Path(entry.path)
+                if self._unavailable(path):
+                    continue
                 if is_dir:
                     if self.prunes_dir(name):
                         continue
@@ -913,10 +986,11 @@ class Policy:
                 'blocked_reason': reason,
             }
         return {
-            'roots': [str(r) for r in self.roots],
-            'write_roots': [str(r) for r in self.write_roots],
-            'exec_roots': [str(r) for r in self.exec_roots],
-            'tree_roots': [str(r) for r in self.tree_roots],
+            'roots': [str(r) for r in self.roots if not self._unavailable(r)],
+            'write_roots': [str(r) for r in self.write_roots if not self._unavailable(r)],
+            'exec_roots': [str(r) for r in self.exec_roots if not self._unavailable(r)],
+            'tree_roots': [str(r) for r in self.tree_roots if not self._unavailable(r)],
+            'unavailable_roots': list(self.unavailable_roots),
             'tree_deny': [str(r) for r in self.tree_deny],
             'exec_allowed_bin': list(self.exec_allowed_bin),
             'exec_args_unrestricted': list(self.exec_args_unrestricted),

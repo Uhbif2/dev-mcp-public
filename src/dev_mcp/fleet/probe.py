@@ -65,6 +65,8 @@ def register(store: Any, policy: Any, worker_id: str, project: str, tz: str, rea
             argv = process_idle.validate(tokens)
         elif tokens and tokens[0] == world.DISK_ADMISSION:
             argv = world.validate_disk_admission(tokens)
+        elif tokens and (tokens == [world.ADB_READY] or world.is_adb_listing(tokens)):
+            argv = [world.ADB_READY]
         else:
             argv = bite.parse_command(raw, policy)
     except Exception as exc:  # noqa: BLE001 — отказ пробы не отменяет блокировку
@@ -101,12 +103,15 @@ def current(tx: Any, project: str, tz: str) -> dict[str, Any] | None:
         return None
     if not argv:
         return None
+    # 08.11: нужны последние прогоны (бэкофф и last_rc), а не вся история: 1045 прогонов
+    # пробы ведущего читались на каждом ходе (216 мс).
     runs = [
         (int(json.loads(str(r["payload"] or "{}")).get("rc", -1)), str(r["ts"]))
-        for r in tx.query(
-            "SELECT ts,payload FROM events WHERE project=? AND tz=? AND kind=? AND id>? ORDER BY id",
-            (project, tz, RUN_KIND, int(reg["id"])),
-        )
+        for r in reversed(tx.query(
+            "SELECT ts,payload FROM events WHERE project=? AND tz=? AND kind=? AND id>? "
+            "ORDER BY id DESC LIMIT ?",
+            (project, tz, RUN_KIND, int(reg["id"]), len(BACKOFF_MIN) + 1),
+        ))
     ]
     return {
         "argv": argv, "block_id": int(block["id"]), "registration_id": int(reg["id"]),
@@ -185,6 +190,8 @@ def run_due(store: Any, policy: Any, runner: Callable[[list[str], str], int] = _
                 argv, execute = process_idle.validate(argv), process_idle.run
             elif argv[0] == world.DISK_ADMISSION:
                 argv, execute = world.validate_disk_admission(argv), world.disk_admission
+            elif argv == [world.ADB_READY] or world.is_adb_listing(argv):
+                execute = world.adb_ready
             else:
                 argv, execute = bite.validate_argv(argv, policy), runner
             rc = execute(argv, root) if root and os.path.isdir(root) else -2

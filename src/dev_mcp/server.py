@@ -22,13 +22,18 @@ import base64
 import difflib
 import fnmatch
 import hashlib
+import http.client
 import ipaddress
 import json
+import io
+import logging
+import struct
 import ntpath
 import os
 import re
 import secrets
 import shutil
+import ssl
 import socket
 import subprocess
 import time
@@ -36,6 +41,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import threading
+import tempfile
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -44,6 +50,7 @@ from typing import Any, Callable
 
 import anyio
 from fastmcp import FastMCP
+from fastmcp.utilities.types import Image
 
 from dev_mcp.audit import Audit
 from dev_mcp.context_docs import ContextDocs
@@ -109,6 +116,144 @@ _BINARY_SUFFIXES = frozenset({
 })
 _BINARY_SNIFF_BYTES = 8192
 
+_IMAGE_LIMIT = 8 * 1024 * 1024
+_IMAGE_FORMATS = {'.png': 'png', '.jpg': 'jpeg', '.jpeg': 'jpeg',
+                  '.webp': 'webp', '.gif': 'gif'}
+
+
+def _regex_risk(query: str) -> str:
+    """Отказ для шаблонов с катастрофическим перебором (25.11, ночное ревью dev-mcp-self).
+
+    Модуль re не прерывается по времени, поэтому ограничение — до запуска: вложенная
+    неограниченная повторяемость ((a+)+, (\\w*)*, (x+y?)*, (?:a{1,3})+) — класс, дающий
+    экспоненциальный перебор на одной строке.
+    """
+    try:
+        from re import _parser as sre  # Python 3.11+
+    except ImportError:  # pragma: no cover
+        import sre_parse as sre  # type: ignore[no-redef]
+    try:
+        parsed = sre.parse(query)
+    except Exception:  # noqa: BLE001 - синтаксис уже проверен re.compile
+        return ''
+    unbounded = sre.MAXREPEAT
+    repeats = {sre.MAX_REPEAT, sre.MIN_REPEAT, getattr(sre, 'POSSESSIVE_REPEAT', None)} - {None}
+
+    def has_repeat(items) -> bool:
+        for op, av in items:
+            if op in repeats and av[1] > 1:
+                return True
+            for sub in _children(op, av):
+                if has_repeat(sub):
+                    return True
+        return False
+
+    def _children(op, av):
+        if op in repeats:
+            return [av[2]]
+        if op == sre.SUBPATTERN:
+            return [av[-1]]
+        if op == sre.BRANCH:
+            return list(av[1])
+        if op in (sre.ASSERT, sre.ASSERT_NOT):
+            return [av[1]]
+        return []
+
+    def walk(items) -> str:
+        for op, av in items:
+            if op in repeats and (av[1] == unbounded or av[1] > 50):
+                body = av[2]
+                if has_repeat(body):
+                    return 'вложенная неограниченная повторяемость'
+            for sub in _children(op, av):
+                found = walk(sub)
+                if found:
+                    return found
+        return ''
+
+    found = walk(parsed)
+    if found:
+        return (f'регулярное выражение отклонено: {found} даёт неограниченный по времени перебор; '
+                'перепиши без вложенных квантификаторов или ищи подстроку (regex=false)')
+    return ''
+
+
+def _image_payload(raw: bytes, suffix: str, max_side: int) -> tuple[bytes, str, int, int]:
+    """Validate image bytes and dimensions; resize when Pillow is available."""
+    if type(max_side) is not int or not 1 <= max_side <= 8192:
+        raise ValueError('max_side должен быть от 1 до 8192')
+    fmt = _IMAGE_FORMATS.get(suffix.lower())
+    if not fmt or not raw or len(raw) > _IMAGE_LIMIT:
+        raise ValueError('неподдерживаемый формат или изображение больше 8 МБ')
+    try:
+        from PIL import Image as PILImage, UnidentifiedImageError
+    except ImportError:
+        PILImage = None
+    if PILImage is not None:
+        try:
+            with PILImage.open(io.BytesIO(raw)) as pic:
+                if pic.format.lower() != fmt:
+                    raise ValueError('формат содержимого не совпадает с расширением')
+                width, height = pic.size
+                if not width or not height or width * height > 100_000_000:
+                    raise ValueError('недопустимый размер изображения')
+                if max(width, height) > max_side:
+                    pic.thumbnail((max_side, max_side), PILImage.Resampling.LANCZOS)
+                    out = io.BytesIO()
+                    # Animated GIFs are represented by the first frame in a preview.
+                    output_format = 'png' if fmt in {'gif', 'webp'} else fmt
+                    if output_format == 'jpeg' and pic.mode not in ('RGB', 'L'):
+                        pic = pic.convert('RGB')
+                    pic.save(out, format=output_format.upper())
+                    if out.tell() > _IMAGE_LIMIT:
+                        raise ValueError('уменьшенное изображение больше 8 МБ')
+                    return out.getvalue(), output_format, width, height
+                return raw, fmt, width, height
+        except (OSError, ValueError) as exc:
+            raise ValueError(f'неверное изображение: {exc}') from exc
+    # Header-only fallback. No untrusted image is decoded without Pillow.
+    if fmt == 'png' and raw.startswith(b'\x89PNG\r\n\x1a\n') and len(raw) >= 24:
+        width, height = struct.unpack('>II', raw[16:24])
+    elif fmt == 'gif' and raw[:6] in (b'GIF87a', b'GIF89a') and len(raw) >= 10:
+        width, height = struct.unpack('<HH', raw[6:10])
+    elif fmt == 'webp' and raw.startswith(b'RIFF') and raw[8:12] == b'WEBP':
+        if raw[12:16] == b'VP8X' and len(raw) >= 30:
+            width = 1 + int.from_bytes(raw[24:27], 'little')
+            height = 1 + int.from_bytes(raw[27:30], 'little')
+        elif raw[12:16] == b'VP8L' and len(raw) >= 25 and raw[20] == 0x2f:
+            bits = int.from_bytes(raw[21:25], 'little')
+            width, height = (bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1
+        elif raw[12:16] == b'VP8 ' and len(raw) >= 30 and raw[23:26] == b'\x9d\x01\x2a':
+            width, height = struct.unpack('<HH', raw[26:30])
+            width, height = width & 0x3fff, height & 0x3fff
+        else:
+            raise ValueError('неподдерживаемый заголовок WebP без Pillow')
+    elif fmt == 'jpeg' and raw.startswith(b'\xff\xd8'):
+        width = height = 0
+        pos = 2
+        while pos + 4 <= len(raw):
+            if raw[pos] != 0xff:
+                break
+            marker = raw[pos + 1]
+            pos += 2
+            if marker in (0xd8, 0xd9) or 0xd0 <= marker <= 0xd7:
+                continue
+            size = int.from_bytes(raw[pos:pos + 2], 'big')
+            if size < 2 or pos + size > len(raw):
+                break
+            if marker in (0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf):
+                height = int.from_bytes(raw[pos + 3:pos + 5], 'big')
+                width = int.from_bytes(raw[pos + 5:pos + 7], 'big')
+                break
+            pos += size
+    else:
+        raise ValueError('содержимое не соответствует формату изображения')
+    if not width or not height or width * height > 100_000_000:
+        raise ValueError('не удалось определить размеры изображения')
+    # Without Pillow return original bytes, even if larger than max_side.
+    # The strict 8 MiB byte limit still applies.
+    return raw, fmt, width, height
+
 
 def _blind_snapshot_sha(root: Path, batch: str, attempt_id: str | None = None) -> str | None:
     """Rehash the sealed *set* of case files, not just an event's SHA shape.
@@ -130,19 +275,8 @@ def _blind_snapshot_sha(root: Path, batch: str, attempt_id: str | None = None) -
         source = manifest.read_bytes()
         if not source or len(source) > 1024 * 1024:
             return None
-        source_text = source.decode('utf-8')
-        begin, end = '<!-- MILL_MANIFEST_JSON', 'MILL_MANIFEST_JSON -->'
-        if source_text.count(begin) != 1 or source_text.count(end) != 1:
-            return None
-        payload = json.loads(source_text.split(begin, 1)[1].split(end, 1)[0])
-        entries = payload.get('entries') if isinstance(payload, dict) else None
-        if not isinstance(entries, dict) or not entries:
-            return None
-        candidates = sorted(cid for cid, item in entries.items()
-                            if isinstance(cid, str) and isinstance(item, dict)
-                            and item.get('outcome') == 'candidate')
-        if not candidates:
-            return None
+        from dev_mcp.fleet.blind_manifest import blind_case_ids
+        candidates = blind_case_ids(source, root, batch)
         digests: list[tuple[str, str]] = []
         for cid in candidates:
             safe = (cid if re.fullmatch(r'[A-Za-z0-9._-]{1,120}', cid)
@@ -161,7 +295,7 @@ def _blind_snapshot_sha(root: Path, batch: str, attempt_id: str | None = None) -
         return None
 
 
-_PULT_READ = ("result", "active", "decisions", "flow", "report", "look")
+_PULT_READ = ("result", "active", "decisions", "flow", "report")
 
 
 def _pult_read(argv: list[str]) -> list[str] | str | None:
@@ -241,21 +375,8 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
     сторон: этот код зовётся из пула потоков, и «подождать подольше» здесь
     означает «занять поток навсегда».
     """
-    try:
-        subprocess.run(  # noqa: S603,S607 — фиксированный argv, наш же процесс
-            ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
-            capture_output=True,
-            timeout=15,
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        proc.kill()
-    for _ in range(2):
-        try:
-            proc.wait(timeout=10)
-            return
-        except subprocess.TimeoutExpired:
-            proc.kill()
+    from dev_mcp.process_execution import finish_process
+    finish_process(proc, kill=True)
 
 
 def _read_output(path: Path, max_chars: int = 200_000) -> str:
@@ -296,6 +417,7 @@ def _run_capturing(
     jobs: JobRegistry | None = None,
     budget_s: int | None = None,
     on_exit=None,
+    agent: str = '',
 ) -> tuple[int | None, str, bool, Job | None]:
     """Запустить процесс и забрать вывод ЧЕРЕЗ ФАЙЛ.
 
@@ -323,11 +445,15 @@ def _run_capturing(
     соединения на шлюзе. Свой `timeout_s` команда при этом не теряет: остаток
     досторожит поток внутри `JobRegistry.adopt`.
     """
+    from dev_mcp.fleet.world import command_resources
+    from dev_mcp.runner import is_test_command
+    finite = bool(command_resources(argv)) or is_test_command(argv)
     log_path = runs_dir / f'sync-{uuid.uuid4().hex[:12]}.log'
     sink = log_path.open('wb')
     started_at = time.time()
     try:
-        proc = subprocess.Popen(  # noqa: S603 — argv собран политикой, shell=False
+        from dev_mcp.process_execution import start_process
+        proc = start_process(
             argv, cwd=cwd, env=env,
             stdout=sink, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             shell=False, creationflags=(
@@ -335,7 +461,8 @@ def _run_capturing(
                 | getattr(subprocess, 'CREATE_NO_WINDOW', 0)
             ),
         )
-    except OSError:
+        proc._dev_mcp_finite = finite
+    except BaseException:
         sink.close()
         _drop_file(log_path)
         raise
@@ -352,10 +479,14 @@ def _run_capturing(
                 started_at=started_at, remaining_s=timeout_s - promote_at,
                 on_exit=on_exit,
             )
+            job.agent = str(agent or '').strip()
             return None, '', False, job
         timed_out = True
         _kill_process_tree(proc)
         rc = proc.returncode
+    if not timed_out:
+        from dev_mcp.process_execution import finish_process
+        finish_process(proc, preserve_children=not proc._dev_mcp_finite)
     sink.close()
     out = _read_output(log_path)
     _drop_file(log_path)
@@ -412,6 +543,76 @@ def _is_public_host(host: str) -> tuple[bool, str]:
         ):
             return False, f'{host} → {ip} (приватный/loopback адрес)'
     return True, ''
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Keep the HTTP Host header while connecting only to a verified DNS answer."""
+
+    def __init__(self, hostname: str, port: int, address: str):
+        super().__init__(hostname, port, timeout=_FETCH_TIMEOUT_S)
+        self._pinned_address = address
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self._pinned_address, self.port), self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """DNS-pinned TLS with certificate validation and SNI for the original host."""
+
+    def __init__(self, hostname: str, port: int, address: str):
+        super().__init__(hostname, port, timeout=_FETCH_TIMEOUT_S, context=ssl.create_default_context())
+        self._pinned_address = address
+
+    def connect(self) -> None:
+        raw = socket.create_connection((self._pinned_address, self.port), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+        except BaseException:
+            raw.close()
+            raise
+
+
+def _fetch_open_public(url: str) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
+    """Validate every address in a fresh DNS answer and connect to one of those IPs.
+
+    urllib's default opener follows redirects and re-resolves DNS when connecting.
+    A direct, pinned http.client connection avoids both trust gaps.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise PolicyError('только http/https URL с хостом и без userinfo')
+    try:
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    except ValueError as exc:
+        raise PolicyError(f'неверный порт URL: {exc}') from exc
+    host = parsed.hostname
+    ok, reason = _is_public_host(host)
+    if not ok:
+        raise PolicyError(f'адрес отклонён: {reason}')
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise PolicyError(f'адрес отклонён: имя не разрешается: {exc}') from exc
+    if not infos:
+        raise PolicyError('адрес отклонён: нет DNS-адресов')
+    # The second DNS query can differ from the initial SSRF check (rebind).
+    # Validate every address returned by THIS query and pin the socket to it.
+    for info in infos:
+        address = info[4][0]
+        ok, reason = _is_public_host(address)
+        if not ok:
+            raise PolicyError(f'адрес отклонён: {reason}')
+    address = infos[0][4][0]
+    connection = (_PinnedHTTPSConnection(host, port, address) if parsed.scheme == 'https'
+                  else _PinnedHTTPConnection(host, port, address))
+    route = urllib.parse.urlunsplit(('', '', parsed.path or '/', parsed.query, ''))
+    try:
+        connection.request('GET', route, headers={'User-Agent': _FETCH_UA})
+        response = connection.getresponse()
+    except BaseException:
+        connection.close()
+        raise
+    return connection, response
 
 
 def _read_keep_eol(path: Path) -> tuple[str, str]:
@@ -486,6 +687,50 @@ def _clip(text: str, reserve: int = 0) -> tuple[str, bool]:
     return text[:limit] + f'\n\n[…обрезано, всего {len(text)} символов]', True
 
 
+def _install_operator_delegation(mcp: FastMCP, fleet_db: Callable[[], Path]) -> None:
+    """Права оператора быстрому агенту Claude Code — на время его вызова (policy.DELEGATED_ROOTS).
+
+    Вызов с agent="Q<n>" открытого задания Claude Code (fleet/quick.py, owner="claude") получает
+    его явную область `--scope` как область оператора: запись и run там, где агентам закрыто
+    (tree_deny — dev-mcp), но не шире области и только на время одного вызова.
+    """
+    from fastmcp.server.middleware import Middleware
+
+    from dev_mcp.fleet import quick
+    from dev_mcp.policy import DELEGATED_ROOTS
+
+    class _Delegation(Middleware):
+        async def on_call_tool(self, context, call_next):  # type: ignore[override]
+            args = getattr(context.message, 'arguments', None) or {}
+            agent = str(args.get('agent') or '') if isinstance(args, dict) else ''
+            roots: tuple[Path, ...] = ()
+            if agent and quick.is_quick_agent(agent):
+                try:
+                    book = quick.Book(Path(fleet_db()).parent)
+                    job = quick.lookup(book, agent)
+                    try:
+                        quick.mark_acting(book, job)
+                    except Exception:  # noqa: BLE001 — статус не должен ломать сам вызов
+                        pass
+                    if job and str(job.get("owner", "")).startswith("nightly:"):
+                        from dev_mcp.fleet.nightly_review import allows_tool
+                        if not allows_tool(job, str(getattr(context.message, "name", "")), args):
+                            raise PermissionError("NIGHTLY_READ_ONLY: разрешены только чтения "
+                                                  "в корне проекта и fleet_quick report/park")
+                    roots = quick.operator_roots(job)
+                except PermissionError:
+                    raise
+                except Exception:  # noqa: BLE001 — нет книги/записи → обычные права
+                    roots = ()
+            token = DELEGATED_ROOTS.set(roots)
+            try:
+                return await call_next(context)
+            finally:
+                DELEGATED_ROOTS.reset(token)
+
+    mcp.add_middleware(_Delegation())
+
+
 def build_server(
     policy: Policy,
     audit: Audit,
@@ -495,6 +740,7 @@ def build_server(
     operator_client: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> FastMCP:
     mcp = FastMCP('dev-mcp')
+    _install_operator_delegation(mcp, lambda: fleet_db)
     jobs = JobRegistry(runs_dir or (audit.path.parent / 'runs'))
     # Реестр флота — класс data: живёт в data/fleet рядом с logs/, а не внутри него,
     # и снимается в data/backups на каждом старте (fleet/location.py).
@@ -580,6 +826,17 @@ def build_server(
                 "ORDER BY c.id DESC LIMIT 1", (project, tz),
             )
         if source is None:
+            from dev_mcp.fleet.lead import is_lead
+            if is_lead(tz):
+                # №48 B1: сдачу-прогресс ведущего уже принял сервер (lead-progress); это ревью —
+                # сирота гонки (класс rudiments lead_orphan_review). Снимаем сразу, не оператору.
+                from dev_mcp.fleet import rudiments
+                retired = rudiments.retire_lead_orphan(
+                    fleet_store, str(review['project']), str(review['tz']), agent)
+                if retired:
+                    raise PolicyError('FLEET_SEALED_REVIEW: orphan review снято платформой — сдачу '
+                                      'ведущего уже принял сервер. Захват освобождён; заявка не '
+                                      'нужна. Возьми следующую задачу (fleet_take)')
             raise PolicyError('FLEET_SEALED_REVIEW: submitted source missing')
         try:
             _, source_context = claim_review_bite._claim(fleet_store,int(source['id']))
@@ -897,23 +1154,27 @@ def build_server(
         description=(
             'Показывает границы этого сервера: в каких корнях разрешено работать, '
             'разрешена ли запись, какие имена файлов закрыты, какие задачи доступны. '
+            'Передай agent=Q… для показа делегированной оператором области записи и run. '
             'Вызови первым — это дешевле, чем упираться в отказы наугад.'
         ),
     )
-    def policy_info() -> str:
+    def policy_info(agent: str = '') -> str:
         described = policy.describe()
         lines = ['Разрешённые корни:']
         lines += [f'  {r}' for r in described['roots']]
+        if described['unavailable_roots']:
+            lines.append('Недоступные каталоги: доступ закрыт до успешного policy_reload:')
+            lines += [f'  {r}' for r in described['unavailable_roots']]
         if described['allow_write']:
             lines.append('Запись: разрешена во всех корнях')
-        elif described['write_roots']:
-            lines.append('Запись: ТОЛЬКО в этих каталогах (остальное — чтение):')
+        elif described['write_roots'] or described['tree_roots']:
+            lines.append('Запись: явные корни и разрешённые деревья ниже:')
             lines += [f'  {r}' for r in described['write_roots']]
         else:
             lines.append('Запись: ЗАПРЕЩЕНА (read-only)')
         lines.append(f'Закрытые имена: {", ".join(described["deny_patterns"])}')
-        if described['exec_roots']:
-            lines.append('Исполнение (run): РАЗРЕШЕНО в этих каталогах:')
+        if described['exec_roots'] or described['tree_roots']:
+            lines.append('Исполнение (run): явные корни и разрешённые деревья ниже:')
             lines += [f'  {r}' for r in described['exec_roots']]
             lines.append(f'  бинари: {", ".join(described["exec_allowed_bin"])}')
             if described['exec_bin_missing']:
@@ -924,7 +1185,18 @@ def build_server(
                     + ', '.join(described['exec_args_unrestricted'])
                 )
         else:
-            lines.append('Исполнение (run): ЗАПРЕЩЕНО (exec_roots пуст)')
+            lines.append('Исполнение (run): ЗАПРЕЩЕНО (нет явных корней и деревьев)')
+        if described['tree_roots']:
+            lines.append('Деревья записи и run (tree_roots): работа в подкаталогах, файлы самого корня правит владелец:')
+            lines += [f'  {r}' for r in described['tree_roots']]
+        if described['tree_deny']:
+            lines.append('Защищённые поддеревья (tree_deny): запись и run закрыты без делегирования:')
+            lines += [f'  {r}' for r in described['tree_deny']]
+        from dev_mcp.policy import DELEGATED_ROOTS
+        delegated = DELEGATED_ROOTS.get() if agent else ()
+        if delegated:
+            lines.append('Делегированная оператором область записи и run для этого agent (приоритетнее tree_deny):')
+            lines += [f'  {root}' for root in delegated]
         lines.append(
             f'Скачивание из сети (fetch_url): {"разрешено" if described["allow_network_fetch"] else "запрещено"}'
         )
@@ -942,7 +1214,7 @@ def build_server(
             'request_note разбирается сервером автоматически: если запрос безопасно решаем — он превращается в обычную fleet-задачу/подсказку; '
             'если расширение периметра не допускается — получишь отказ и альтернативу. Не жди ручного review владельца и не повторяй одну заявку циклом.'
         )
-        return _ok('policy_info', {}, '\n'.join(lines))
+        return _ok('policy_info', {'agent': agent}, '\n'.join(lines))
 
     # ---------- чтение ----------
 
@@ -1001,21 +1273,11 @@ def build_server(
             raw = manifest_file.read_bytes()
             if not raw or len(raw) > 1024 * 1024:
                 raise PolicyError('FLEET_BLIND: MANIFEST вне лимита')
-            manifest_text = raw.decode('utf-8')
-            start, end = '<!-- MILL_MANIFEST_JSON', 'MILL_MANIFEST_JSON -->'
-            if manifest_text.count(start) != 1 or manifest_text.count(end) != 1:
-                raise PolicyError('FLEET_BLIND: нет единственной секции MANIFEST')
-            payload = json.loads(manifest_text.split(start, 1)[1].split(end, 1)[0])
-            entries = payload.get('entries') if isinstance(payload, dict) else None
-            if not isinstance(entries, dict) or not entries:
-                raise PolicyError('FLEET_BLIND: пустой/некорректный MANIFEST')
-            candidates = sorted(
-                cid for cid, entry in entries.items()
-                if isinstance(cid, str) and isinstance(entry, dict)
-                and entry.get('outcome') == 'candidate'
-            )
-            if not candidates:
-                raise PolicyError('FLEET_BLIND: candidates отсутствуют')
+            from dev_mcp.fleet.blind_manifest import blind_case_ids
+            try:
+                candidates = blind_case_ids(raw, root, batch)
+            except (ValueError, TypeError, UnicodeError, OSError) as exc:
+                raise PolicyError('FLEET_BLIND: ' + str(exc)) from exc
             attempt_id = _claim_attempt_id(dict(claim))
             review_dir = root / 'data' / 'reviews' / batch
             if attempt_id is not None:
@@ -1312,6 +1574,93 @@ def build_server(
             context_docs.mark_read(agent, target)
         return _ok('read_file', args, _with_folder_docs(agent, target, f'{header}\n\n{numbered}'), t0)
 
+    def _read_image_one(path: str, agent: str, max_side: int, tool: str):
+        t0 = time.monotonic()
+        args = {'path': path, 'agent': agent, 'max_side': max_side}
+        try:
+            sealed = _sealed_review_inspect(agent, path, 'read_image')
+            if sealed is not None:
+                root, rel, raw = sealed
+                target = policy.resolve(str(root / rel), for_write=False)
+                if not isinstance(raw, bytes):
+                    raise PolicyError('FLEET_SEALED_REVIEW: invalid image bytes')
+            else:
+                target, _, _ = _claim_target(path, agent)
+                _require_blind_read(target)
+                if not target.is_file():
+                    raise PolicyError('файл не найден')
+                if target.stat().st_size > _IMAGE_LIMIT:
+                    raise PolicyError('изображение больше 8 МБ')
+                raw = target.read_bytes()
+            if target.suffix.lower() not in _IMAGE_FORMATS:
+                raise PolicyError('разрешены только PNG, JPEG, WebP, GIF')
+            data, fmt, width, height = _image_payload(raw, target.suffix, max_side)
+            fleet_ctx.record_event('read', agent, tool=tool, path=str(target))
+            description = f'{target} — {width}×{height} px, {len(raw)} байт'
+            return [_ok(tool, args, description, t0), Image(data=data, format=fmt)]
+        except (PolicyError, OSError, ValueError) as exc:
+            return [_fail(tool, args, exc, t0)]
+
+    @mcp.tool(name='read_image', description='Читает PNG/JPEG/WebP/GIF из разрешённых корней как MCP image content; max_side=1600.')
+    def read_image(path: str, agent: str = '', max_side: int = 1600) -> list:
+        fleet_ctx.touch(agent)
+        return _read_image_one(path, agent, max_side, 'read_image')
+
+    @mcp.tool(name='read_images', description='Читает до 12 PNG/JPEG/WebP/GIF; общий бюджет изображений 16 МиБ за вызов.')
+    def read_images(paths: list[str], agent: str = '', max_side: int = 1600) -> list:
+        fleet_ctx.touch(agent)
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 12 or any(
+                not isinstance(path, str) for path in paths):
+            # Never stringify an attacker-controlled huge path list for the audit response.
+            preview = repr(paths[:2])[:200] if isinstance(paths, list) else repr(type(paths))
+            return [_fail('read_images', {'paths': preview, 'agent': agent},
+                          PolicyError('укажи от 1 до 12 путей'))]
+        # Twice the per-image 8 MiB ceiling: allows two maximal images, but
+        # never returns the 96 MiB possible from twelve individually legal files.
+        batch_limit = 2 * _IMAGE_LIMIT
+        used = 0
+        results = []
+        for index, path in enumerate(paths):
+            # Account for ORIGINAL file bytes, not just the resized image
+            # returned by Pillow: large inputs can shrink to tiny previews.
+            # Preflight size before loading the file whenever access permits.
+            raw_size = 0
+            try:
+                sealed = _sealed_review_inspect(agent, path, 'read_image')
+                if sealed is not None:
+                    if isinstance(sealed[2], bytes):
+                        raw_size = len(sealed[2])
+                else:
+                    target, _, _ = _claim_target(path, agent)
+                    _require_blind_read(target)
+                    raw_size = target.stat().st_size
+            except (PolicyError, OSError, ValueError):
+                pass  # Preserve the original per-file refusal from _read_image_one.
+            if used + raw_size > batch_limit:
+                skipped = paths[index:]
+                preview = ', '.join(repr(p[:120]) for p in skipped)
+                results.append(_fail(
+                    'read_images', {'agent': agent, 'skipped': len(skipped)},
+                    PolicyError(f'общий лимит изображений 16 МиБ (уже {used} байт); '
+                                f'не вошли {len(skipped)} файл(ов): {preview}'),
+                ))
+                break
+            one = _read_image_one(path, agent, max_side, 'read_images')
+            if len(one) > 1 and isinstance(one[1], Image):
+                size = max(raw_size, len(one[1].data))
+                if used + size > batch_limit:
+                    skipped = paths[index:]
+                    preview = ', '.join(repr(p[:120]) for p in skipped)
+                    results.append(_fail(
+                        'read_images', {'agent': agent, 'skipped': len(skipped)},
+                        PolicyError(f'общий лимит изображений 16 МиБ (уже {used} байт); '
+                                    f'не вошли {len(skipped)} файл(ов): {preview}'),
+                    ))
+                    break
+                used += size
+            results.extend(one)
+        return results
+
     @mcp.tool(
         name='search_files',
         description=(
@@ -1387,6 +1736,11 @@ def build_server(
             matcher = re.compile(query if regex else re.escape(query), re.IGNORECASE)
         except re.error as exc:
             return _fail('search_files', args, PolicyError(f'некорректное регулярное выражение: {exc}'), t0)
+        # 25.11 (ночное ревью, HIGH): одно re.search по целому файлу не прерывается дедлайном —
+        # шаблон с вложенной неограниченной повторяемостью ((a+)+, (\w*)*…) вешал поток MCP.
+        risk = _regex_risk(query) if regex else ''
+        if risk:
+            return _fail('search_files', args, PolicyError(risk), t0)
 
         # Предфильтр: одна проверка по ВСЕМУ тексту файла (сишный цикл) вместо
         # splitlines + поиск в каждой строке (питоновский цикл на файл в
@@ -1524,24 +1878,51 @@ def build_server(
             if target.exists() and target.is_dir():
                 raise PolicyError('по этому пути каталог')
         except PolicyError as exc:
+            # A quick operator without an active, verifiable scope must not bypass
+            # tree_deny. Give an actionable denial instead of a cryptic guard code.
+            if (str(exc).startswith('tree_deny:') and
+                    '/data/fleet/quick/tasks/' in path.replace('\\', '/').casefold()):
+                exc = PolicyError(
+                    'tree_deny: папка данных флота закрыта для записи без '
+                    'подтверждённого operator scope. Передай отчёт через '
+                    'fleet_quick(command="report") или пиши в разрешённый '
+                    'каталог проекта вне защищённого дерева; для доступа сюда '
+                    'нужно открытое задание Claude Code с --scope на этот путь'
+                )
             return _fail('write_file', args, exc, fleet_decision=decision)
+        except Exception as exc:  # Ошибка checkout/guard не должна ронять MCP.
+            logging.getLogger(__name__).exception('write_file: ошибка проверки доступа')
+            return _fail('write_file', args, PolicyError(
+                f'внутренняя ошибка проверки записи ({type(exc).__name__}); '
+                'подробности в журнале сервера'), fleet_decision=decision)
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        existed = target.exists()
-        eol = os.linesep
-        if existed:
-            try:
-                eol = _read_keep_eol(target)[1]
-            except (OSError, UnicodeDecodeError):
-                pass
-        _write_keep_eol(target, content, eol)
-        event_agent = str(getattr(decision, 'worker_id', '') or agent)
-        fleet_ctx.record_event('write', event_agent, tool='write_file', path=str(target), declared=bool(str(agent or '').strip()))
-        verb = 'перезаписан' if existed else 'создан'
-        return _ok(
-            'write_file', args, f'{verb}: {target} ({len(content)} символов)',
-            fleet_decision=decision, tail=syntax_check.check(target),
-        )
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            existed = target.exists()
+            eol = os.linesep
+            if existed:
+                try:
+                    eol = _read_keep_eol(target)[1]
+                except (OSError, UnicodeDecodeError):
+                    pass
+            _write_keep_eol(target, content, eol)
+            event_agent = str(getattr(decision, 'worker_id', '') or agent)
+            fleet_ctx.record_event('write', event_agent, tool='write_file', path=str(target), declared=bool(str(agent or '').strip()))
+            verb = 'перезаписан' if existed else 'создан'
+            return _ok(
+                'write_file', args, f'{verb}: {target} ({len(content)} символов)',
+                fleet_decision=decision, tail=syntax_check.check(target),
+            )
+        except OSError as exc:
+            return _fail('write_file', args, PolicyError(
+                f'ошибка файловой системы при записи: {exc}. '
+                'Проверь наличие файла перед повтором'), fleet_decision=decision)
+        except Exception as exc:  # Не отдавать клиенту «Tool failed internally».
+            logging.getLogger(__name__).exception('write_file: непредвиденная ошибка')
+            return _fail('write_file', args, PolicyError(
+                f'внутренняя ошибка записи ({type(exc).__name__}); '
+                'проверь наличие файла и журнал сервера перед повтором'),
+                fleet_decision=decision)
 
     @mcp.tool(
         name='edit_file',
@@ -1673,16 +2054,48 @@ def build_server(
         except (PolicyError, patch_mod.PatchError) as exc:
             return _fail('apply_patch', args, exc, fleet_decision=decision)
 
+        # Snapshot the complete target set before the first write. A later disk
+        # error must restore even files written successfully earlier in the batch.
+        originals: dict[Path, bytes | None] = {}
+        try:
+            for target, _text, _eol, _stat in plan:
+                if target in originals:
+                    raise PolicyError(f'{target}: повтор пути в одном patch')
+                originals[target] = target.read_bytes() if target.exists() else None
+        except (OSError, PolicyError) as exc:
+            return _fail('apply_patch', args, PolicyError(f'не удалось сохранить исходные файлы: {exc}'),
+                         fleet_decision=decision)
+
         declared = bool(str(agent or '').strip())
         event_agent = str(getattr(decision, 'worker_id', '') or agent)
         verdicts = []
-        for target, new_text, eol, _stat in plan:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            _write_keep_eol(target, new_text, eol)
-            fleet_ctx.record_event('write', event_agent, tool='apply_patch', path=str(target), declared=declared)
-            verdict = syntax_check.check(target)
-            if verdict:
-                verdicts.append(f'{target.name}: {verdict}')
+        touched: list[Path] = []
+        try:
+            for target, new_text, eol, _stat in plan:
+                touched.append(target)  # also restore after a partial/failed write
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _write_keep_eol(target, new_text, eol)
+                verdict = syntax_check.check(target)
+                if verdict:
+                    verdicts.append(f'{target.name}: {verdict}')
+            for target in touched:
+                fleet_ctx.record_event('write', event_agent, tool='apply_patch',
+                                       path=str(target), declared=declared)
+        except Exception as exc:
+            rollback_errors = []
+            for target in reversed(touched):
+                try:
+                    previous = originals[target]
+                    if previous is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        target.write_bytes(previous)
+                except OSError as restore_exc:
+                    rollback_errors.append(f'{target}: {restore_exc}')
+            detail = f'запись набора не удалась ({exc}); изменения отменены'
+            if rollback_errors:
+                detail = f'запись набора не удалась ({exc}); ОШИБКА ОТКАТА: ' + '; '.join(rollback_errors)
+            return _fail('apply_patch', args, PolicyError(detail), fleet_decision=decision)
         body = f'применено файлов: {len(plan)}\n' + '\n'.join(stat for *_, stat in plan)
         return _ok('apply_patch', args, body, fleet_decision=decision, tail='\n'.join(verdicts) or None)
 
@@ -1939,25 +2352,7 @@ def build_server(
             # нельзя» — ход кончался (07.10.2026). Чтение пульта безвредно: отдаём его как есть.
             from dev_mcp.fleet.tools import _run_pult
 
-            if isinstance(pult, list) and pult[0] == "look":
-                # Compatibility for clients whose cached tools/list predates
-                # fleet_look. Reuse the claim-scoped service, never a subprocess.
-                from dev_mcp.fleet.look import look_for_agent
-                try:
-                    paths, rubric = pult[1:], ""
-                    if "--rubric" in paths:
-                        index = paths.index("--rubric")
-                        if index != len(paths) - 2:
-                            raise ValueError("look: --rubric требует одну последнюю строку")
-                        paths, rubric = paths[:index], paths[index + 1]
-                    for item in paths:
-                        policy.resolve(str(Path(root) / item), for_write=False)
-                    text = json.dumps(look_for_agent(fleet_ctx.store, agent, paths, rubric, policy=policy),
-                                      ensure_ascii=False)
-                except (PolicyError, ValueError) as exc:
-                    return _fail('run', args, exc, t0)
-            else:
-                text = pult if isinstance(pult, str) else _run_pult(fleet_ctx, pult)
+            text = pult if isinstance(pult, str) else _run_pult(fleet_ctx, pult)
             return _ok('run', args, text, t0)
         # TZ-41: independent reviewers execute only sealed immutable author
         # snapshots. This MUST precede the ordinary claim/trunk cwd mapping:
@@ -2028,6 +2423,12 @@ def build_server(
                 work, real_argv = _prepare_run(root, list(argv), cwd)
         except (PolicyError, ClaimRoutingError) as exc:
             return _fail('run', args, exc, t0, fleet_decision=decision)
+        # 05.11: демон adb, рождённый внутри задания команды, умирал вместе с ней (телефон каждый
+        # раз заново спрашивал разрешение). Демон — заранее и вне задания, бинарь — закреплённый.
+        refusal = fleet_world.adb_refusal(real_argv)
+        if refusal:
+            return _fail('run', args, PolicyError(refusal), t0, fleet_decision=decision)
+        real_argv = fleet_world.pin_adb(real_argv)
 
         completion_subject = fleet_ctx._subject(str(agent or "").strip()) if agent else None
         completion_paths = list(completion_subject["paths"]) if completion_subject else []
@@ -2066,8 +2467,9 @@ def build_server(
         try:
             release, busy = fleet_world.hold_for_run(
                 fleet_ctx.store, agent, real_argv, f'{agent or "?"}: {" ".join(argv)[:80]}')
-        except Exception:  # noqa: BLE001 — сбой учёта ресурса не должен ронять run
-            release, busy = (lambda: None), ''
+        except Exception as exc:
+            return _fail('run', args, PolicyError(f'resource accounting failed: {exc}'), t0,
+                         fleet_decision=decision)
         if release is None:
             return _ok('run', args, busy, t0, fleet_decision=decision)
         cap = max(1, min(int(timeout_s), policy.exec_timeout_cap_s))
@@ -2077,7 +2479,9 @@ def build_server(
             try:
                 from dev_mcp.runner import is_test_command
                 job = jobs.start(real_argv, str(work), env,
-                                 timeout_s=cap if is_test_command(real_argv) else None)
+                                 timeout_s=cap if (is_test_command(real_argv) or
+                                                  fleet_world.command_resources(real_argv)) else None)
+                job.agent = str(agent or '').strip()
             except (OSError, RuntimeError) as exc:
                 release()
                 return _fail(
@@ -2115,6 +2519,7 @@ def build_server(
                     real_argv, cwd=str(work), env=env, timeout_s=cap, runs_dir=jobs.runs_dir,
                     jobs=jobs, budget_s=_budget_left(policy.exec_sync_budget_s, t0),
                     on_exit=_promoted_exit,
+                    agent=agent,
                 )
         except PolicyError as exc:  # шлюз занят
             release()
@@ -2173,12 +2578,15 @@ def build_server(
         if re.fullmatch(r'[0-9a-f]{12}', target):
             archived = None
             try:
-                with fleet_ctx.store.tx() as tx:
+                with fleet_ctx.store.read() as tx:
                     archived = tx.one(
                         """SELECT ts,rc FROM events
-                           WHERE kind='run' AND rc IS NOT NULL AND payload LIKE ?
+                           WHERE kind='run' AND rc IS NOT NULL AND
+                             CASE WHEN json_valid(payload) THEN
+                               COALESCE(json_extract(payload,'$.promoted'),json_extract(payload,'$.job_id'))
+                             END = ?
                            ORDER BY id DESC LIMIT 1""",
-                        (f'%{target}%',),
+                        (target,),
                     )
             except Exception:
                 archived = None
@@ -2244,19 +2652,27 @@ def build_server(
             )
         return text
 
-    @mcp.tool(name='run_stop', description='Останавливает фоновую задачу run (убивает всё дерево процессов).')
-    def run_stop(job_id: str) -> str:
-        if not jobs.stop(job_id):
-            return _fail('run_stop', {'job_id': job_id}, PolicyError('нет такой фоновой задачи'))
+    @mcp.tool(name='run_stop', description='Останавливает свою фоновую задачу run (оператор без agent — любую).')
+    def run_stop(job_id: str, agent: str = '') -> str:
+        args = {'job_id': job_id, 'agent': agent}
         job = jobs.get(job_id)
-        return _ok('run_stop', {'job_id': job_id}, describe_job(job) if job else f'{job_id}: остановлена')
+        if job is None:
+            return _fail('run_stop', args, PolicyError('нет такой фоновой задачи'))
+        if agent and job.agent != str(agent).strip():
+            return _fail('run_stop', args, PolicyError('чужая фоновая задача: остановка запрещена'))
+        if not jobs.stop(job_id):
+            return _fail('run_stop', args, PolicyError('нет такой фоновой задачи'))
+        job = jobs.get(job_id)
+        return _ok('run_stop', args, describe_job(job) if job else f'{job_id}: остановлена')
 
-    @mcp.tool(name='run_list', description='Все фоновые задачи run этой сессии сервера, свежие сверху.')
-    def run_list() -> str:
+    @mcp.tool(name='run_list', description='Фоновые задачи агента; оператор без agent видит все.')
+    def run_list(agent: str = '') -> str:
         rows = jobs.all()
+        if agent:
+            rows = [job for job in rows if job.agent == str(agent).strip()]
         if not rows:
-            return _ok('run_list', {}, '(фоновых задач нет)')
-        return _ok('run_list', {}, '\n\n'.join(describe_job(j) for j in rows))
+            return _ok('run_list', {'agent': agent}, '(фоновых задач нет)')
+        return _ok('run_list', {'agent': agent}, '\n\n'.join(describe_job(j) for j in rows))
 
     # ---------- скачивание из сети ----------
 
@@ -2294,47 +2710,73 @@ def build_server(
             )
 
         current = url.strip()
-        for _ in range(_FETCH_MAX_REDIRECTS + 1):
-            host = urllib.parse.urlparse(current).hostname or ''
-            ok, why = _is_public_host(host)
-            if not ok:
-                return _fail('fetch_url', args, PolicyError(f'адрес отклонён: {why}'), fleet_decision=decision)
-            req = urllib.request.Request(current, headers={'User-Agent': _FETCH_UA}, method='GET')
+        connection = None
+        resp = None
+        for redirect_count in range(_FETCH_MAX_REDIRECTS + 1):
             try:
-                resp = urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT_S)  # noqa: S310 — схема проверена
-            except urllib.error.HTTPError as exc:
-                if exc.code in (301, 302, 303, 307, 308) and exc.headers.get('Location'):
-                    current = urllib.parse.urljoin(current, exc.headers['Location'])
-                    continue
-                return _fail('fetch_url', args, PolicyError(f'HTTP {exc.code}'), fleet_decision=decision)
-            except (urllib.error.URLError, OSError, ValueError) as exc:
+                # http.client does not automatically follow redirects. The socket
+                # connects to a freshly validated, pinned DNS answer.
+                connection, resp = _fetch_open_public(current)
+            except PolicyError as exc:
+                return _fail('fetch_url', args, exc, fleet_decision=decision)
+            except (OSError, ValueError, http.client.HTTPException) as exc:
                 return _fail('fetch_url', args, PolicyError(f'не скачалось: {exc}'), fleet_decision=decision)
-            redirect = resp.headers.get('Location') if resp.status in (301, 302, 303, 307, 308) else None
-            if redirect:
-                current = urllib.parse.urljoin(current, redirect)
+            if resp.status in (301, 302, 303, 307, 308):
+                location = resp.getheader('Location')
                 resp.close()
+                connection.close()
+                if not location:
+                    return _fail('fetch_url', args, PolicyError(f'HTTP {resp.status} без Location'),
+                                 fleet_decision=decision)
+                if redirect_count == _FETCH_MAX_REDIRECTS:
+                    return _fail('fetch_url', args, PolicyError('слишком много редиректов'),
+                                 fleet_decision=decision)
+                current = urllib.parse.urljoin(current, location)
                 continue
+            if not 200 <= resp.status < 300:
+                status = resp.status
+                resp.close()
+                connection.close()
+                return _fail('fetch_url', args, PolicyError(f'HTTP {status}'), fleet_decision=decision)
             break
-        else:
-            return _fail('fetch_url', args, PolicyError('слишком много редиректов'), fleet_decision=decision)
 
         limit = policy.fetch_max_bytes
         got = 0
-        target.parent.mkdir(parents=True, exist_ok=True)
+        staged: Path | None = None
         try:
-            with resp, target.open('wb') as fh:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode='wb', dir=target.parent,
+                                             prefix=f'.{target.name}.', suffix='.part',
+                                             delete=False) as fh:
+                staged = Path(fh.name)
                 while True:
                     chunk = resp.read(65536)
                     if not chunk:
                         break
                     got += len(chunk)
                     if got > limit:
-                        fh.close()
-                        target.unlink(missing_ok=True)
-                        return _fail('fetch_url', args, PolicyError(f'превышен лимит {limit} б'), fleet_decision=decision)
+                        raise PolicyError(f'превышен лимит {limit} б')
                     fh.write(chunk)
-        except OSError as exc:
-            return _fail('fetch_url', args, PolicyError(f'ошибка записи: {exc}'), fleet_decision=decision)
+            declared_length = resp.getheader('Content-Length')
+            if declared_length and declared_length.isdecimal() and got != int(declared_length):
+                raise PolicyError(f'неполная загрузка: получено {got} из {declared_length} б')
+            if overwrite:
+                os.replace(staged, target)
+            else:
+                # Atomic exclusive creation: do not overwrite a file created
+                # concurrently after the initial existence check.
+                try:
+                    os.link(staged, target)
+                except FileExistsError as exc:
+                    raise PolicyError('файл существует — overwrite=true, если осознанно') from exc
+        except (OSError, http.client.HTTPException, PolicyError) as exc:
+            failure = exc if isinstance(exc, PolicyError) else PolicyError(f'ошибка скачивания/записи: {exc}')
+            return _fail('fetch_url', args, failure, fleet_decision=decision)
+        finally:
+            resp.close()
+            connection.close()
+            if staged is not None:
+                _drop_file(staged)
         event_agent = str(getattr(decision, 'worker_id', '') or agent)
         fleet_ctx.record_event('write', event_agent, tool='fetch_url', path=str(target), declared=bool(str(agent or '').strip()))
         return _ok(
@@ -2473,7 +2915,55 @@ def build_server(
                     lists=cleaned_lists,
                 )
                 if draft_tz is None:
-                    raise RuntimeError('fleet request unexpectedly routed to legacy channel')
+                    # open_request intentionally returns None for owner/access or
+                    # when queue generators are disabled. Do not turn a supported
+                    # non-delivery outcome into a failing MCP call.
+                    from dev_mcp.fleet.generators import enabled as _generators_enabled
+                    generators_off = not _generators_enabled()
+                    reason = (
+                        'заявка request_note сама задачу не создаёт: выключены только АВТОМАТИЧЕСКИЕ '
+                        'задачи платформы (fix/review/request). Регистрация ТЗ работает'
+                        if generators_off
+                        else 'тип или адресат заявки требует legacy-маршрута'
+                    )
+                    # 20.11.2026: раньше такая заявка оставляла в audit.jsonl только хеш —
+                    # оператор её не видел. Теперь она в журнале заявок с decision=not_created.
+                    try:
+                        with requests_history_path.open('a', encoding='utf-8') as fh:
+                            fh.write(json.dumps({
+                                'id': request_id,
+                                'ts': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                'kind': k, 'summary': summary.strip()[:500],
+                                'detail': (detail or '').strip()[:4000],
+                                'path': (path or '').strip()[:1000], 'to': target,
+                                'agent': agent or '', 'project': project or '',
+                                'source_tz': source_tz or '', 'decision': 'not_created',
+                                'auto': True, 'note': reason,
+                            }, ensure_ascii=False) + '\n')
+                    except OSError:
+                        pass
+                    audit.record(
+                        'request_note', args, decision='deny',
+                        reason='fleet_request_not_created', agent=agent,
+                    )
+                    if generators_off:
+                        text = (
+                            f'Заявка {request_id} записана в журнал оператора, но задачу не создала: '
+                            f'{reason}. Это не поломка флота, повторять заявку не нужно. Нужна задача — напиши ТЗ файлом в ToDo/tz проекта и '
+                            "зарегистрируй: fleet_owner bootstrap ПРОЕКТ TZ-NN (command='bootstrap', args=['ПРОЕКТ','TZ-NN']) — "
+                            'сразу ready, без проверок; доступно владельцу и любому агенту, которого '
+                            'запустил владелец. Агенту, запущенному системой, — через ведущего '
+                            '(fleet_lead issue). НЕ сообщай владельцу, что создание задач отключено: '
+                            'это неверно.'
+                        )
+                    else:
+                        text = (
+                            f'Заявка {request_id} не принята: {reason}. Задача в очереди не создана, '
+                            "заявка записана в журнал оператора. Выбери адресат to='queue' или "
+                            "'<project>/<tz>' либо продолжай доступные шаги и зафиксируй "
+                            'препятствие в checkpoint.'
+                        )
+                    return fleet_ctx.with_envelope(agent, text)
 
                 # Явный blocker не должен превращаться в бесконечное «продолжи».
                 # Раньше ответ советовал отдельный fleet_block, но старые ChatGPT-коннекторы
@@ -2488,7 +2978,11 @@ def build_server(
                     blocking_text,
                 ))
                 auto_blocked = False
-                if agent and source_tz and looks_blocking:
+                from dev_mcp.fleet.lead import is_lead as _is_lead
+                lead_kept = bool(source_tz and _is_lead(source_tz) and looks_blocking)
+                # №48 §G / план 49 §8: ведущий не замораживается из-за заявки — паркуется шаг,
+                # а не весь проект; захват остаётся у ведущего.
+                if agent and source_tz and looks_blocking and not lead_kept:
                     queue = fleet_ctx.module('queue')
                     if queue is not None:
                         try:
@@ -2514,6 +3008,11 @@ def build_server(
                     ' Текущая задача автоматически освобождена и frozen до выполнения этой зависимости; '
                     'после её принятия она сама вернётся в ready. Бери следующую доступную задачу.'
                 )
+            elif lead_kept:
+                payload += (
+                    ' Ты ведущий: захват и проект остаются у тебя. Шаг, которому нужна эта зависимость, '
+                    'ждёт её; продолжай независимые шаги к выбранному обещанию проекта.'
+                )
             else:
                 payload += ' Если это не blocker — продолжай текущую задачу; отдельного owner approve нет.'
             return fleet_ctx.with_envelope(agent, payload)
@@ -2536,19 +3035,31 @@ def build_server(
         # вкладка, ждущая ответа, не должна держать claim и получать «продолжи» раз за разом.
         request_triage.triage_pending([entry], policy, stamp=now_iso)
         denied_permission_blocked = False
+        operator_item = ''
         if agent and k in ('access', 'bin', 'root', 'network') and entry.get('decision') == 'denied':
-            queue = fleet_ctx.module('queue')
-            if queue is not None:
-                try:
-                    queue.block(
-                        fleet_ctx.store,
-                        agent,
-                        f"автоблок: request_note {k} denied; {entry.get('note', '')[:300]}",
-                    )
-                    denied_permission_blocked = True
-                except ValueError:
-                    # Нет active claim / claim уже освободился: блокировать нечего.
-                    pass
+            # №48 §H п.3 (владелец 09.11): отказ в бинаре/доступе — не тупик и не заморозка.
+            # Раньше задача уходила в frozen, через 180 мин оттаивала, снова просила то же и снова
+            # замерзала (TSPU sub:LEAD-8, cargo). Теперь — одна строка оператору (у неё есть
+            # читатель), задача остаётся у агента: он продолжает доступные шаги.
+            try:
+                import hashlib
+                from dev_mcp.fleet import platform_manual
+                with fleet_ctx.store.tx() as tx:
+                    claim = tx.one("SELECT project,tz FROM claims WHERE worker_id=? AND state='active' "
+                                   "ORDER BY id DESC LIMIT 1", (agent,))
+                    subject = (str(claim['project']), str(claim['tz'])) if claim else ('', '')
+                    wanted = (entry.get('path') or entry.get('summary') or '')[:200]
+                    fingerprint = hashlib.sha256(
+                        f'{subject[0]}:{k}:{wanted}'.encode()).hexdigest()
+                    operator_item = platform_manual.enqueue(
+                        tx, fingerprint, title=f'Отказ в праве {k}: {wanted[:120]}',
+                        detail=(f"request_note {request_id} ({k}) отклонён автоматом; задача не "
+                                f"заморожена. Решить: разрешить по классу §H или ответить агенту. "
+                                f"Заявка: {entry.get('summary', '')}\n{entry.get('detail', '')}\n"
+                                f"Ответ автомата: {entry.get('note', '')}")[:4000],
+                        source_project=subject[0], source_tz=subject[1])
+            except Exception:  # noqa: BLE001 — журнал оператора не должен ломать ответ агенту
+                operator_item = ''
         try:
             with requests_history_path.open('a', encoding='utf-8') as fh:
                 fh.write(json.dumps(entry, ensure_ascii=False) + '\n')
@@ -2560,6 +3071,12 @@ def build_server(
             payload += (
                 ' Текущий claim автоматически освобождён, задача frozen: не жди владельца и не повторяй заявку. '
                 'Сразу бери следующую доступную задачу.'
+            )
+        elif operator_item:
+            payload += (
+                f' Задача НЕ заморожена: отказ записан оператору ({operator_item}), повтор заявки не нужен. '
+                'Продолжай доступные шаги; если без этого права шаг невозможен — назови его в checkpoint '
+                'и переходи к независимой работе.'
             )
         return fleet_ctx.with_envelope(agent, payload)
 
@@ -2661,10 +3178,12 @@ def build_server(
         except (PolicyError, OSError) as exc:
             return _fail('policy_reload', {}, exc)
         d = policy.describe()
+        unavailable = (' Недоступные каталоги отключены: ' + '; '.join(d['unavailable_roots'])
+                       if d['unavailable_roots'] else '')
         return _ok(
             'policy_reload', {},
             f'policy.toml перечитан. roots={len(d["roots"])} write_roots={len(d["write_roots"])} '
-            f'exec_roots={len(d["exec_roots"])} tasks={len(d["tasks"])}',
+            f'exec_roots={len(d["exec_roots"])} tasks={len(d["tasks"])}' + unavailable,
         )
 
     @mcp.tool(
@@ -3026,4 +3545,28 @@ def build_server(
             return json.dumps({"status": "error", "reason": "unverified_image"})
 
     register_fleet_tools(mcp, fleet_ctx)
+    # The handoff implementation is registered by fleet/tools.py. Its expected
+    # authorization/URL refusals otherwise escape FastMCP as plain transport
+    # text ("Error calling tool ..."), which breaks the browser JSON contract.
+    # Adapt this *one* registered handler without changing neighboring tools.
+    handoff_tool = next((component for provider in mcp.providers
+                         for component in getattr(provider, '_components', {}).values()
+                         if getattr(component, 'name', None) == 'fleet_chat_handoff'), None)
+    if handoff_tool is not None:
+        original_handoff = handoff_tool.fn
+
+        def handoff_json_response(*args: Any, **kwargs: Any) -> str:
+            try:
+                return original_handoff(*args, **kwargs)
+            except (PermissionError, ValueError) as exc:
+                # Especially for quick agents without a registered chat URL:
+                # do not allow a DOM URL to grant handoff rights.
+                return json.dumps({'action': 'refused', 'reason': str(exc),
+                                   'retry_after_s': 1800}, ensure_ascii=False)
+            except Exception:
+                logging.exception('fleet_chat_handoff: transient server failure')
+                return json.dumps({'action': 'error', 'reason': 'handoff temporarily unavailable',
+                                   'retry_after_s': 600}, ensure_ascii=False)
+
+        handoff_tool.fn = handoff_json_response
     return mcp

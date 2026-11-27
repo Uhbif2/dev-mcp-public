@@ -610,6 +610,9 @@ class Txn:
         *,
         event: Mapping[str, Any] | str,
     ) -> sqlite3.Cursor:
+        from .generators import permitted
+        if not permitted(sql, event):
+            return self._conn.execute("SELECT 0 WHERE 1=0")
         try:
             cursor = self._conn.execute(sql, tuple(params))
             self._record_event(event)
@@ -623,9 +626,13 @@ class Txn:
         *,
         event: Mapping[str, Any] | str,
     ) -> list[sqlite3.Cursor]:
+        from .generators import permitted
         cursors: list[sqlite3.Cursor] = []
         try:
             for sql, params in statements:
+                if not permitted(sql, event):
+                    cursors.append(self._conn.execute("SELECT 0 WHERE 1=0"))
+                    continue
                 cursors.append(self._conn.execute(sql, tuple(params)))
             self._record_event(event)
             return cursors
@@ -682,25 +689,55 @@ class _ReadTxn(Txn):
 
 
 class _ReadContext(AbstractContextManager[Txn]):
+    """Снимок для чтения; вложенный read() в том же потоке читает снимок внешнего.
+
+    20.11.2026: fleet_list внутри `with store.read()` строил текст будки ведущего
+    (wake.wake_text → lead.focus_lines → свой store.read()). Второй BEGIN на соединении потока
+    падал «cannot start a transaction within a transaction», и весь fleet_list отдавал ошибку
+    расширению (значок «!»). Вложенное чтение теперь переиспользует открытый снимок, а
+    закрывает его только внешний уровень.
+    """
+
     def __init__(self, store: Store) -> None:
         self._store = store
         self._own = False
+        self._nested = False
 
     def __enter__(self) -> Txn:
         self._store._require_available()
-        active = getattr(self._store._local, "active_tx", None)
+        local = self._store._local
+        active = getattr(local, "active_tx", None)
         if active is not None:
             return active  # внутри своей транзакции читаем её же
         conn = self._store._connection()
+        if int(getattr(local, "read_depth", 0) or 0) > 0 and conn.in_transaction:
+            local.read_depth += 1
+            self._nested = True
+            return _ReadTxn(self._store, conn)
+        if conn.in_transaction:
+            # Ни записи (active_tx), ни внешнего чтения в этом потоке нет: транзакция осталась
+            # от оборванного вызова. Соединение принадлежит потоку — откатываем и читаем заново.
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
         try:
             conn.execute("BEGIN")  # отложенная: снимок без замка записи
         except sqlite3.Error as exc:
             raise FleetUnavailable(f"cannot begin fleet read: {exc}") from exc
         self._own = True
+        local.read_depth = 1
         return _ReadTxn(self._store, conn)
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        local = self._store._local
+        if self._nested:
+            local.read_depth = max(0, int(getattr(local, "read_depth", 1) or 1) - 1)
+            self._nested = False
+            return False
         if self._own:
+            local.read_depth = 0
+            self._own = False
             try:
                 self._store._connection().rollback()
             except sqlite3.Error:

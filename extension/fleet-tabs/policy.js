@@ -5,6 +5,15 @@
 // не мешать человеку, не долбить вкладку, которая не двигается, и не продолжать то,
 // что уже сдано.
 
+// Часовой бюджет надзирателя не зависит от времени жизни MV3 service worker.
+export const OVERSEER_SENDS_PER_HOUR = 12;
+export function overseerSendBudget(timestamps, now, limit = OVERSEER_SENDS_PER_HOUR) {
+  const recent = (Array.isArray(timestamps) ? timestamps : [])
+    .filter((at) => Number.isFinite(at) && at > now - 3600_000 && at <= now);
+  const allowed = recent.length < limit;
+  return { allowed, sends: allowed ? [...recent, now] : recent };
+}
+
 export const DEFAULTS = {
   idleGraceSec: 5, // завершённый ход подхватываем на ближайшем тике, без лишней четверти минуты
   minGapSec: 20, // обычный follow-up не должен ждать минуту; фактический тик всё равно ограничивает темп
@@ -49,11 +58,10 @@ export const LAUNCH_DEFAULTS = {
   // Вкладка — одноразовая клавиатура (архитектура v2 §3, 07.10.2026): ход идёт на серверах
   // OpenAI и без вкладки, будит замолчавший разговор сервер (fleet/wake.py). Агентов — maxWorking,
   // вкладок одновременно — maxTabs. До этого вкладка жила весь ход: 13 вкладок, 4.6 ГБ, 194 МБ свободно.
-  maxTabs: 4, // 16.10: ограничиваем одновременно загруженный интерфейс, не число чатов
-  // Свободной памяти меньше — новую вкладку не открывать. Вкладка-клавиатура живёт ~1 мин и
-  // стоит ~300 МБ; у машины владельца обычный фон — 450–600 МБ свободно, поэтому 1200 (0.17)
-  // запрещал любой новый чат. 194 МБ (было до 0.17) — уже подкачка.
-  minFreeMemMB: 350,
+  maxTabs: 4, // исходная независимая настройка числа UI-клавиатур; не лимит агентов
+  // При нехватке ОЗУ новые вкладки НЕ блокируются: безопасные idle/answered вкладки
+  // выгружаются отдельно. Измеренный фон владельца — 450–600 МБ.
+  minFreeMemMB: 250, // только порог аварийного discard, не запрет открытия
   // Это темп владельца, а не выдуманное окно квоты ChatGPT. Старый журнал не измерял
   // восстановление: оставленный диалог повторно запускал паузу на 20/40 минут.
   minGapSec: 4, // 09.10 (владелец): запуск быстрее, аккаунт выдерживает
@@ -271,10 +279,7 @@ export function decideLaunch(projects, agentLabels, workers, launch, nowMs, cfg 
   const tabs = agentLabels.length + pending.filter((label) => !agentLabels.includes(label)).length;
   const maxTabs = cfg.maxTabs ?? cfg.maxWorking + cfg.spareTabs;
   if (tabs >= maxTabs) return skip(`открыто ${tabs} вкладок-агентов — потолок ${maxTabs}`);
-  if (freeMemMB != null && freeMemMB < cfg.minFreeMemMB) {
-    return skip(`свободно памяти ${freeMemMB} МБ < ${cfg.minFreeMemMB} МБ — новую вкладку не открываю`);
-  }
-  // Своя вкладка между задачами (сдала, лимит чата не исчерпан, только что работала) —
+   // Своя вкладка между задачами (сдала, лимит чата не исчерпан, только что работала) —
   // тоже занятое место: иначе на каждую сдачу открывался бы лишний новый чат.
   if (working + pending.length >= cfg.maxWorking) return skip(`заняты все рабочие места: ${working}+${pending.length} стартуют/${cfg.maxWorking}`);
   const gapSec = Math.min(next.nextGapSec || cfg.minGapSec, cfg.minGapSec * 1.5);
@@ -449,6 +454,7 @@ export function reloadPlan(tab, mem, history, nowMs, cfg = RELOAD_DEFAULTS, work
   const interrupted = pageFailure || (composerMissing ? "поле ввода разговора не загрузилось" : tab.interrupted);
   if (!interrupted) {
     state.since = 0;
+    state.streak = 0;
     const hung = hungText(tab, worker, cfg);
     if (!hung) return out(false, "");
     if (!tab.composerEmpty) return out(false, "зависание, но в поле ввода текст — не перезагружаю");
@@ -465,12 +471,21 @@ export function reloadPlan(tab, mem, history, nowMs, cfg = RELOAD_DEFAULTS, work
   const kind = pageFailure ? "разговор не загрузился" : composerMissing ? "поле ввода разговора не загрузилось" : "обрыв ответа";
   if (heldSec < holdSec) return out(false, `${kind} ${Math.round(heldSec)}с — жду подтверждения`);
   if (!tab.composerEmpty) return out(false, `${kind}, но в поле ввода текст — не перезагружаю`);
-  if (state.lastAt && nowMs - state.lastAt < minGapSec * 1000) {
-    return out(false, `${kind} повторился сразу после перезагрузки — жду`);
+  // 16.11: сломанный чат перезагружался каждые ~12 с (18 раз за 15 мин) и съедал общую полосу
+  // действий аккаунта у всех вкладок. Подряд идущие перезагрузки одной вкладки — с удвоением паузы
+  // (до 10 мин); удачная загрузка сбрасывает счёт.
+  const streak = state.streak || 0;
+  // 18.11: API разговора из этой же вкладки ответил 200 (tab.apiOk) — сбой локальный (рендерер,
+  // сеть страницы), не лимит аккаунта: без удвоения паузы и без общего часового потолка. Живьём
+  // две вкладки 10+ мин висели на «Could not load» из-за потолка 24/ч, одна ручная перезагрузка — и всё.
+  const gapMs = tab.apiOk ? Math.max(60_000, minGapSec * 1000) : Math.min(600_000, minGapSec * 1000 * 2 ** Math.max(0, streak - 1));
+  if (state.lastAt && nowMs - state.lastAt < gapMs) {
+    return out(false, `${kind} повторился сразу после перезагрузки (${streak} подряд) — жду ${Math.ceil((gapMs - (nowMs - state.lastAt)) / 1000)} с`);
   }
-  if (recent.length >= cfg.maxPerHour) return out(false, `${kind}; за час уже ${recent.length} перезагрузок — потолок`);
+  if (recent.length >= cfg.maxPerHour && !tab.apiOk) return out(false, `${kind}; за час уже ${recent.length} перезагрузок — потолок`);
   state.lastAt = nowMs;
   state.since = 0;
+  state.streak = streak + 1;
   recent.push(nowMs);
   return out(true, `«${String(interrupted).slice(0, 60)}» держится ${Math.round(heldSec)}с — перезагружаю страницу`);
 }

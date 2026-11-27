@@ -10,10 +10,11 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Callable, Iterable, Mapping, Sequence
 
 _ID = re.compile(r"[a-f0-9]{64}\Z")
 _SKIP = frozenset({".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache"})
@@ -23,6 +24,19 @@ _MAX_BYTES = 128 * 1024 * 1024
 
 class SnapshotError(ValueError):
     """Invalid, corrupted, or no longer available snapshot."""
+
+
+def _is_link(path: Path) -> bool:
+    """Reject symlinks, Windows junctions and unrecognized NTFS reparse points."""
+    if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+        return True
+    if os.name == "nt":
+        try:
+            # Path.is_junction is not available before Python 3.12.
+            return bool(path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        except FileNotFoundError:
+            return False
+    return False
 
 
 def _json(obj: object) -> bytes:
@@ -80,21 +94,184 @@ class SnapshotStore:
         path = source
         for part in PurePosixPath(rel).parts:
             path = path / part
-            if path.is_symlink():
-                raise SnapshotError("symlink in snapshot source")
+            if _is_link(path):
+                raise SnapshotError("symlink or junction in snapshot source")
         if not path.is_file():
             raise SnapshotError("missing or non-regular source file")
         return path
 
-    def create(self, source: str | Path, include: Iterable[str] | None = None) -> SnapshotRef:
+    def manifest(self, snapshot_id: str) -> dict:
+        """Validate the content-addressed manifest without rereading every blob.
+
+        A base object was verified when captured. Every reused blob is also
+        checked for regular-file type and size before linking it into a new
+        immutable object; verify() remains the exhaustive integrity check.
+        """
+        obj = self._object(snapshot_id)
+        if _is_link(obj) or _is_link(obj / "manifest.json"):
+            raise SnapshotError("snapshot object symlink")
+        try:
+            raw = (obj / "manifest.json").read_bytes()
+            value = json.loads(raw)
+        except (OSError, ValueError) as exc:
+            raise SnapshotError("snapshot manifest unavailable") from exc
+        if (not isinstance(value, dict) or value.get("schema") != 1
+                or not isinstance(value.get("files"), list)
+                or _json(value) != raw
+                or hashlib.sha256(raw).hexdigest() != snapshot_id):
+            raise SnapshotError("invalid snapshot manifest")
+        seen = set()
+        for entry in value["files"]:
+            if (not isinstance(entry, dict)
+                    or set(entry) != {"path", "sha256", "size"}
+                    or not isinstance(entry["size"], int)
+                    or entry["size"] < 0
+                    or not isinstance(entry["sha256"], str)
+                    or _ID.fullmatch(entry["sha256"]) is None):
+                raise SnapshotError("invalid snapshot entry")
+            name = _relative(entry["path"])
+            if _restricted(name) or name in seen:
+                raise SnapshotError("invalid snapshot path")
+            seen.add(name)
+        return value
+
+    def create_incremental(
+        self, source: str | Path, include: Sequence[str], *,
+        base_snapshot: str,
+        base_versions: Mapping[str, Sequence[int]],
+        current_versions: Mapping[str, Sequence[int]] | None = None,
+        volatile_fallback: Callable[[str], bytes | None] | None = None,
+    ) -> SnapshotRef:
+        """Reuse unchanged immutable blobs; read/hash only changed source files.
+
+        The metadata hint is a performance hint, never a source for hashes:
+        hashes come from the previously content-addressed manifest. A changed
+        or missing file is copied from the live tree under the same stability
+        check used by create(). The stage is atomically published.
+        """
         source = Path(source)
-        if not source.is_dir() or source.is_symlink():
+        if not source.is_dir() or _is_link(source):
+            raise SnapshotError("source must be a real directory")
+        names = sorted(include)
+        if not names or len(names) > _MAX_FILES or len(set(names)) != len(names):
+            raise SnapshotError("empty, duplicate, or oversized snapshot")
+        previous = {row["path"]: row for row in self.manifest(base_snapshot)["files"]}
+        stage = Path(tempfile.mkdtemp(prefix=".stage-", dir=self.root))
+        entries = []
+        total = 0
+        linked_bases: list[Path] = []
+        created_dirs: set[Path] = set()
+        try:
+            for name in names:
+                # Even incremental reuse must not trust a now-junction source.
+                self._safe_source(source, name)
+                old = previous.get(name)
+                version = base_versions.get(name)
+                current = (current_versions or {}).get(name)
+                if current is None:
+                    path = self._safe_source(source, name)
+                    st = path.stat()
+                    current = (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+                same = (
+                    old is not None and version is not None
+                    and tuple(version) == tuple(current)
+                    and old["size"] == current[0]
+                )
+                dest = stage / "tree" / name
+                if dest.parent not in created_dirs:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    created_dirs.add(dest.parent)
+                if same:
+                    base_file = self._object(base_snapshot) / "tree"
+                    if _is_link(base_file):
+                        raise SnapshotError("linked base snapshot tree")
+                    for part in PurePosixPath(name).parts:
+                        base_file = base_file / part
+                        if _is_link(base_file):
+                            raise SnapshotError("linked base snapshot file")
+                    if not base_file.is_file():
+                        raise SnapshotError("missing or linked base snapshot file")
+                    if base_file.stat().st_size != old["size"]:
+                        raise SnapshotError("base snapshot size mismatch")
+                    try:
+                        os.link(base_file, dest)
+                        linked_bases.append(base_file)
+                    except OSError:
+                        shutil.copyfile(base_file, dest)
+                    entry = dict(old)
+                else:
+                    data = None
+                    for attempt in range(6):
+                        try:
+                            path = self._safe_source(source, name)
+                            before = path.stat()
+                            if before.st_size > _MAX_BYTES:
+                                raise SnapshotError("snapshot exceeds byte limit")
+                            with path.open("rb") as stream:
+                                candidate = stream.read(before.st_size + 1)
+                            after = path.stat()
+                            if (before.st_size == after.st_size == len(candidate)
+                                    and before.st_mtime_ns == after.st_mtime_ns
+                                    and before.st_ctime_ns == after.st_ctime_ns):
+                                data = candidate
+                                break
+                        except (FileNotFoundError, PermissionError):
+                            pass
+                        if attempt < 5:
+                            import time
+                            time.sleep(0.005 * (attempt + 1))
+                    if data is None and volatile_fallback is not None:
+                        data = volatile_fallback(name)
+                    if data is None:
+                        raise SnapshotError(f"source file changed during capture: {name}")
+                    entry = {"path": name, "sha256": hashlib.sha256(data).hexdigest(),
+                             "size": len(data)}
+                    dest.write_bytes(data)
+                    dest.chmod(0o444)
+                total += entry["size"]
+                if total > _MAX_BYTES:
+                    raise SnapshotError("snapshot exceeds byte limit")
+                entries.append(entry)
+            manifest = {"schema": 1, "files": entries}
+            subject = hashlib.sha256(_json(manifest)).hexdigest()
+            target = self._object(subject)
+            if target.exists():
+                if self.manifest(subject) != manifest:
+                    raise SnapshotError("existing snapshot collision")
+            else:
+                (stage / "manifest.json").write_bytes(_json(manifest))
+                (stage / "manifest.json").chmod(0o444)
+                try:
+                    stage.rename(target)
+                except FileExistsError:
+                    if self.manifest(subject) != manifest:
+                        raise SnapshotError("existing snapshot collision")
+            return SnapshotRef(subject, subject, len(entries), total)
+        finally:
+            if stage.exists():
+                # On Windows a read-only hardlink cannot be unlinked. Temporarily
+                # clear the shared attribute, then restore the original object's
+                # read-only protection after disposing of the abandoned stage.
+                def retry_readonly(func, path, exc):
+                    os.chmod(path, 0o666)
+                    func(path)
+                try:
+                    shutil.rmtree(stage, onexc=retry_readonly)
+                finally:
+                    for base_file in linked_bases:
+                        if base_file.exists():
+                            base_file.chmod(0o444)
+
+    def create(self, source: str | Path, include: Iterable[str] | None = None, *,
+               volatile_fallback: Callable[[str], bytes | None] | None = None) -> SnapshotRef:
+        source = Path(source)
+        if not source.is_dir() or _is_link(source):
             raise SnapshotError("source must be a real directory")
         if include is None:
             names = []
             for folder, dirs, files in os.walk(source, followlinks=False):
                 dirs[:] = sorted(d for d in dirs if not _restricted(d) and
-                                 not (Path(folder) / d).is_symlink())
+                                 not _is_link(Path(folder) / d))
                 for name in sorted(files):
                     path = Path(folder) / name
                     rel = path.relative_to(source).as_posix()
@@ -112,13 +289,34 @@ class SnapshotStore:
                 # Vanished between the walk and the read: the live tree is shared with
                 # agents and the server moves tz-drafts (13.10.2026, TZ-330 bootstrap).
                 continue
-            path = self._safe_source(source, name)
-            before = path.stat()
-            with path.open("rb") as stream:
-                data = stream.read(_MAX_BYTES + 1)
-            after = path.stat()
-            if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
-                raise SnapshotError("source file changed during capture")
+            # A busy shared project can rewrite an unrelated file while a bootstrap
+            # captures it. Retry THAT file, not the entire multi-thousand-file tree.
+            # The caller may supply immutable Git bytes for volatile non-owned inputs.
+            data = None
+            for attempt in range(6):
+                try:
+                    path = self._safe_source(source, name)
+                    before = path.stat()
+                    if before.st_size > _MAX_BYTES:
+                        raise SnapshotError("snapshot exceeds byte limit")
+                    # Bound the read to the observed size, not _MAX_BYTES per file.
+                    with path.open("rb") as stream:
+                        candidate = stream.read(before.st_size + 1)
+                    after = path.stat()
+                    if (before.st_size == after.st_size == len(candidate)
+                            and before.st_mtime_ns == after.st_mtime_ns
+                            and before.st_ctime_ns == after.st_ctime_ns):
+                        data = candidate
+                        break
+                except (FileNotFoundError, PermissionError):
+                    pass  # Concurrent atomic replace; recheck the exact path.
+                if attempt < 5:
+                    import time
+                    time.sleep(0.005 * (attempt + 1))
+            if data is None and volatile_fallback is not None:
+                data = volatile_fallback(name)
+            if data is None:
+                raise SnapshotError(f"source file changed during capture: {name}")
             total += len(data)
             if total > _MAX_BYTES:
                 raise SnapshotError("snapshot exceeds byte limit")
@@ -155,7 +353,7 @@ class SnapshotStore:
 
     def verify(self, snapshot_id: str) -> SnapshotRef:
         target = self._object(snapshot_id)
-        if target.is_symlink() or (target / "manifest.json").is_symlink():
+        if _is_link(target) or _is_link(target / "manifest.json"):
             raise SnapshotError("snapshot object symlink")
         try:
             raw = (target / "manifest.json").read_bytes()
@@ -182,11 +380,11 @@ class SnapshotStore:
             parts = PurePosixPath(name).parts
             expected_dirs.update("/".join(parts[:depth]) for depth in range(1, len(parts)))
             path = target / "tree"
-            if path.is_symlink() or not path.is_dir():
+            if _is_link(path) or not path.is_dir():
                 raise SnapshotError("invalid snapshot tree")
             for part in parts:
                 path = path / part
-                if path.is_symlink():
+                if _is_link(path):
                     raise SnapshotError("snapshot symlink")
             try:
                 data = path.read_bytes()
@@ -206,7 +404,7 @@ class SnapshotStore:
                 with os.scandir(folder) as entries:
                     for entry in entries:
                         rel = _relative(f"{prefix}/{entry.name}" if prefix else entry.name)
-                        if entry.is_symlink():
+                        if _is_link(Path(entry.path)):
                             raise SnapshotError("snapshot symlink")
                         if entry.is_dir(follow_symlinks=False):
                             if rel not in expected_dirs:
@@ -226,7 +424,7 @@ class SnapshotStore:
         """Copy to an isolated working directory; never execute in the object tree."""
         self.verify(snapshot_id)
         target = Path(target)
-        if target.exists() or target.is_symlink():
+        if target.exists() or _is_link(target):
             raise SnapshotError("materialization target must be absent")
         source = self._object(snapshot_id)
         manifest = json.loads((source / "manifest.json").read_bytes())
@@ -239,7 +437,7 @@ class SnapshotStore:
                 path = source / "tree"
                 for part in PurePosixPath(name).parts:
                     path = path / part
-                    if path.is_symlink():
+                    if _is_link(path):
                         raise SnapshotError("snapshot symlink during materialization")
                 data = path.read_bytes()
                 if (len(data) != entry["size"] or

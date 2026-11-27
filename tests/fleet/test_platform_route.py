@@ -275,3 +275,12 @@ def test_open_request_g1_plan_does_not_freeze_source(store):
     assert _state(store, "Main Hub", new_tz) == "ready"
     with store.read() as tx:
         assert not tx.query("SELECT tz FROM tasks WHERE project='Fleet Platform'")
+
+
+def test_project_guard_request_with_fix_task_id_is_not_platform():
+    from dev_mcp.fleet.platform_route import is_platform_request
+    assert not is_platform_request(
+        summary="Просьба добавить semantic forbidden-link guard + negative mutation selftest "
+                "для четырёх ложных привязок LEDGER (fix:TZ-LEAD:6 claim 28088)",
+        detail="Страж FLEET_FOREIGN_PATH на ledger_check.py у W8178.", path="guard/core.py")
+    assert is_platform_request(summary="Ошибка флота: ревью не выдаётся после сдачи")

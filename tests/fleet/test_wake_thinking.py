@@ -42,6 +42,11 @@ def env(tmp_path: Path):
     return store, book
 
 
+@pytest.fixture(autouse=True)
+def _two_orders(monkeypatch):
+    """Эти тесты проверяют учёт «думает/простаивает» на лесенке из двух приказов."""
+    monkeypatch.setattr(wake, "MAX_ORDERS", 2)
+
 def issue(env, minutes: float) -> dict:
     store, book = env
     orders = wake.orders(store, book, now=T0 + timedelta(minutes=minutes))

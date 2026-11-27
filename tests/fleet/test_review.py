@@ -154,6 +154,39 @@ def test_accept_without_reviewers_own_successful_acceptance_run_is_rejected(tmp_
     assert task_row(store, review_tz)["state"] == "taken"
 
 
+def test_lead_criteria_do_not_replace_current_review_or_executable_acceptance(tmp_path: Path):
+    from dev_mcp.fleet.lead_admin import criteria_block
+
+    store = setup_store(tmp_path)
+    tz = "sub:LEAD-11"
+    command = "python -m pytest tests/unit.py -q"
+    criterion = "Verify the exact revision and preserve the unresolved field outcome."
+    note = "Checked revision and negative control. Field outcome remains unresolved."
+    add_task(store, tz, state="submitted", author_worker="W1", acceptance=(command,))
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET body=? WHERE project='P' AND tz=?",
+                  ("[fleet-lead-sub] P" + criteria_block([criterion]), tz),
+                  event={"kind": "test_setup"})
+    review_tz = open_review(store, "P", tz)
+    assert criterion in task_row(store, review_tz)["body"]
+    assert take_next(store, "W2", "P").tz == review_tz
+    record_run(store, "W2", command.split(), 0)  # unbound to this review
+    with pytest.raises(ValueError, match="по criteria"):
+        decide(store, "W2", "accept", note, tree="candidate")
+    with store.tx() as tx:
+        tx.record_event(kind="run", worker_id="W2", project="P", tz=review_tz,
+                        rc=0, payload={"argv": ["git", "rev-parse", "HEAD"], "tree": "candidate"})
+    with pytest.raises(ValueError, match="по criteria"):
+        decide(store, "W2", "accept", "", tree="candidate")
+    with pytest.raises(ValueError, match="менялись"):
+        decide(store, "W2", "accept", note, tree="candidate")
+    with store.tx() as tx:
+        tx.record_event(kind="run", worker_id="W2", project="P", tz=review_tz,
+                        rc=0, payload={"argv": command.split(), "tree": "candidate"})
+    decide(store, "W2", "accept", note, tree="candidate")
+    assert task_row(store, tz)["state"] == "accepted"
+
+
 def test_accept_requires_matching_command_rc_zero_and_releases_claims(tmp_path: Path):
     store = setup_store(tmp_path)
     command = "python -m pytest tests/unit.py -q"

@@ -16,6 +16,21 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def production_policy_requires_host_layout(request):
+    """Live-machine policy assertions require directories declared by that host."""
+    if request.node.get_closest_marker("production") is None:
+        return
+    import tomllib
+    config = Path(__file__).resolve().parents[1] / "policy.toml"
+    raw = tomllib.loads(config.read_text(encoding="utf-8"))
+    missing = [path for path in raw.get("roots", []) if not Path(path).exists()]
+    if missing:
+        pytest.skip("production policy requires host-specific roots: " + ", ".join(missing[:2]))
+
+
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 from dev_mcp.policy import Policy, PolicyError  # noqa: E402
@@ -138,6 +153,7 @@ def test_junction_pointing_outside_blocked(tmp_path: Path) -> None:
         ['cmd', '/c', 'mklink', '/J', str(link), str(tmp_path / 'outside')],
         capture_output=True,
         text=True,
+        errors='replace',  # cmd may emit OEM bytes while PYTHONUTF8=1 is set in CI
     )
     if result.returncode != 0:
         pytest.skip(f'mklink недоступен: {result.stdout.strip()} {result.stderr.strip()}')

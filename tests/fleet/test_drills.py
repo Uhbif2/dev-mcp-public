@@ -14,6 +14,27 @@ from dev_mcp.fleet.drills import (
 )
 
 
+def test_synthetic_cleanup_uses_python311_compatible_rmtree_hook(tmp_path, monkeypatch):
+    from dev_mcp.fleet import drills
+
+    calls = []
+
+    def legacy_rmtree(path, *, onerror=None):
+        calls.append((path, onerror))
+        assert callable(onerror), "Python 3.11 shutil.rmtree has onerror, not onexc"
+
+    monkeypatch.setattr(drills.shutil, "rmtree", legacy_rmtree)
+    drills._synthetic_cleaner(tmp_path)
+    assert calls[0][0] == tmp_path
+
+
+@pytest.fixture(autouse=True)
+def synthetic_drill_generators(monkeypatch):
+    # Synthetic recovery must exercise routing with automatic work enabled.
+    from dev_mcp.fleet import generators
+    monkeypatch.setattr(generators, 'enabled', lambda: True)
+
+
 NOW = datetime(2026, 10, 9, 12, tzinfo=timezone.utc)
 
 

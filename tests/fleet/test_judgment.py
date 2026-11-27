@@ -681,7 +681,73 @@ def test_frozen_unlink_requires_fresh_independent_authority(
 
 def test_hardware_words_no_longer_wait_for_owner() -> None:
     # 18.10: у VPN каждая задача про телефон/устройство — это ресурс очереди, не решение владельца.
-    assert not judgment.irreversible("нужен телефон TECNO по ADB и внешний vSwitch на втором ПК")
+    assert not judgment.irreversible("нужен телефон PHONEB по ADB и внешний vSwitch на втором ПК")
     assert not judgment.irreversible("device session", "$env:PATH")
     assert judgment.irreversible("оплатить VPS на месяц")
     assert judgment.irreversible("опубликовать в store listing")
+
+
+def test_folded_yaml_why_is_read_whole(store: Store, tmp_path: Path) -> None:
+    """27.10: `why: >-` с отступом давал причину «>-»."""
+    add(store, "TZ-176", state="frozen", title="стенд")
+    path = tmp_path / "P" / "ToDo" / "decisions" / "TZ-176.md"
+    path.write_text("tz: TZ-176\naction: park\nwhy: >-\n  Нет кадров после исправления;\n"
+                    "  стенд недоступен.\nuntil: |\n  py -3 tools/probe.py\n", encoding="utf-8")
+    fields = judgment._read_decision(path)
+    assert fields["why"] == "Нет кадров после исправления; стенд недоступен."
+    assert fields["until"] == "py -3 tools/probe.py"
+    assert fields["action"] == "park"
+    path.write_text("# Решение\nэто не yaml: а текст\n```yaml\ntz: TZ-176\naction: keep\n```\n",
+                    encoding="utf-8")
+    assert judgment._read_decision(path)["action"] == "keep"
+
+
+def test_parked_task_returns_to_queue_on_backoff(store: Store, tmp_path: Path) -> None:
+    add(store, "TZ-177", state="frozen", title="стенд")
+    write_decision(store, tmp_path, "TZ-177", "park", why="стенд недоступен")
+    judgment.apply_accepted(store)
+    start = datetime.now(timezone.utc)
+    assert judgment.revisit_parked(store, now=start + timedelta(hours=71)) == []
+    assert judgment.revisit_parked(store, now=start + timedelta(hours=73)) == ["P/TZ-177"]
+    with store.tx() as tx:
+        assert tx.scalar("SELECT state FROM tasks WHERE tz='TZ-177'") == "ready"
+        tx.change("UPDATE tasks SET state='frozen' WHERE tz='TZ-177'", event={"kind": "test_setup"})
+    event(store, "proposal", "TZ-177", action="park", reversible=True, until="", state_at="frozen")
+    # Второй круг ждёт уже неделю.
+    assert judgment.revisit_parked(store, now=start + timedelta(days=6)) == []
+    assert judgment.revisit_parked(store, now=start + timedelta(days=8)) == ["P/TZ-177"]
+
+
+def test_owner_keep_and_newer_block_are_not_revisited(store: Store, tmp_path: Path) -> None:
+    add(store, "TZ-178", state="frozen", title="ключ")
+    event(store, "proposal", "TZ-178", action="keep", reversible=False, state_at="frozen")
+    add(store, "TZ-179", state="frozen", title="стенд")
+    event(store, "proposal", "TZ-179", action="park", reversible=True, state_at="frozen")
+    event(store, "block", "TZ-179", reason="blocked: until: adb devices")
+    add(store, "TZ-182", state="frozen", title="выкатка")
+    event(store, "block", "TZ-182", reason="blocked: платформа",
+          reactivate_policy={"kind": "platform_deploy_after", "target": "x"})
+    far = datetime.now(timezone.utc) + timedelta(days=30)
+    assert judgment.revisit_parked(store, now=far) == []
+
+
+def test_prose_only_block_is_revisited_like_park(store: Store) -> None:
+    add(store, "TZ-183", state="frozen", title="телефон")
+    event(store, "block", "TZ-183", reason="blocked: нужен телефон и ADB-сессия")
+    start = datetime.now(timezone.utc)
+    assert judgment.revisit_parked(store, now=start + timedelta(hours=1)) == []
+    assert judgment.revisit_parked(store, now=start + timedelta(hours=73)) == ["P/TZ-183"]
+
+
+def test_review_of_already_decided_source_is_retired(store: Store) -> None:
+    add(store, "TZ-180", state="accepted")
+    add(store, "review:TZ-180", state="frozen", kind="review")
+    add(store, "TZ-181", state="submitted")
+    add(store, "review:TZ-181", state="frozen", kind="review")
+    assert judgment.retire_obsolete_reviews(store) == ["P/review:TZ-180"]
+    with store.tx() as tx:
+        assert tx.scalar("SELECT state FROM tasks WHERE tz='review:TZ-180'") == "rejected"
+        assert tx.scalar("SELECT state FROM tasks WHERE tz='review:TZ-181'") == "frozen"
+        assert tx.scalar("SELECT COUNT(*) FROM events WHERE kind='review_obsolete'") == 1
+        assert tx.scalar("SELECT COUNT(*) FROM events WHERE kind='reject'") == 0
+    assert judgment.retire_obsolete_reviews(store) == []

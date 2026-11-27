@@ -221,8 +221,6 @@ def test_real_entrypoint_accept_handoff_owner_dashboard_and_offline_retry(
 
     monkeypatch.setattr(controller, "_production_handoff_route", production_route)
     monkeypatch.setattr(controller, "run_daily_drill_scheduler", lambda _stop: None)
-    monkeypatch.setattr(controller, "run_cross_review_worker",
-                        lambda _store, _stop: None)
 
     # Leave the dashboard unavailable: route must persist proof, never toast.
     stop = threading.Event()

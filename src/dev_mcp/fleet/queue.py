@@ -8,6 +8,7 @@ import shlex
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from dev_mcp.json_book import read_json, write_json
 from typing import Any, Iterator
 
 from .model import Task, norm_path, paths_overlap, task_root
@@ -59,6 +60,50 @@ def _task(row: dict[str, Any], *, state: str | None = None) -> Task:
     )
 
 
+def _visual_review_required(row: dict[str, Any], settings: dict[str, Any] | None = None) -> bool:
+    """Detect tasks that cannot be reviewed without image-capable connector tools."""
+    if row.get("kind") != "review":
+        return False
+    config = settings or {}
+    if "read_image" in (config.get("needs_tools") or []):
+        return True
+    body = str(row.get("body") or "")
+    if re.search(r"needs_tools\s*:\s*\[?[^\n]*read_images?", body, re.I):
+        return True
+    evidence = " ".join((body, str(row.get("owns") or ""),
+                         str(row.get("acceptance") or "")))
+    return bool(re.search(r"(?:\.png\b|\.jpe?g\b|скриншот|screenshot)", evidence, re.I))
+
+
+def _worker_can_read_images(tx: Any, worker_id: str, *, settings: dict[str, Any] | None = None) -> bool:
+    """New conversations after the connector refresh, or actual image-tool use."""
+    worker = tx.one("SELECT first_seen FROM workers WHERE id=?", (worker_id,))
+    if worker is None:
+        return False
+    refresh = str((settings or {}).get("image_tools_refreshed_at") or
+                  "2026-11-16T06:40:00+00:00")
+    try:
+        first = datetime.fromisoformat(str(worker["first_seen"]).replace("Z", "+00:00"))
+        bound = datetime.fromisoformat(refresh.replace("Z", "+00:00"))
+        if first.tzinfo is None:
+            first = first.replace(tzinfo=timezone.utc)
+        if bound.tzinfo is None:
+            bound = bound.replace(tzinfo=timezone.utc)
+        if first >= bound:
+            return True
+    except (ValueError, TypeError):
+        pass
+    # The flow 'инструменты v2' counts apply_patch/checkpoint, not image tools.
+    # Read actual call evidence, never infer an old session's connector visibility.
+    from dev_mcp.audit import iter_entries
+    audit_path = Path(__file__).resolve().parents[3] / "logs" / "audit.jsonl"
+    for entry in iter_entries(audit_path, since=str(worker["first_seen"])[:10]):
+        if (str(entry.get("agent") or "") == worker_id
+                and entry.get("tool") in ("read_image", "read_images")):
+            return True
+    return False
+
+
 def _touch(store: Any, worker_id: str) -> None:
     store.touch_worker(worker_id)
 
@@ -100,7 +145,7 @@ def read_settings(store: Any) -> dict[str, Any]:
     if cached and cached[0] == mtime:
         return cached[1]
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = read_json(path, strict=True)
     except (OSError, ValueError):
         data = {}
     data = data if isinstance(data, dict) else {}
@@ -113,14 +158,12 @@ def write_setting(db_path: Any, key: str, value: Any) -> Path:
     if path is None:
         raise ValueError("у реестра нет файла — настройки некуда записать")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = read_json(path, strict=True)
         data = data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         data = {}
     data[key] = value
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    write_json(path, data, indent=2)
     return path
 
 
@@ -159,6 +202,16 @@ def family_root(tz: str) -> str:
     return task_root(tz)
 
 
+def _owner_rank(tz: str, target: str) -> int:
+    from .lead import is_lead
+
+    if target and (tz == target or family_root(tz) == target):
+        return 0
+    if target and is_lead(tz):
+        return 1
+    return 2
+
+
 def _worked_on_family(tx: Any, worker_id: str, project: str, review_tz: str) -> bool:
     """Держал ли воркер work/fix-claim этой семьи задач (исходная и все её fix).
 
@@ -183,6 +236,51 @@ def _held_before(tx: Any, worker_id: str, project: str, tz: str) -> bool:
         (worker_id, project, tz),
     )
     return row is not None
+
+
+def _last_claim(tx: Any, worker_id: str) -> Any:
+    return tx.one(
+        "SELECT project,tz,worker_id,state,started_at,released_at FROM claims "
+        "WHERE worker_id=? AND state!='prepare_failed' ORDER BY id DESC LIMIT 1",
+        (worker_id,),
+    )
+
+
+def _submitted_claim(tx: Any, claim: Any) -> bool:
+    return bool(claim and claim["state"] == "released" and tx.one(
+        "SELECT 1 FROM events WHERE worker_id=? AND project=? AND tz=? "
+        "AND kind='submit' AND ts>=? LIMIT 1",
+        (claim["worker_id"], claim["project"], claim["tz"], claim["started_at"]),
+    ))
+
+
+def _lead_continuation(tx: Any, claim: Any) -> bool:
+    if _submitted_claim(tx, claim):
+        return True
+    from .lead_focus import continuous
+
+    if not claim or claim["state"] != "released" or not continuous(str(claim["project"])):
+        return False
+    return bool(tx.one(
+        "SELECT 1 FROM events WHERE worker_id=? AND project=? AND tz=? AND ts>=? AND "
+        "(kind='lead_focus_result' OR (kind='lead_focus_release' AND "
+        "json_extract(payload,'$.action') IN ('wait','park'))) LIMIT 1",
+        (claim["worker_id"], claim["project"], claim["tz"], claim["started_at"]),
+    ))
+
+
+def _warm_lead_owner(tx: Any, row: dict[str, Any], after: str) -> str | None:
+    author = row.get("author_worker")
+    if not author:
+        return None
+    worker = tx.one("SELECT revoked_at FROM workers WHERE id=?", (author,))
+    if worker is None or worker["revoked_at"]:
+        return None
+    previous = _last_claim(tx, str(author))
+    if (previous and previous["project"] == row["project"] and previous["tz"] == row["tz"]
+            and str(previous["released_at"] or "") >= after and _lead_continuation(tx, previous)):
+        return str(author)
+    return None
 
 
 _BLIND_BATCH = re.compile(r"TZ-MR-batch-([0-9a-z]+)\Z")
@@ -468,6 +566,15 @@ def _reviewed_before(tx: Any, worker_id: str, review_row: dict[str, Any]) -> boo
     return row is not None
 
 
+def _reviewed_task(tx: Any, worker_id: str, project: str, tz: str) -> bool:
+    """Держал ли воркер ревью этой задачи (review:<tz>, review:<tz>:N)."""
+    row = tx.one(
+        "SELECT 1 AS hit FROM claims WHERE worker_id=? AND project=? AND (tz=? OR tz LIKE ?) LIMIT 1",
+        (worker_id, project, f"review:{tz}", f"review:{tz}:%"),
+    )
+    return row is not None
+
+
 def _active_claim_for_worker(tx: Any, worker_id: str) -> dict[str, Any] | None:
     row = tx.one(
         "SELECT c.id,c.project,c.tz,c.started_at,t.state FROM claims c "
@@ -690,6 +797,33 @@ def _accepted_watch(tx: Any, project: str, tz: str, kind: str) -> bool:
     ) is not None
 
 
+def _dependency_snapshot(tx: Any) -> tuple[list[dict[str, Any]], dict]:
+    """Unfinished graph plus its terminal references, independent of history size.
+
+    Accepted/rejected nodes never recurse into their own needs in world._satisfied.
+    Loading their entire history on every forecast made even a small live queue
+    parse tens of thousands of JSON values twice per extension refresh.
+    """
+    rows = _rows(tx.query(
+        "SELECT project,tz,state,needs,resources FROM tasks "
+        "WHERE state NOT IN ('accepted','rejected')"))
+    present = {(str(row['project']), str(row['tz'])) for row in rows}
+    refs = {(str(row['project']), world.dep_tz(dep))
+            for row in rows for dep in _json_list(row['needs'])}
+    # Frozen tasks may inherit a world's resource through their block reason.
+    blocked = world.block_refs(tx)
+    refs.update((project, ref) for (project, _), targets in blocked.items() for ref in targets)
+    missing = sorted(refs - present)
+    for start in range(0, len(missing), 300):
+        batch = missing[start:start + 300]
+        slots = ','.join('(?,?)' for _ in batch)
+        rows.extend(_rows(tx.query(
+            "SELECT project,tz,state,needs,resources FROM tasks "
+            f"WHERE (project,tz) IN (VALUES {slots})",
+            tuple(value for pair in batch for value in pair))))
+    return rows, blocked
+
+
 def _available(tx: Any, worker_id: str, project: str | None = None,
                skipped: list | None = None, *,
                preview_by_project: bool = False,
@@ -721,6 +855,26 @@ def _available(tx: Any, worker_id: str, project: str | None = None,
     if not candidates:
         return
 
+    # The queue, its launcher preview and fleet.cmd why use this same
+    # availability predicate. Refuse *before* taking a claim on emergency
+    # storage pressure; report the identical reason in every view.
+    from .storage_guard import admission as storage_admission
+    storage_ok, storage_reason = storage_admission()
+    if not storage_ok:
+        if skipped is not None:
+            skipped.extend((str(row["project"]), str(row["tz"]), storage_reason)
+                           for row in candidates)
+        return
+
+    from .lead import is_lead
+    from .instructions import queue_target
+    from .lead_focus import hold_reason as lead_focus_hold
+
+    previous = _last_claim(tx, worker_id) if worker_id else None
+    lead_chat = previous is not None and is_lead(str(previous["tz"]))
+    continuing_lead = lead_chat and _lead_continuation(tx, previous)
+    warm_after = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+
     # Критический путь важнее возраста среди задач одинакового класса/приоритета.
     # Если acceptance одной ready-задачи сразу снимет последнюю dependency с нескольких
     # следующих, её раннее выполнение уменьшает общую длину очереди. При этом fanout НИКОГДА
@@ -732,11 +886,14 @@ def _available(tx: Any, worker_id: str, project: str | None = None,
     # project forecasts without a time cache or weakening per-project admission.
     shared = snapshot if snapshot is not None else {}
     if "tasks" not in shared:
-        shared["tasks"] = _rows(tx.query("SELECT project,tz,state,needs,resources FROM tasks"))
+        shared["tasks"], blocked = _dependency_snapshot(tx)
         shared["world_config"] = world.config()
         shared["index"] = world.build_index(
-            shared["tasks"], world.provided_levels(tx), world.block_refs(tx))
+            shared["tasks"], world.provided_levels(tx), blocked)
     all_tasks = shared["tasks"]
+    owner_targets = shared.setdefault("owner_targets", {})
+    for project_name in {str(row["project"]) for row in candidates} - owner_targets.keys():
+        owner_targets[project_name] = queue_target(tx, project_name)
     world_cfg = shared["world_config"]
     world_set = world.world_names(world_cfg)
     run_scoped = world.run_scoped(world_cfg)
@@ -805,6 +962,7 @@ def _available(tx: Any, worker_id: str, project: str | None = None,
         # обгоняло работу интенций; за ночь платформа заняла 76 % агент-часов, три интенции
         # не прошли ни стадии. Порядок проектов — первым, «доводи начатое» — внутри проекта.
         return (
+            _owner_rank(key[1], owner_targets[key[0]]),
             int(row["project_priority"]),
             kind_rank,
             int(row["priority"]),
@@ -868,6 +1026,24 @@ def _available(tx: Any, worker_id: str, project: str | None = None,
             skipped.append((str(row["project"]), str(row["tz"]), why))
 
     for row in candidates:
+        visual_settings = project_info(str(row["project"]))
+        if (worker_id and _visual_review_required(row, visual_settings)
+                and not _worker_can_read_images(tx, worker_id, settings=visual_settings)):
+            _skip(row, "нужен новый разговор ChatGPT с read_image/read_images")
+            continue
+        candidate_lead = is_lead(str(row["tz"]))
+        if previous and (lead_chat != candidate_lead or (lead_chat and previous["project"] != row["project"])):
+            _skip(row, "другая роль или проект ведущего")
+            continue
+        if candidate_lead:
+            focus_hold = lead_focus_hold(tx, str(row["project"]), str(row["tz"]))
+            if focus_hold:
+                _skip(row, focus_hold)
+                continue
+            warm_owner = _warm_lead_owner(tx, row, warm_after)
+            if warm_owner and warm_owner != worker_id:
+                _skip(row, "ведущий продолжает в текущем чате")
+                continue
         reserved = reserved_by_scope.setdefault(str(row['project']) if preview_by_project else '',[])
         if _json_list(row["needs"]) and unmet_of(row):
             _skip(row, "ждёт задачи")
@@ -908,11 +1084,27 @@ def _available(tx: Any, worker_id: str, project: str | None = None,
                 _skip(row, "ресурс занят")
                 continue
 
+        # 03.11.2026: ревью — это прогон приёмки. Если её команде нужен ресурс scope="run",
+        # занятый прямо сейчас (heavy-build держит check_all), выдача даёт только захват,
+        # блок и повторную выдачу. Ревью ждёт ресурс в очереди, без захвата и без заявки.
+        if row["kind"] == "review" and run_scoped:
+            if "run_busy" not in shared:
+                shared["run_busy"] = world.busy_run_resources()
+            if shared["run_busy"]:
+                waits = [r for r in world.acceptance_run_needs(
+                    _json_list(row.get("acceptance")), world_cfg) if r in shared["run_busy"]]
+                if waits:
+                    _skip(row, f"ждёт ресурс {waits[0]}")
+                    continue
+
         owns = _claimed_paths(row)
-        if any(paths_overlap(owned, claimed) for owned in reserved for claimed in owns):
+        if not candidate_lead and any(paths_overlap(owned, claimed) for owned in reserved for claimed in owns):
             _skip(row, "зона зарезервирована ремонтом")
             continue
+        # 03.11: зона ведущего (TZ-LEAD*) уступает — она не держит выдачу профильных задач,
+        # и они не держат выдачу ведущего; столкновение по файлу разводит guard.check_write.
         if any(paths_overlap(owned, active[0]) and not independent_checkout(active, str(row["project"]))
+               and not (candidate_lead or is_lead(active[3]))
                for owned in owns for active in active_paths):
             # Резерв зоны (07.10.2026): fix/request, упёршийся в чужие захваты, не должен ждать
             # вечно, пока новая работа раз за разом занимает его зону. fix:styk:4 Beta App
@@ -952,8 +1144,16 @@ def _available(tx: Any, worker_id: str, project: str | None = None,
         # 24.09.2026 W292 брал fix:TZ-165 двадцать раз подряд («Задача №20: blocker
         # неизменён, submit не выполнялся»), W272 — семнадцать: finish возвращал задачу
         # в ready, и следующий fleet_take отдавал её тому же чату первой.
-        if worker_id and _held_before(tx, worker_id, str(row["project"]), str(row["tz"])):
+        if (worker_id and not (candidate_lead and continuing_lead)
+                and _held_before(tx, worker_id, str(row["project"]), str(row["tz"]))):
             _skip(row, "этот агент уже держал задачу")
+            continue
+        # 25.11 (№118, живой TZ-511 24.11: W10629 отклонил ревью и через 1 с сам взял ту же задачу).
+        # Возвращённую после reject задачу не получает и её прежний ревьюер — независимость
+        # следующей попытки и следующего ревью.
+        if (worker_id and row["kind"] != "review"
+                and _reviewed_task(tx, worker_id, str(row["project"]), str(row["tz"]))):
+            _skip(row, "этот агент уже ревьюировал задачу")
             continue
         # Один предикат для прогноза и выдачи (аудит Codex 14.10, §5 п.3).
         if worker_id and _triple_sibling_conflict(tx, worker_id, row):
@@ -1152,8 +1352,13 @@ def take_next(store: Any, worker_id: str, project: str | None = None, *,
         if tx.one("SELECT 1 FROM claims WHERE worker_id=? AND state IN ('active','preparing')",
                   (worker_id,)) is not None:
             return None
-        if next(iter(_available(tx, worker_id, project)), None) is None:
-            return None
+        # Empty queue must never acquire the registry writer. Visual-only queues
+        # take the writer below solely to record an actionable refusal event.
+        preview_skipped: list = []
+        if next(iter(_available(tx, worker_id, project, skipped=preview_skipped)), None) is None:
+            if not any("нужен новый разговор ChatGPT" in why
+                       for _, _, why in preview_skipped):
+                return None
     tried: set[tuple[str, str]] = set()
     while True:
         with store.tx() as tx:
@@ -1165,9 +1370,18 @@ def take_next(store: Any, worker_id: str, project: str | None = None, *,
             taken, cap = task_budget(tx, worker_id, chat_budget(store))
             if cap is not None and taken >= cap:
                 return None
-            eligible = list(_available(tx, worker_id, project))
+            skipped: list = []
+            eligible = list(_available(tx, worker_id, project, skipped=skipped))
             choice = next((r for r in eligible if (r[0]["project"], r[0]["tz"]) not in tried), None)
             if choice is None:
+                visual = next(((p, tz, why) for p, tz, why in skipped
+                               if "нужен новый разговор ChatGPT" in why), None)
+                if visual is not None:
+                    tx.record_event(kind="claim_take_refused", project=visual[0],
+                                    tz=visual[1], worker_id=worker_id,
+                                    payload={"reason": visual[2],
+                                             "hint": "обнови инструменты и открой новый разговор",
+                                             "requeued": True})
                 return None
             row, owns, resources = choice
             tried.add((row["project"], row["tz"]))
@@ -1283,11 +1497,15 @@ def peek_projects(store: Any) -> list[tuple[str, Task | None, int]]:
         ]
         first: dict[str,Task] = {}
         counts = dict.fromkeys(names,0)
-        for row,_,_ in _available(tx,'',preview_by_project=True):
+        snapshot: dict[str, Any] = {}
+        for row,_,_ in _available(tx,'',preview_by_project=True, snapshot=snapshot):
             name = str(row['project'])
             if name not in counts: continue
             counts[name] += 1
             if name not in first: first[name] = _blind_preview_task(row)
+    owner_targets = snapshot.get("owner_targets", {})
+    names.sort(key=lambda name: _owner_rank(first[name].tz, owner_targets.get(name, ""))
+               if name in first else 2)
     return [(name,first.get(name),counts[name]) for name in names]
 
 
@@ -1598,6 +1816,15 @@ def block(store: Any, worker_id: str, reason: str, *,
                             "authority": "fleet_task_events",
                         },
                     }
+            elif (not dependencies and
+                  ('ресурс' in reason.casefold() or 'resource' in reason.casefold()) and
+                  not any(term in reason.casefold() for term in ('gallery', 'consent', 'signed apk')) and
+                  (missing := world.down_resources(tx, _json_list(task['resources'])))):
+                # Persist a typed sensor dependency, never infer authority from prose.
+                policy_binding = {
+                    'origin': 'fleet_auto', 'gate': 'resource',
+                    'resource_wait': missing,
+                }
             elif probe.from_reason(reason):
                 # No registered proof yet. The only possible predicate is
                 # supplied by a subsequent *server-owned* block_probe event.
@@ -2493,7 +2720,9 @@ def _record_acceptance_shadow(tx: Any, worker_id: str, claim: dict[str, Any],
                         payload={**payload, "reason": finding, "code": "acceptance_guard"})
 
 
-def _legacy_submission_files(tx: Any, claim: dict[str, Any], worker_id: str) -> dict[str, str | None] | None:
+def _legacy_submission_files(tx: Any, claim: dict[str, Any], worker_id: str,
+                              scope_out: list[str] | None = None,
+                              meta: dict[str, Any] | None = None) -> dict[str, str | None] | None:
     """Capture the candidate's current bytes from the trusted shared checkout.
 
     Only Git changes inside the server-registered task/fix owns are eligible;
@@ -2501,46 +2730,61 @@ def _legacy_submission_files(tx: Any, claim: dict[str, Any], worker_id: str) -> 
     the caller records the resulting receipt inside the *same* transaction as
     submit. None means we cannot attest to the candidate, so integration will
     defer rather than interpret current working-tree bytes as accepted bytes.
+
+    Печать не зависит от флага commit (04.11.2026): печать — аттестация сданных
+    байтов, а не коммит. Пока Nova VPN жил с commit=false, ни одна сдача не
+    получила печати, и каждое включение коммита поднимало хвост revalidate:*
+    (35 задач 03.11, ещё 10 — 04.11) по приёмкам, которые уже прошли ревью.
+
+    07.11 (LEAD-SYSTEM-DESIGN 1.3, печать = снимок): meta получает
+    ``refused`` — типизированную причину None (раньше молчаливое «печати нет», и интеграция
+    вечно ждала ревалидации); ``bytes`` — прочитанные для печати байты, из них вызывающий
+    синхронно пишет git-blob-ы снимка (не перечитывая дерево); ``truncated`` — сколько путей
+    было при усечении до MAX_COMMIT_PATHS; ``excluded`` — пути вне печати (STATE.md ведущего —
+    генерируемая проекция, её байты меняются каждый раунд и не принадлежат сдаче).
     """
-    from .goals import project_info
     from .integrate import MAX_COMMIT_PATHS, _porcelain_files, _rel_pathspec
 
-    project, tz = str(claim["project"]), str(claim["tz"])
-    if project_info(project).get("commit") is not True:
+    info: dict[str, Any] = meta if meta is not None else {}
+
+    def refuse(reason: str) -> None:
+        info["refused"] = reason
         return None
+
+    project, tz = str(claim["project"]), str(claim["tz"])
     taken = tx.one(
         "SELECT payload FROM events WHERE kind='take' AND worker_id=? "
         "AND project=? AND tz=? ORDER BY id DESC LIMIT 1",
         (worker_id, project, tz),
     )
     if taken is None:
-        return None
+        return refuse("no_take_event")
     try:
         provenance = json.loads(str(taken["payload"]))
     except (TypeError, ValueError):
-        return None
+        return refuse("take_payload_invalid")
     if (not isinstance(provenance, dict)
             or provenance.get("claim_id") != claim["id"]):
-        return None
+        return refuse("take_claim_mismatch")
     context = provenance.get("claim_context")
     if (context is not None and (not isinstance(context, dict)
                                  or context.get("mode") != "shared")):
         # Isolated claims use claim_accept; neither a naked take event nor a
         # mutable project feature flag may downgrade an isolated submission.
-        return None
+        return refuse("isolated_claim")
     row = tx.one("SELECT root FROM projects WHERE name=? AND active=1", (project,))
     if row is None:
-        return None
+        return refuse("project_inactive")
     root = str(row["root"])
     source_root = Path(root)
     try:
         # On Windows a directory junction has is_symlink() == False. Never
         # traverse any reparse-point alias when attesting submitted bytes.
         if source_root.is_symlink() or source_root.is_junction():
-            return None
+            return refuse("root_is_link")
         canonical_root = source_root.resolve(strict=True)
     except (OSError, ValueError):
-        return None
+        return refuse("root_unreadable")
     base = task_root(tz)
     tasks = tx.query(
         "SELECT tz,owns FROM tasks WHERE project=? AND (tz=? OR tz LIKE ?)",
@@ -2558,24 +2802,55 @@ def _legacy_submission_files(tx: Any, claim: dict[str, Any], worker_id: str) -> 
         "SELECT path_norm FROM claim_paths WHERE claim_id=?", (claim["id"],)))
     specs = sorted({spec for path in owned
                     if (spec := _rel_pathspec(path, root)) is not None})
+    if scope_out is not None:
+        # Область печати: файл в ней, но не в печати, был чистым при сдаче (05.11).
+        scope_out.extend(sorted({spec.split(")", 1)[1] for spec in specs}))
     if not specs:
         return {}
+    captured: dict[str, bytes] = {}
+    budget = SEAL_BYTES_BUDGET
     try:
         status = subprocess.run(
             ["git", "-c", "core.quotepath=false", "status", "--porcelain", "-z", "-uall", "--", *specs],
             cwd=root, capture_output=True, timeout=15,
         )
         if status.returncode:
-            return None
+            return refuse("git_status_failed")
         files = _porcelain_files(status.stdout.decode("utf-8", errors="surrogateescape"))
+        # 08.11: пути porcelain — от верха репозитория (ключи печати сверяет интегратор так же),
+        # а у проекта-подпапки (Main Hub — `_todo/hub-fleet` внутри пульта) байты лежат под
+        # корнем проекта: `root / путь` видел каждый файл «удалённым».
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=root,
+                             capture_output=True, timeout=15)
+        if top.returncode:
+            return refuse("git_status_failed")
+        prefix = canonical_root.relative_to(
+            Path(top.stdout.decode("utf-8").strip()).resolve(strict=True)).as_posix()
+        prefix = "" if prefix == "." else prefix + "/"
+
+        def local(rel: str) -> str | None:
+            if not prefix:
+                return rel
+            return rel[len(prefix):] if rel.casefold().startswith(prefix.casefold()) else None
+
+        excluded = sorted(rel for rel in files if (loc := local(rel)) is not None and _outside_seal(loc))
+        if excluded:
+            info["excluded"] = excluded
+            files = [rel for rel in files if rel not in excluded]
         if len(files) > MAX_COMMIT_PATHS:
-            return None
+            # Флаг усечения вместо молчаливого None: печать первых путей сохраняет байты,
+            # а интегратор видит типизированное «зона шире предела».
+            info["truncated"] = len(files)
+            files = sorted(files)[:MAX_COMMIT_PATHS]
         sealed: dict[str, str | None] = {}
         for rel in files:
-            relative = Path(rel)
+            loc = local(rel)
+            if loc is None:
+                return refuse("path_outside_root")
+            relative = Path(loc)
             if (relative.is_absolute() or not relative.parts or ".." in relative.parts
                     or relative.parts[0].casefold() == ".git"):
-                return None
+                return refuse("unsafe_path")
             file = source_root / relative
             # Symlinks alone are insufficient: an NTFS junction is not a
             # symlink, yet can map an in-owns path to an external file.
@@ -2583,24 +2858,34 @@ def _legacy_submission_files(tx: Any, claim: dict[str, Any], worker_id: str) -> 
             for part in relative.parts:
                 walk /= part
                 if walk.is_symlink() or walk.is_junction():
-                    return None
+                    return refuse("path_is_link")
             try:
                 file.resolve(strict=False).relative_to(canonical_root)
             except ValueError:
-                return None
+                return refuse("path_outside_root")
             if file.is_file():
-                digest = hashlib.sha256()
-                with file.open("rb") as source:
-                    for block in iter(lambda: source.read(1024 * 1024), b""):
-                        digest.update(block)
-                sealed[rel] = digest.hexdigest()
+                data = file.read_bytes()
+                sealed[rel] = hashlib.sha256(data).hexdigest()
+                if len(data) <= budget:
+                    captured[rel] = data
+                    budget -= len(data)
             elif not file.exists():
                 sealed[rel] = None
             else:
-                return None
+                return refuse("not_a_file")
+        info["bytes"] = captured
         return sealed
-    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
-        return None
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as exc:
+        return refuse(f"{type(exc).__name__}")
+
+
+# Байты печати держатся в памяти до записи blob-ов сразу после транзакции сдачи (1.3).
+SEAL_BYTES_BUDGET = 64 * 1024 * 1024
+
+
+def _outside_seal(rel: str) -> bool:
+    """STATE.md ведущего — проекция, а не продукт сдачи (LEAD-SYSTEM-DESIGN 1.3)."""
+    return rel.replace("\\", "/").casefold() == "todo/lead/state.md"
 
 
 def submit(store: Any, worker_id: str, note: str, *,
@@ -2621,8 +2906,12 @@ def submit(store: Any, worker_id: str, note: str, *,
         if task_kind is not None and task_kind["kind"] == "cross_review":
             raise ValueError("cross_review: передай типизированный verdict через "
                              "fleet_send(kind='cross_review_verdict'), не fleet_submit")
+        from .lead import resubmit_reason as _lead_resubmit_reason
+        from .lead import submit_refusal as _lead_submit_refusal
         refusal = (
-            _empty_submit_reason(store, tx, worker_id, claim)
+            _lead_resubmit_reason(tx, claim)
+            or _lead_submit_refusal(tx, claim, note)
+            or _empty_submit_reason(store, tx, worker_id, claim)
             or _unproven_submit_reason(store, tx, worker_id, claim, note)
             or _triage_submit_reason(tx, worker_id, claim)
         )
@@ -2673,39 +2962,45 @@ def submit(store: Any, worker_id: str, note: str, *,
         # The bytes seal is server-owned, not synthesized by the reviewer or
         # author. Keep its link to the *exact* submit event in this transaction
         # so a failed submission cannot leave a usable orphan receipt.
-        sealed_files = _legacy_submission_files(tx, claim, worker_id)
-        if sealed_files is not None:
-            submitted = tx.one(
-                "SELECT id FROM events WHERE project=? AND tz=? AND kind='submit' "
-                "AND worker_id=? ORDER BY id DESC LIMIT 1",
-                (claim["project"], claim["tz"], worker_id),
+        seal_scope: list[str] = []
+        seal_meta: dict[str, Any] = {}
+        sealed_files = _legacy_submission_files(tx, claim, worker_id, seal_scope, seal_meta)
+        submitted = tx.one(
+            "SELECT id FROM events WHERE project=? AND tz=? AND kind='submit' "
+            "AND worker_id=? ORDER BY id DESC LIMIT 1",
+            (claim["project"], claim["tz"], worker_id),
+        )
+        submit_id = int(submitted["id"]) if submitted is not None else None
+        if submit_id is not None and sealed_files is not None:
+            seal_payload: dict[str, Any] = {"submit_id": submit_id, "files": sealed_files,
+                                            "scope": seal_scope}
+            for key in ("truncated", "excluded"):
+                if key in seal_meta:
+                    seal_payload[key] = seal_meta[key]
+            tx.record_event(
+                kind="submission_file_seal", tool="fleet",
+                project=str(claim["project"]), tz=str(claim["tz"]), payload=seal_payload,
             )
-            if submitted is not None:
-                tx.record_event(
-                    kind="submission_file_seal", tool="fleet",
-                    project=str(claim["project"]), tz=str(claim["tz"]),
-                    payload={"submit_id": int(submitted["id"]), "files": sealed_files},
-                )
-        # TZ-20: durable outbox, inside the submit transaction.  Gemini network IO
-        # must run outside this lock; a controller can replay this request safely.
-        # A model verdict never replaces the independent fleet review above.
-        task = tx.one("SELECT kind FROM tasks WHERE project=? AND tz=?",
-                      (claim["project"], claim["tz"]))
-        worker = tx.one("SELECT kind FROM workers WHERE id=?", (worker_id,))
-        author_model = str(worker["kind"]) if worker is not None else ""
-        if (task is not None and str(task["kind"]) in {"work", "fix", "request"}
-                and author_model in {"chatgpt", "gemini"}):
-            from . import evidence
-
-            paths = [str(r["path_norm"]) for r in tx.query(
-                "SELECT path_norm FROM claim_paths WHERE claim_id=?", (claim["id"],))]
-            tx.record_event(kind="cross_review_requested", worker_id=worker_id,
-                            project=str(claim["project"]), tz=str(claim["tz"]),
-                            payload={"claim_id": int(claim["id"]),
-                                     "tree_sha": evidence.tree_hash(paths),
-                                     "author_model": author_model,
-                                     "outcome_sha": hashlib.sha256(
-                                         note.encode("utf-8")).hexdigest()})
+        elif submit_id is not None and seal_meta.get("refused"):
+            # 07.11 (1.3): причина вместо молчания — интегратор пишет её в reason_code.
+            tx.record_event(
+                kind="submission_seal_refused", tool="fleet",
+                project=str(claim["project"]), tz=str(claim["tz"]),
+                payload={"submit_id": submit_id, "reason": seal_meta["refused"]},
+            )
+    from . import snapshot
+    captured = seal_meta.get("bytes")
+    if submit_id is not None and sealed_files is not None and captured:
+        # 07.11 (LEAD-SYSTEM-DESIGN 1.3): печать = снимок. Blob-ы пишутся сразу из тех же байтов,
+        # что дали sha печати, а не из дерева «через секунду» в фоне: ведущий успевал переписать
+        # файл, и интеграция не находила байтов печати.
+        snapshot.seal_snapshot(store, str(claim["project"]), str(claim["tz"]), worker_id,
+                               int(claim["id"]), submit_id, sealed_files, captured)
+        return
+    # 04.11.2026 (FLEET-SERVICE-WORK §7 шаг 2, тень): git-снимок по записям захвата — для сдач
+    # без печати (изолированные захваты, отказ печати).
+    snapshot.start_submission_shadow(store, str(claim["project"]), str(claim["tz"]),
+                                     worker_id, int(claim["id"]))
 
 
 def _is_imported_claim(tx: Any, row: dict[str, Any]) -> bool:
@@ -2809,8 +3104,13 @@ def recover_stale_with_work(store: Any, *, silence_min: int = 180) -> list[Task]
     revokes the vanished worker so it cannot resume writing, preserves the shared
     worktree as-is, and requeues the exact task for continuation.
     """
+    from .owner import owner_ids_for_store
+
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=silence_min)
     returned: list[Task] = []
+    # Номер с действующей выдачей роли владельца не отзываем (20.11.2026): захват уходит в
+    # очередь, но вкладка владельца, молчащая ночью, сохраняет номер и роль.
+    owners = owner_ids_for_store(store)
     with store.tx() as tx:
         rows = _rows(
             tx.query(
@@ -2864,8 +3164,9 @@ def recover_stale_with_work(store: Any, *, silence_min: int = 180) -> list[Task]
                         (now, row["project"], row["tz"]),
                     ),
                     (
-                        "UPDATE workers SET revoked_at=COALESCE(revoked_at,?),revoke_reason=? WHERE id=?",
-                        (now, reason, row["worker_id"]),
+                        "UPDATE workers SET revoked_at=COALESCE(revoked_at,?),revoke_reason=? "
+                        "WHERE id=? AND ?=0",
+                        (now, reason, row["worker_id"], int(str(row["worker_id"]) in owners)),
                     ),
                 ],
                 event=_event(
@@ -2876,6 +3177,7 @@ def recover_stale_with_work(store: Any, *, silence_min: int = 180) -> list[Task]
                     silence_min=silence_min,
                     automatic_recovery=True,
                     preserved_work=True,
+                    owner_kept=str(row["worker_id"]) in owners,
                 ),
             )
             returned.append(_task(row, state="ready"))
@@ -3498,7 +3800,13 @@ def thaw_frozen(store: Any, *, after_min: int = THAW_AFTER_MIN, max_thaws: int =
     now_dt = datetime.now(timezone.utc)
     thawed: list[str] = []
     world_cfg = world.config()
-    with store.tx() as tx:
+    from .reactivation_plan import ThawPlanner
+    with store.read() as reader:
+        tx = ThawPlanner(reader)
+        # The planner caches raw project rows, but rebuilding two dicts from
+        # those rows for every frozen task still cost ~290k conversions/tick.
+        # This is a single read snapshot; queued changes apply only afterwards.
+        project_state_cache: dict[str, tuple[dict[str, str], dict[str, str]]] = {}
         # judgment.apply_accepted in older fleets can requeue a watchdog
         # decision after an apply error. Its review accept remains immutable:
         # restore the terminal state before any periodic thaw/retry selection.
@@ -3509,6 +3817,7 @@ def thaw_frozen(store: Any, *, after_min: int = THAW_AFTER_MIN, max_thaws: int =
             "AND e.tz=t.tz AND e.kind='accept')"
         ))
         for row in terminal:
+            tx.begin_subject(str(row['project']), str(row['tz']))
             tx.change(
                 "UPDATE tasks SET state='accepted',updated_at=? "
                 "WHERE project=? AND tz=? AND state IN ('ready','frozen')",
@@ -3523,6 +3832,7 @@ def thaw_frozen(store: Any, *, after_min: int = THAW_AFTER_MIN, max_thaws: int =
         ))
         for task in frozen:
             project, tz = str(task["project"]), str(task["tz"])
+            tx.begin_subject(project, tz)
             last = tx.one(
                 "SELECT id,ts,kind,payload FROM events WHERE project=? AND tz=? "
                 "AND kind IN ('block','freeze','thaw','reactivate','approve','auto_reactivate') "
@@ -3544,6 +3854,29 @@ def thaw_frozen(store: Any, *, after_min: int = THAW_AFTER_MIN, max_thaws: int =
             reason = str(payload.get("reason") or "")
             if (payload.get("origin") in {"owner", "guard", "manual"}
                     or payload.get("gate") in {"security", "manual"}):
+                continue
+            # Sensor-bound resource waits are distinct from operator/manual gates.
+            # Only a newer UP event for every originally missing resource is authority.
+            waiting = payload.get('resource_wait')
+            if (payload.get('origin') == 'fleet_auto' and payload.get('gate') == 'resource'
+                    and isinstance(waiting, list) and waiting
+                    and all(isinstance(r, str) and r in _json_list(task['resources'])
+                            and world_cfg.get(r, {}).get('sensor') for r in waiting)):
+                sensed_wait = world.states(tx, waiting)
+                if all(st == world.UP and ts > str(last['ts'])
+                       for st, ts in sensed_wait.values()):
+                    tx.change(
+                        "UPDATE tasks SET state='ready',updated_at=? "
+                        "WHERE project=? AND tz=? AND state='frozen'",
+                        (_now(), project, tz),
+                        event=_event('resource_return', worker_id=None,
+                                     project=project, tz=tz,
+                                     blocked_event_id=int(last['id']),
+                                     origin='fleet_auto',
+                                     reason='ресурс ' + ', '.join(waiting) + ' вернулся',
+                                     resource_wait=waiting),
+                    )
+                    thawed.append(f"{project}/{tz}: ресурс {', '.join(waiting)} вернулся")
                 continue
             # New structured blocks are never thawed by a textual reason,
             # age-based retry, or an unverified external signal.
@@ -3632,10 +3965,18 @@ def thaw_frozen(store: Any, *, after_min: int = THAW_AFTER_MIN, max_thaws: int =
             if until and _TASK_REF.fullmatch(until):
                 structured.append(until)
             refs = list(dict.fromkeys(ref for ref in structured if ref.upper() != tz.upper()))
-            project_tasks = _rows(tx.query("SELECT tz,state FROM tasks WHERE project=?", (project,)))
-            states = {str(r["tz"]).upper(): str(r["state"]) for r in project_tasks}
-            canonical_refs = {str(r["tz"]).upper(): str(r["tz"]) for r in project_tasks}
+            cached_states = project_state_cache.get(project)
+            if cached_states is None:
+                project_tasks = tx.project_tasks(project)
+                states = {str(r["tz"]).upper(): str(r["state"]) for r in project_tasks}
+                canonical_refs = {str(r["tz"]).upper(): str(r["tz"]) for r in project_tasks}
+                project_state_cache[project] = (states, canonical_refs)
+            else:
+                states, canonical_refs = cached_states
             known = [ref for ref in refs if ref.upper() in states]
+            for ref in known:
+                tx.one('SELECT state FROM tasks WHERE project=? AND tz=?',
+                       (project,canonical_refs[ref.upper()]))
             newly_accepted = [
                 ref for ref in known if states[ref.upper()] == "accepted" and tx.one(
                     # Resolve case through the small task index first. UPPER(tz)
@@ -3720,7 +4061,21 @@ def thaw_frozen(store: Any, *, after_min: int = THAW_AFTER_MIN, max_thaws: int =
                 ),
             )
             thawed.append(f"{project}/{tz}: {why}")
-    return thawed
+    def validate(writer: Any, event: dict) -> bool:
+        data = event.get('payload') or {}
+        if isinstance(data, str):
+            data = json.loads(data)
+        if event.get('kind') == 'auto_reactivate' and data.get('blocked_event_id'):
+            blocked = writer.one('SELECT id,ts,kind,payload FROM events WHERE id=?',
+                                 (data['blocked_event_id'],))
+            if blocked is None:
+                return False
+            return _verified_reactivation(writer, event['project'], event['tz'], blocked,
+                                          json.loads(blocked['payload']), datetime.now(timezone.utc)) is not None
+        return True
+
+    applied = tx.apply(store, validate)
+    return [line for line in thawed if any(line.startswith(f'{p}/{tz}:') for p, tz in applied)]
 
 
 _OPEN_STATES = ("draft", "ready", "taken", "submitted", "frozen")
@@ -3786,9 +4141,11 @@ def reopen_orphan_reviews(store: Any) -> list[str]:
 
     Иначе задача навсегда `submitted`: её никто не возьмёт, и всё, что от неё зависит, стоит.
     """
-    from .review import _open_review_tx, _review_target
+    from .lead import is_progress_submission
+    from .review import _open_review_tx, _review_target, open_review
 
     reopened: list[str] = []
+    progress: list[tuple[str, str]] = []
     with store.tx() as tx:
         submitted = _rows(tx.query(
             "SELECT project,tz FROM tasks WHERE state='submitted' AND kind<>'review' ORDER BY project,tz"
@@ -3815,12 +4172,23 @@ def reopen_orphan_reviews(store: Any) -> list[str]:
             project, tz = str(row["project"]), str(row["tz"])
             if (project, tz) in reviewed or (project, family_root(tz)) in fixing:
                 continue
+            if is_progress_submission(tx, project, tz):
+                # №48 B1: прогресс ведущего — тем же маршрутом, что и submit (progress_accept),
+                # а не прямым LLM-ревью: иначе ревью-сирота без источника.
+                progress.append((project, tz))
+                continue
             review_tz = _open_review_tx(tx, project, tz)
             tx.record_event(
                 kind="review_reopen", worker_id=None, project=project, tz=tz,
                 payload={"review": review_tz, "why": "submitted без открытого ревью и без открытого fix"},
             )
             reopened.append(f"{project}/{tz}")
+    for project, tz in progress:
+        try:
+            routed = open_review(store, project, tz)  # идемпотентно: accept только из submitted
+        except ValueError:
+            continue  # задачу уже приняли/переоткрыли между транзакциями
+        reopened.append(f"{project}/{tz}:{routed}")
     return reopened
 
 

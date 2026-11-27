@@ -27,6 +27,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from dev_mcp.json_book import read_json, write_json
 from typing import Any, Callable
 
 LOG = logging.getLogger(__name__)
@@ -592,7 +593,7 @@ class Board:
     # -- state -----------------------------------------------------------------------------
     def _load(self) -> dict:
         try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            data = read_json(self.state_path, strict=True)
             if isinstance(data, dict):
                 return data
         except (OSError, ValueError):
@@ -603,9 +604,7 @@ class Board:
     def _save(self) -> None:
         self.state["ledger"] = self.state["ledger"][-2000:]
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.state_path)
+        write_json(self.state_path, self.state)
 
     def _wrote(self, kind: str, object_id: str) -> None:
         self.state["ledger"].append({"kind": kind, "id": object_id, "at": time.time()})
@@ -1272,6 +1271,59 @@ class Board:
         if isinstance(answer, dict) and answer.get("id"):
             self._wrote("comment", answer["id"])
 
+    def _world_needs(self, column: str, open_ids: set[str]) -> None:
+        """Что может сделать только владелец в мире (телефон, стенд) — задачей с напоминанием.
+
+        05.11.2026: о выключенной отладке PHONEB владелец узнавал от оператора в чате. Теперь
+        одна задача на эпизод: появилась — напоминание на телефон; текст меняется — правка без
+        нового звонка; ресурс вернулся — система сама закрывает задачу. Владелец закрыл сам, а
+        датчик всё ещё down, — комментарий с тем, что видит датчик, без новой задачи до
+        следующего эпизода.
+        """
+        from dev_mcp.fleet import world
+        try:
+            needs = {n["resource"]: n for n in world.owner_needs(self.store)}
+        except Exception:  # noqa: BLE001 — доска важнее одной строки
+            LOG.exception("world needs unavailable")
+            return
+        known = self.state.setdefault("world_needs", {})
+        for name, rec in list(known.items()):
+            if name in needs:
+                continue
+            if rec.get("id") in open_ids:
+                try:
+                    self.api.call("complete_task", {"project_id": self.state["list_id"], "task_id": rec["id"]})
+                except BoardUnavailable:
+                    pass
+            del known[name]
+        for name, need in needs.items():
+            projects = sorted({p for p, _ in need["waiting"]})
+            title = f"Нужно от тебя: {name} — ждут {len(need['waiting'])} задач"
+            content = (need["detail"] + "\n\n" + (need["need"] + "\n\n" if need["need"] else "")
+                       + "Лежит с " + need["since"][:16].replace("T", " ") + " UTC · проекты: "
+                       + ", ".join(projects) + "\nЗакроется само, когда датчик увидит ресурс.")
+            rec = known.get(name)
+            if rec is None:
+                stamp = self.clock().astimezone(timezone(timedelta(hours=3))).isoformat()
+                task = self.api.call("create_task", {"task": {
+                    "projectId": self.state["list_id"], "columnId": column, "kind": "TEXT",
+                    "title": title, "content": content, "priority": 5, "startDate": stamp,
+                    "dueDate": stamp, "timeZone": "Europe/Moscow", "isAllDay": False,
+                    "reminders": ["TRIGGER:PT0S"], "sortOrder": -300}})
+                self._wrote("world_need", task["id"])
+                known[name] = {"id": task["id"], "since": need["since"], "hash": _digest([title, content])}
+                continue
+            if rec["id"] not in open_ids:
+                if not rec.get("owner_closed"):
+                    rec["owner_closed"] = True
+                    self._comment(rec["id"], "Датчик всё ещё не видит ресурс: " + need["detail"])
+                continue
+            digest = _digest([title, content])
+            if rec.get("hash") != digest:
+                self.api.call("update_task", {"task_id": rec["id"], "task": {
+                    "id": rec["id"], "projectId": self.state["list_id"], "title": title, "content": content}})
+                rec["hash"] = digest
+
     def _stamp(self) -> str:
         return self.clock().strftime("%d.%m %H:%M")
 
@@ -1285,6 +1337,7 @@ class Board:
         self._board = self.api.call("filter_tasks", {"filter": {
             "projectIds": [self.state["list_id"]], "status": [0]}}) or []
         self.read_owner_cards(self._board)
+        open_ids = {str(t.get("id")) for t in self._board if isinstance(t, dict)}
         pins = {}
         keys_by_column = {cid: key for key, cid in self.state["columns"].items()}
         for rec in self.state.get("owner_cards", {}).values():
@@ -1333,6 +1386,7 @@ class Board:
         self.read_owner_items(sections)
         self.read_comments()
         self._board = None
+        self._world_needs(system, open_ids)
         self._upsert_note("system", system, "▶ Флот", "\n".join([*system_lines, f"— сверка {stamp}"]), -100)
         self._upsert_note("help", system, "Как работать с доской", HELP, -200)
         self._save()
@@ -1353,8 +1407,7 @@ STATUS_PATH = STATE_PATH.with_name("ticktick-board-status.json")
 
 def _status(data: dict) -> None:
     try:
-        STATUS_PATH.write_text(json.dumps({"at": datetime.now(timezone.utc).isoformat(), **data},
-                                          ensure_ascii=False), encoding="utf-8")
+        write_json(STATUS_PATH, {"at": datetime.now(timezone.utc).isoformat(), **data})
     except OSError:
         pass
 

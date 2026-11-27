@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
+import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,27 +47,60 @@ def _now() -> str:
 
 def _files(root: Path) -> dict[str, dict[str, str]]:
     directory = root/'ToDo'/'tz'
+    # Verify every parent before enumerating. DirEntry's non-following stat is
+    # then enough for unchanged regular files: a cached spec is never re-read.
     if not _link_free(root, directory) or not directory.is_dir():
         return {}
     result = {}
-    for path in sorted(directory.glob('TZ-*.md')):
+    with os.scandir(directory) as scan:
+        entries = sorted(
+            (entry for entry in scan
+             if entry.name.casefold().startswith('tz-')
+             and entry.name.casefold().endswith('.md')),
+            key=lambda entry: entry.name.casefold(),
+        )
+    for entry in entries:
+        path = Path(entry.path)
         match = _ID.match(path.stem)
         if not match:
             continue
         rel = path.relative_to(root).as_posix()
         record = {'tz': match[1].upper(), 'sha': '', 'error': ''}
-        if not _safe_draft(root, path) or path.stat().st_size > 1_000_000:
+        # Do not follow file symlinks, even when their target matches cached
+        # (mtime, size). Replaced files also invalidate the cache via inode.
+        if not entry.is_file(follow_symlinks=False):
             record['error'] = 'unsafe_or_oversize_spec'
+            _PARSED.pop(str(path), None)
         else:
-            record['sha'] = hashlib.sha256(path.read_bytes()).hexdigest()
-            try:
-                item = parse_spec(str(path))
-                if item.tz.casefold() != match[1].casefold():
-                    record['error'] = 'filename_header_identity_mismatch'
-            except (OSError, SpecError, ValueError) as exc:
-                record['error'] = str(exc)[:300]
+            st = entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 1_000_000:
+                record['error'] = 'unsafe_or_oversize_spec'
+                _PARSED.pop(str(path), None)
+            else:
+                key = (st.st_mtime_ns, st.st_size, st.st_ino)
+                cached = _PARSED.get(str(path))
+                if cached is not None and cached[0] == key:
+                    result[rel] = dict(cached[1])
+                    continue
+                # Fresh/changed specs must still pass the full ancestry guard
+                # before either byte read or parser access.
+                if not _safe_draft(root, path):
+                    record['error'] = 'unsafe_or_oversize_spec'
+                    _PARSED.pop(str(path), None)
+                else:
+                    record['sha'] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    try:
+                        item = parse_spec(str(path))
+                        if item.tz.casefold() != match[1].casefold():
+                            record['error'] = 'filename_header_identity_mismatch'
+                    except (OSError, SpecError, ValueError) as exc:
+                        record['error'] = str(exc)[:300]
+                    _PARSED[str(path)] = (key, dict(record))
         result[rel] = record
     return result
+
+
+_PARSED: dict[str, tuple[tuple[int, int, int], dict[str, str]]] = {}
 
 
 def adopt(store: Any, project: str, tzs: list[str]) -> None:
@@ -106,6 +141,8 @@ def _issue(store: Any, project: str, root: Path, tz: str, detail: str,
                 'номера в одно полное ТЗ, сохрани все совместимые требования и проверки. '
                 'Оставь у прежнего имени обычную ссылку без YAML-заголовка. Не выбирай по '
                 'алфавиту/mtime, не ослабляй приёмку и не выполняй LIVE/OWNER действия. '
+                'Не сужай owns и не дописывай запретов/ограничений полномочий: зона записи — '
+                'решение владельца, а не способ снять конфликт. '
                 'Если требования противоречат друг другу, опиши конкретную развилку через block. '
                 'Контроллер сам повторит строгую регистрацию после исправления.\n'
                 'Файлы: ' + ', '.join(paths))
@@ -177,12 +214,23 @@ def _demanded(tx: Any, project: str) -> set[str]:
     return out
 
 
+_RETRY: dict[int, Any] = {}
+
+
 def tick(store: Any, policy: Any, runner: Any, *, max_registrations: int = 8) -> dict[str, Any]:
     """Bounded imports; slow filesystem/probes never run inside a write lock."""
     result: dict[str, Any] = {'registered': [], 'conflicts': [], 'deferred': [], 'baselined': []}
     if runner is None or policy is None:
         return result
     install_schema(store)
+    from .integration_retry import RetryPolicy
+    from .integrate import Integrator
+    # 05.11.2026: a fresh policy per tick forgot its early-wake rate limit; TZ-281 re-ran
+    # a full strict preflight every 1-5 min while its dependencies kept emitting events.
+    retry = _RETRY.get(id(store))
+    if retry is None or retry.store is not store:
+        retry = _RETRY[id(store)] = RetryPolicy(store, Integrator._head)
+    retry.begin_tick()
     with store.read() as tx:
         projects = [dict(r) for r in tx.query(
             'SELECT p.name,p.root FROM projects p LEFT JOIN queue_sources s ON s.project=p.name '
@@ -230,6 +278,16 @@ def tick(store: Any, policy: Any, runner: Any, *, max_registrations: int = 8) ->
             if len(paths) > 1 and tz in known:
                 _issue(store, name, root, tz, 'duplicate_published_specs', paths)
                 result['conflicts'].append(name + '/' + tz)
+        # 28.10: файл увидели до ручной регистрации (bootstrap) — открылся «ремонт» определения;
+        # после регистрации он держал зону ТЗ и блокировал саму задачу. Зарегистрированное ТЗ
+        # без второго определения ремонта не требует.
+        with store.read() as tx:
+            stale = [str(r['tz']) for r in tx.query(
+                "SELECT tz FROM queue_source_issues WHERE project=? AND state!='resolved'", (name,))]
+        for tz in stale:
+            if tz.upper() in known and len(duplicates.get(tz.upper(), [])) <= 1:
+                _resolve(store, name, tz)
+                _retire_obsolete_repair(store, name, tz, [])
         # A rename of a historical or completed spec is never new work.
         for tz in sorted(pending - known):
             entries = {p: r for p, r in inventory.items() if r['tz'] == tz}
@@ -246,7 +304,18 @@ def tick(store: Any, policy: Any, runner: Any, *, max_registrations: int = 8) ->
                 _issue(store, name, root, tz, detail, sorted(entries))
                 result['conflicts'].append(name + '/' + tz)
                 continue
+            with store.read() as tx:
+                last_retry = tx.one("SELECT payload FROM events WHERE kind='queue_source_retry' "
+                                    "AND project=? AND tz=? ORDER BY id DESC LIMIT 1",(name,tz))
+            previous_retry = json.loads(last_retry['payload']) if last_retry else {}
+            if previous_retry and not retry.due(name,tz,previous_retry):
+                result['deferred'].append(name+'/'+tz)
+                continue
             # Tombstones have no YAML and may accompany the one real spec.
+            from .generators import enabled as task_generators_enabled
+            if not task_generators_enabled():
+                result['deferred'].append(name + '/' + tz)
+                continue
             if budget <= 0:
                 result['deferred'].append(name + '/' + tz)
                 continue
@@ -270,6 +339,10 @@ def tick(store: Any, policy: Any, runner: Any, *, max_registrations: int = 8) ->
                 result['deferred'].append(name + '/' + tz)
                 dependencies = sorted({dep for report in registration['preflight'].values()
                                        for dep in report['dependencies']})
+                wait = {'waiting_for':dependencies,'deferred':valid,'reason':'source_dependencies'}
+                wait['retry'] = retry.schedule(name,tz,wait,previous_retry)
+                with store.tx() as tx:
+                    tx.record_event(kind='queue_source_retry',project=name,tz=tz,payload=wait)
                 _retire_obsolete_repair(store, name, tz, dependencies)
                 with store.tx() as tx:
                     tx.change("UPDATE queue_source_issues SET state='waiting_dependencies',updated_at=? "
@@ -295,21 +368,41 @@ def tick(store: Any, policy: Any, runner: Any, *, max_registrations: int = 8) ->
     return result
 
 
+def _narrowed_owns(store: Any, project: str, tz: str, declared: Any) -> list[str]:
+    """Registered owns the repaired definition no longer covers (28.10: TZ-LEAD lost client/app)."""
+    from .model import paths_overlap
+    with store.read() as tx:
+        target = tx.one('SELECT owns FROM tasks WHERE project=? AND tz=?', (project, tz))
+    if target is None:
+        return []
+    try:
+        registered = [str(x) for x in json.loads(target['owns'] or '[]')]
+    except ValueError:
+        return []
+    declared = [str(x) for x in declared]
+    return [r for r in registered if not any(paths_overlap(r, d) for d in declared)]
+
+
 def submission_refusal(store: Any, worker_id: str) -> str:
     """A source repair cannot be submitted while its source is still ambiguous."""
     with store.read() as tx:
-        row = tx.one('SELECT t.body,p.root FROM claims c JOIN tasks t ON t.project=c.project AND t.tz=c.tz '
+        row = tx.one('SELECT t.body,p.root,c.project FROM claims c JOIN tasks t ON t.project=c.project AND t.tz=c.tz '
                      'JOIN projects p ON p.name=c.project WHERE c.worker_id=? AND c.state=\'active\'', (worker_id,))
     if row is None or not row['body'].startswith('[fleet-queue-source] target='):
         return ''
     tz = row['body'].splitlines()[0].split('target=', 1)[1]
     root = Path(row['root'])
+    row_project = row['project']
     files = _files(root)
     valid = [path for path, entry in files.items() if entry['tz'] == tz and not entry['error']]
     if len(valid) != 1:
         return f'Источник {tz} ещё неоднозначен: действующих определений {len(valid)}; исправь до сдачи.'
     from .spec_preflight import _command
     task = parse_spec(str(root/valid[0]))
+    narrowed = _narrowed_owns(store, row_project, tz, task.owns)
+    if narrowed:
+        return (f'Источник {tz}: ремонт убрал из owns зарегистрированные пути ({", ".join(narrowed[:6])}). '
+                'Зону записи сужает только владелец: верни их; противоречие опиши через block.')
     if not task.acceptance or any(_command(command, root)[1] for command in task.acceptance):
         return f'Источник {tz}: команда приёмки ещё не проходит структурную проверку.'
     return ''

@@ -1,8 +1,9 @@
-"""ChatGPT egress sensor, extension outage evidence and owner alert transitions.
+"""Independent server egress and FleetChrome→ChatGPT route observations.
 
-``tick(store)`` is a nonblocking, once-per-minute maintenance hook. The caller
-registers ``[resources."chatgpt-reachable"] sensor = "chatgpt"`` in the world
-configuration, and propagates the DOWN state to the extension launch frontier.
+``tick(store)`` is a nonblocking once-per-minute maintenance hook. Its trace
+probes the SERVER route, not the Chrome UI route. Browser sends/answers and
+page-failure reports are separate evidence for the fleet resource and owner
+alert. dev/core MCP availability and the Oracle gateway are separate monitors.
 No Windows proxy settings are changed by this module.
 """
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import json
 import http.client
 import os
+import sqlite3
 import socket
 import ssl
 import threading
@@ -28,6 +30,7 @@ RESOURCE = "chatgpt-reachable"
 TRACE_URL = "https://chatgpt.com/cdn-cgi/trace"
 EVERY_S = 60.0
 EXTENSION_EVIDENCE_S = 120.0
+BROWSER_ROUTE_WINDOW_S = 600.0  # A recent browser send or answer, not a server trace.
 _lock = threading.Lock()
 _last_started = 0.0
 _running = False
@@ -51,6 +54,7 @@ class Result:
     proxy_listening: bool
     exit_ip: str = ""
     loc: str = ""
+    server_egress_state: str = ""  # Original trace result when a browser failure overrides state.
 
     @property
     def detail(self) -> str:
@@ -59,6 +63,108 @@ class Result:
     def payload(self) -> dict[str, Any]:
         return {"cause": self.cause, "exit_ip": self.exit_ip, "loc": self.loc,
                 "proxy_enabled": self.proxy_enabled, "proxy_listening": self.proxy_listening}
+
+
+@dataclass(frozen=True)
+class BrowserRoute:
+    state: str  # working | failed | unknown; independent of server egress
+    sends: int = 0
+    answers: int = 0
+    failed_attempts: int = 0
+
+
+def _browser_route(store: Any, *, now: datetime | None = None) -> BrowserRoute:
+    """Observe the *Chrome* route using extension receipts, never the server's proxy.
+
+    Quick-agent messages are acknowledged by FleetChrome after an actual send
+    or finished answer. For regular agents, use a fresh *tab generating* probe
+    from worker_activity; MCP activity or extension heartbeat alone is not
+    evidence that Chrome received a ChatGPT response.
+    Three matching Cloudflare page failures are failed page attempts. No
+    observations, rate limits and transient failures remain UNKNOWN.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = now.timestamp() - BROWSER_ROUTE_WINDOW_S
+    sends = answers = 0
+    last_success = float("-inf")
+    db_path = Path(store.path) if hasattr(store, "path") else Path(store)
+    path = db_path.parent / "quick" / "jobs.json"
+    try:
+        jobs = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(jobs, dict):
+            jobs = {}
+    except (OSError, ValueError, TypeError):
+        jobs = {}
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        for message in job.get("messages", []):
+            if not isinstance(message, dict):
+                continue
+            try:
+                stamp = datetime.fromisoformat(str(message.get("ts", "")).replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    continue
+                age = stamp.timestamp()
+            except (ValueError, TypeError):
+                continue
+            if not cutoff <= age <= now.timestamp():
+                continue
+            if message.get("role") == "owner":
+                sends += 1
+                last_success = max(last_success, age)
+            elif message.get("role") == "agent" and job.get("answer_source") != "mcp":
+                answers += 1
+                last_success = max(last_success, age)
+    # The activity table is optional and created only after actual Chrome
+    # observation; stale/idle states do not prove successful browser transport.
+    activity_sql = ("SELECT seen_at FROM worker_activity WHERE state='generating' "
+                    "ORDER BY seen_at DESC LIMIT 1")
+    if hasattr(store, "read"):
+        with store.read() as tx:
+            row = tx.one("SELECT ts,payload FROM events WHERE kind='chatgpt_extension_signal' ORDER BY id DESC LIMIT 1")
+            activity = (tx.one(activity_sql) if tx.one(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_activity'") else None)
+    else:
+        # CLI status must be strictly read-only; Store.open() runs migrations.
+        row = None
+        activity = None
+        try:
+            connection = sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True, timeout=0.5)
+            try:
+                connection.row_factory = sqlite3.Row
+                row = connection.execute(
+                    "SELECT ts,payload FROM events WHERE kind='chatgpt_extension_signal' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_activity'"
+                ).fetchone():
+                    activity = connection.execute(activity_sql).fetchone()
+            finally:
+                connection.close()
+        except (sqlite3.Error, OSError, ValueError):
+            pass
+    if activity:
+        try:
+            stamp = datetime.fromisoformat(str(activity["seen_at"]).replace("Z", "+00:00"))
+            if stamp.tzinfo is not None and cutoff <= stamp.timestamp() <= now.timestamp():
+                last_success = max(last_success, stamp.timestamp())
+        except (ValueError, KeyError, TypeError):
+            pass
+    if row:
+        try:
+            stamp = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
+            failure_cutoff = max(cutoff, now.timestamp() - EXTENSION_EVIDENCE_S)
+            if stamp.tzinfo is not None and failure_cutoff <= stamp.timestamp() <= now.timestamp():
+                evidence = json.loads(row["payload"] or "{}")
+                if (evidence.get("matching") is True and int(evidence.get("count", 0)) >= 3
+                        and stamp.timestamp() >= last_success):
+                    return BrowserRoute("failed", failed_attempts=int(evidence["count"]))
+        except (TypeError, ValueError):
+            pass
+    if last_success > float("-inf"):
+        return BrowserRoute("working", sends, answers)
+    return BrowserRoute("unknown")
 
 
 def fleet_route() -> Route:
@@ -204,14 +310,23 @@ def _alert_path(store: Any) -> Path:
     return (parent.parent if parent.name.lower() == "fleet" else parent) / "owner-alerts.jsonl"
 
 
-def _message(result: Result) -> str:
-    if result.cause == "extension_cloudflare":
-        return "Включи VPN: ChatGPT показывает Cloudflare «Unable to load site» в браузере."
-    if not result.proxy_enabled:
-        return "Включи VPN: системный прокси выключен."
-    if not result.proxy_listening:
-        return "Включи VPN: системный прокси включён, но его порт не слушает."
-    return f"Проверь VPN: ChatGPT недоступен ({result.cause}, exit_ip={result.exit_ip or '?'}, loc={result.loc or '?'})."
+def _message(result: Result, browser: BrowserRoute | None = None) -> str:
+    """VPN is an owner action only for two independently observed route failures."""
+    browser = browser or BrowserRoute("unknown")
+    egress = result.server_egress_state or (
+        "unknown" if result.cause == "extension_cloudflare" else result.state)
+    if egress == world.UP:
+        return ("Egress сервера достигает ChatGPT; маршрут Chrome→ChatGPT не работает — "
+                "проверь вкладки и ошибки браузера." if browser.state == "failed"
+                else "Egress сервера достигает ChatGPT; маршрут Chrome→ChatGPT: " + browser.state + ".")
+    if egress != world.DOWN:
+        return "Egress сервера: unknown; маршрут Chrome→ChatGPT: " + browser.state + " — проверь браузер, VPN пока не требуется."
+    if browser.state == "working":
+        return "Egress сервера не достаёт ChatGPT; Chrome→ChatGPT работает — действий не нужно."
+    if browser.state != "failed" or browser.failed_attempts < 3:
+        return "Egress сервера не достаёт ChatGPT; маршрут Chrome→ChatGPT неизвестен — не требуется включать VPN без проверки браузера."
+    return ("Включи VPN: egress сервера не достигает ChatGPT и Chrome→ChatGPT "
+            "не смог открыть страницу после повторных попыток.")
 
 
 def _last_alert(tx: Any) -> tuple[str, str]:
@@ -220,7 +335,9 @@ def _last_alert(tx: Any) -> tuple[str, str]:
     if row is None:
         return "", ""
     try:
-        cause = str(json.loads(row["payload"] or "{}").get("cause") or "")
+        payload = json.loads(row["payload"] or "{}")
+        cause = "|".join(str(payload.get(key) or "") for key in
+                         ("cause", "server_egress", "browser_route"))
     except ValueError:
         cause = ""
     return str(row["kind"]), cause
@@ -243,29 +360,47 @@ def _extension_blocked(store: Any, *, now: datetime | None = None) -> bool:
 
 
 def publish(store: Any, result: Result, *, alerts_path: Path | None = None) -> bool:
-    """Atomically deduplicate state/cause events; append one owner action per transition."""
+    """Persist browser resource separately from egress and deduplicate owner advice."""
     if result.state not in (world.UP, world.DOWN):
         return False
+    browser = _browser_route(store)
+    egress = result.server_egress_state or (
+        "unknown" if result.cause == "extension_cloudflare" else result.state)
+    evidence = {**result.payload(), "server_egress": egress, "browser_route": browser.state}
+    # Resource DOWN is solely a verified Chrome outage: stop launching tabs
+    # even when server egress is UP or UNKNOWN. Owner VPN advice has a separate
+    # two-failure condition in _message().
+    effective_state = {
+        "working": world.UP, "failed": world.DOWN, "unknown": world.UNKNOWN,
+    }[browser.state]
     alerts_path = alerts_path or _alert_path(store)
-    kind = "chatgpt_unreachable" if result.state == world.DOWN else "chatgpt_reachable"
+    # A browser outage remains an active alert even if the *server* trace is UP.
+    # An egress-only outage is likewise visible but must not block Chrome work.
+    active = egress == world.DOWN or browser.state == "failed"
+    kind = "chatgpt_unreachable" if active else "chatgpt_reachable"
     changed = False
     with store.tx() as tx:
         old, _ = world.last_state(tx, RESOURCE)
         previous_kind, previous_cause = _last_alert(tx)
-        if old != result.state:
+        if old != effective_state:
             tx.record_event(kind=world.EVENT_KIND, path_norm=world.path_key(RESOURCE),
-                            payload={"state": result.state, "was": old, "detail": result.detail[:300]})
+                            payload={"state": effective_state, "was": old, "detail": result.detail[:300],
+                                     "server_egress": egress, "browser_route": browser.state})
         # Healthy startup (including subsequent ticks) is not a recovery.
         # Recover only after an actual outage; a new failure cause is a new action.
-        notify = (previous_kind != kind or previous_cause != result.cause) if result.state == world.DOWN else (
-            old == world.DOWN or previous_kind == "chatgpt_unreachable")
+        key = "|".join(str(evidence.get(field) or "") for field in ("cause", "server_egress", "browser_route"))
+        notify = ((previous_kind != kind or previous_cause != key)
+                  if active else previous_kind == "chatgpt_unreachable")
         if notify:
-            tx.record_event(kind=kind, path_norm=world.path_key(RESOURCE), payload=result.payload())
+            tx.record_event(kind=kind, path_norm=world.path_key(RESOURCE), payload=evidence)
             changed = True
     if changed:
         alert = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                 "kind": kind, "state": "active" if result.state == world.DOWN else "resolved",
-                 **result.payload(), "message": _message(result) if result.state == world.DOWN else "ChatGPT доступен: тревога снята."}
+                 "kind": kind, "state": "active" if active else "resolved",
+                 **result.payload(), "server_egress": egress,
+                 "browser_route": browser.state, "browser_sends": browser.sends,
+                 "browser_answers": browser.answers,
+                 "message": _message(result, browser) if active else "ChatGPT: тревога снята."}
         alerts_path.parent.mkdir(parents=True, exist_ok=True)
         with alerts_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(alert, ensure_ascii=False) + "\n")
@@ -298,13 +433,13 @@ def report_extension(store: Any, detail: str, page_text: str, *, alerts_path: Pa
 
 
 def _apply(store: Any, result: Result, alerts_path: Path | None) -> bool:
-    if _extension_blocked(store):
+    if _extension_blocked(store) and _browser_route(store).state != "working":
         result = Result(world.DOWN, "extension_cloudflare", result.proxy_enabled,
-                        result.proxy_listening, result.exit_ip, result.loc)
+                        result.proxy_listening, result.exit_ip, result.loc,
+                        server_egress_state=result.state)
     now = datetime.now(timezone.utc)
     with store.read() as tx:
         previous = tx.one("SELECT payload FROM events WHERE kind='chatgpt_probe' ORDER BY id DESC LIMIT 1")
-        current, _ = world.last_state(tx, RESOURCE)
     try:
         prior = json.loads(previous['payload']) if previous else {}
         good = datetime.fromisoformat(prior['last_good_at']) if prior.get('last_good_at') else None
@@ -317,7 +452,8 @@ def _apply(store: Any, result: Result, alerts_path: Path | None) -> bool:
     # verified UP, for at most 120s, while awaiting the second independent
     # probe. Missing proxy / three browser Cloudflare failures remain immediate.
     pending = (result.state == world.DOWN and result.cause in {'network_error','proxy_disabled','unexpected_trace'}
-               and current == world.UP and failures == 1 and good is not None and good.tzinfo is not None
+               and prior.get('observed_state') == world.UP
+               and failures == 1 and good is not None and good.tzinfo is not None
                and 0 <= (now-good).total_seconds() <= 120)
     with store.tx() as tx:
         tx.record_event(kind='chatgpt_probe', payload={

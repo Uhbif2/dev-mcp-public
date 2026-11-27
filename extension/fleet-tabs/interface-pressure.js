@@ -9,14 +9,16 @@ export function interfacePlan(rows, workers, previous = {}, now = Date.now(), cf
   // A crash between tabs.create and acknowledgement must not strand a visible
   // conversation in the deferred queue forever.
   for (const row of rows) delete queue[row.label];
-  const safe = rows.filter(r => r.own && r.label && !/^(owner|pult)/i.test(r.label) &&
+  // 18.11: чаты владельца не занимают лимит интерфейсов флота и не вытесняют его вкладки.
+  const interfaces = rows.filter(r => !r.dormant && (r.own || /^pult-q\d+/i.test(r.label || "")));
+  const safe = interfaces.filter(r => r.own && r.label && !/^(owner|pult)/i.test(r.label) &&
     !(r.page?.unlockedFor > 0) && !(r.page && !r.page.composerEmpty && !r.page.composerOwned));
   const failures = safe.filter(r => r.page?.pageLoadFailed);
   const close = failures.slice(cfg.failedTabs);
   // Bring existing idle interfaces under the same cap as newly opened ones.
   // Generating tabs follow the keyboard's short, verified close delay instead.
   for (const row of safe) {
-    if (rows.length - close.length <= cfg.maxTabs) break;
+    if (interfaces.length - close.length <= cfg.maxTabs) break;
     if (!close.includes(row) && !failures.includes(row) && row.page &&
         !row.page.generating && row.url) close.push(row);
   }

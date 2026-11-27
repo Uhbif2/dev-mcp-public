@@ -53,6 +53,23 @@ def add_event(conn: sqlite3.Connection, kind: str, tz: str | None, *, ts: str | 
 
 # --- result ---------------------------------------------------------------------------
 
+
+@pytest.mark.parametrize('identifier',['P/TZ-7','P/fix:TZ-7'])
+def test_result_exposes_latest_repair_artifact_from_the_whole_chain(tmp_path,identifier):
+    import hashlib
+    conn=chain_conn()
+    for tz,name,aid in [('TZ-7','older.zip',1),('fix:TZ-7','repair.zip',2),('TZ-8','unrelated.zip',100)]:
+        artifact=tmp_path/name
+        artifact.write_bytes(name.encode())
+        add_event(conn,'owner_result_available',tz,payload={
+            'accept_id':aid,'artifact':str(artifact),'revision':'b'*40,
+            'sha256':hashlib.sha256(artifact.read_bytes()).hexdigest()})
+    text=fleet.task_result(conn,identifier)
+    assert str(tmp_path/'repair.zip') in text
+    assert str(tmp_path/'older.zip') not in text
+    assert str(tmp_path/'unrelated.zip') not in text
+    assert 'подтверждённого артефакта пока нет' not in text
+
 def chain_conn() -> sqlite3.Connection:
     conn = make_conn()
     add_task(conn, "TZ-7", "accepted", acceptance=["py -3 -m pytest tests -q"], title="TZ-7 — сделать X")
@@ -310,6 +327,16 @@ def test_session_brief_is_short_and_never_raises(tmp_path: Path, monkeypatch, ca
     assert any(line.startswith("1. P/TZ-A") for line in lines)
     assert not any("TZ-S" in line for line in lines)  # сданная без ревью — не ворота владельца
     assert len(lines) <= brief_mod.MAX_LINES and sig
+    with sqlite3.connect(db) as extra:
+        extra.execute(
+            "INSERT INTO events(ts,kind,project,tz,payload) "
+            "VALUES(?, 'obstacle_open', 'P', 'TZ-LEAD', ?)",
+            (ago(), json.dumps({"id": "ob-operator", "actor": "operator",
+                                "option": "Интегрировать 59 файлов в clean Git",
+                                "acceptance": "Получен clean commit"})))
+    operator_lines, _ = brief_mod.brief("*", db)
+    assert operator_lines[0].startswith("ОПЕРАТОР: P/ob-operator")
+    assert "clean commit" in operator_lines[0]
     # Чужой проект: решений нет, платформа в порядке — полная тишина.
     healthy = "платформа: dev:8766 жив · core:8765 жив · шлюз ок"
 
@@ -354,3 +381,25 @@ def test_stalls_name_every_gate_the_chain_needs() -> None:
     assert not items["TZ-78"]["gate"]
     head = fleet.format_stalls(fleet.stalls(conn))
     assert any("нужны ВСЕ ворота: TZ-175, fix:TZ-62" in line for line in head)
+
+
+def test_result_collapses_long_review_runs_and_keeps_latest_events() -> None:
+    """05.11: 266 ревью revalidate у TZ-LEAD съедали весь вывод result — итога не было видно."""
+    conn = make_conn()
+    add_task(conn, "TZ-L", "submitted", title="ведущий")
+    add_task(conn, "fix:TZ-L:3", "accepted")
+    for n in range(2, 60):
+        add_task(conn, f"review:fix:TZ-L:3:{n}", "accepted")
+    conn.execute("INSERT INTO events(ts,kind,worker_id,project,tz,tool,payload) "
+                 "VALUES(?,?,?,?,?,?,?)", (ago(hours=1), "take", "W1", "P", "TZ-L", "fleet", "{}"))
+    for i in range(400):
+        conn.execute("INSERT INTO events(ts,kind,worker_id,project,tz,tool,payload) VALUES(?,?,?,?,?,?,?)",
+                     (ago(minutes=50 - i / 10), "requeue", "W1", "P", "TZ-L", "fleet",
+                      json.dumps({"why": f"шум {i} " + "x" * 60})))
+    conn.execute("INSERT INTO events(ts,kind,worker_id,project,tz,tool,payload) VALUES(?,?,?,?,?,?,?)",
+                 (ago(minutes=1), "reject", "W2", "P", "TZ-L", "fleet", json.dumps({"note": "свежий вердикт"})))
+    text = fleet.task_result(conn, "P/TZ-L")
+    assert "(58 звеньев: accepted ×58)" in text and "review:fix:TZ-L:3:30 " not in text
+    assert "свежий вердикт" in text
+    assert "шум 399" in text and "раньше ещё" in text
+    assert "обрезано" not in text

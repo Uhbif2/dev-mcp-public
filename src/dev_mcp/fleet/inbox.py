@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
 from typing import Any, Iterable, Iterator, Sequence
@@ -29,12 +29,12 @@ except ImportError:  # TZ-01 may not have landed yet.
 
 _IMPORTANCE = {
     "revoke": 0, "revoked": 0, "request_decided": 1,
-    "stale_read": 2, "contract": 3, "broadcast": 4, "note": 5,
+    "stale_read": 2, "lead_decision": 2, "contract": 3, "broadcast": 4, "note": 5,
 }
 _KIND_LABEL = {
     "revoke": "отзыв", "revoked": "отзыв",
     "request_decided": "решение по заявке",
-    "stale_read": "устаревшее чтение",
+    "stale_read": "устаревшее чтение", "lead_decision": "решение модели / отмена",
     "contract": "контракт опубликован",
     "broadcast": "сообщение владельца", "note": "уведомление",
 }
@@ -249,6 +249,32 @@ def _active_task_addresses(db: Any, worker_id: str) -> list[str]:
     return [f"{row['project']}/{row['tz']}" for row in rows]
 
 
+def _lead_family(db: Any, worker_id: str) -> tuple[list[str], list[Any]]:
+    """Письмо к раунду ведущего (P/fix:TZ-LEAD:7) — держателю любого захвата семьи TZ-LEAD.
+
+    05.11: m-40a2e777 (VPNMIR-XHTTP) адресовано закрытому раунду и не доставлено никому.
+    Раунд — наследие схемы «ТЗ → fix»; адресат по смыслу — ведущий проекта (_todo/47 §3.1 п.2).
+    Только письма последних 14 суток: старые хвосты раундов не заливают конверт.
+    """
+    try:
+        rows = _fetchall(
+            db,
+            """SELECT DISTINCT project FROM claims WHERE worker_id=? AND state='active'
+               AND (UPPER(tz) LIKE 'TZ-LEAD%' OR UPPER(tz) LIKE 'FIX:TZ-LEAD%')""",
+            (worker_id,),
+        )
+    except Exception:
+        return [], []
+    since = (_utcnow() - timedelta(days=14)).isoformat()
+    clauses: list[str] = []
+    params: list[Any] = []
+    for row in rows:
+        project = str(row["project"])
+        clauses.append("(created_at>=? AND (to_task=? OR to_task LIKE ? OR to_task LIKE ?))")
+        params.extend([since, f"{project}/TZ-LEAD", f"{project}/TZ-LEAD:%", f"{project}/fix:TZ-LEAD%"])
+    return clauses, params
+
+
 def _candidate_rows(db: Any, worker_id: str) -> list[dict[str, Any]]:
     task_addresses = _active_task_addresses(db, worker_id)
     clauses = ["to_worker=?", "broadcast=1"]
@@ -257,6 +283,9 @@ def _candidate_rows(db: Any, worker_id: str) -> list[dict[str, Any]]:
         placeholders = ",".join("?" for _ in task_addresses)
         clauses.append(f"to_task IN ({placeholders})")
         params.extend(task_addresses)
+    family, family_params = _lead_family(db, worker_id)
+    clauses += family
+    params.extend(family_params)
     return _fetchall(
         db,
         f"""SELECT id,dedup_key,to_worker,to_task,broadcast,from_kind,from_id,kind,
@@ -367,6 +396,9 @@ def ack(store: Any, worker_id: str, ids: list[str]) -> int:
             placeholders = ",".join("?" for _ in task_addresses)
             address_clauses.append(f"to_task IN ({placeholders})")
             address_params.extend(task_addresses)
+        family, family_params = _lead_family(db, worker)
+        address_clauses += family
+        address_params.extend(family_params)
 
         id_placeholders = ",".join("?" for _ in unique_ids)
         cur = db.execute(

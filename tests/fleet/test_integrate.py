@@ -171,7 +171,7 @@ def test_candidate_without_project_gate_still_runs_task_acceptance(env):
     failed = root / "failed_acceptance.py"
     failed.write_text("raise SystemExit(7)\n", encoding="utf-8")
     ok, reason = make(store, temp)._candidate(
-        str(root), [failed.name], "P", ["py -3 failed_acceptance.py"])
+        str(root), [failed.name], "P", [f'"{sys.executable}" failed_acceptance.py'])
     assert not ok
     assert reason.startswith("acceptance:"), reason
 
@@ -200,6 +200,7 @@ def test_historical_incomplete_seal_opens_one_independent_revalidation(env):
         row = tx.one("SELECT id,payload FROM events WHERE kind='submission_file_seal'")
         data = json.loads(row["payload"])
         data["files"] = {}
+        data.pop("scope", None)
         tx.change("UPDATE events SET payload=? WHERE id=?", (json.dumps(data), row["id"]), event="legacy_fixture")
     review.open_review(store, "P", "TZ-historical")
     queue.take_next(store, "W-review", "P")
@@ -213,6 +214,33 @@ def test_historical_incomplete_seal_opens_one_independent_revalidation(env):
         assert "НОВОЕ независимое ревью" in tasks[0]["body"]
         assert tx.scalar("SELECT state FROM tasks WHERE tz='TZ-historical'") == "accepted"
     integ.tick()
+    with store.read() as tx:
+        assert tx.scalar("SELECT count(*) FROM tasks WHERE tz LIKE 'revalidate:%'") == 1
+
+
+def test_repeated_accepts_of_one_task_open_a_single_revalidation(env):
+    """04.11: петля fix:TZ-LEAD:3 — сотни приёмок одной задачи; commit=true открыл
+    revalidate на каждую. Ревалидируется последняя приёмка, и только один раз."""
+    from dev_mcp.fleet.integrate import Batch
+
+    store, root, _, temp = env
+    target = root / "ToDo" / "loop.md"
+    add_task(store, "fix:TZ-loop:3", [norm_path(str(target))])
+    accepts = []
+    with store.tx() as tx:
+        for _ in range(3):
+            tx.record_event(kind="accept", project="P", tz="fix:TZ-loop:3", worker_id="W-R")
+            accepts.append({"id": int(tx.scalar("SELECT MAX(id) FROM events")),
+                            "tz": "fix:TZ-loop:3"})
+    integ = make(store, temp)
+    batch = Batch("P", str(root))
+    reason = "missing_trusted_submission_file_seal"
+    assert integ._request_revalidation(batch, accepts[0], ["ToDo/loop.md"], reason) is None
+    assert integ._request_revalidation(batch, accepts[1], ["ToDo/loop.md"], reason) is None
+    latest = integ._request_revalidation(batch, accepts[2], ["ToDo/loop.md"], reason)
+    assert latest and latest.startswith("revalidate:")
+    assert integ._request_revalidation(
+        batch, accepts[2], ["ToDo/loop.md"], "missing_server_submission") == latest
     with store.read() as tx:
         assert tx.scalar("SELECT count(*) FROM tasks WHERE tz LIKE 'revalidate:%'") == 1
 
@@ -286,7 +314,9 @@ def test_real_shared_submit_seals_bytes_before_independent_accept(
     assert receipt["id"] > submit["id"]
     assert receipt["tool"] == "fleet" and receipt["worker_id"] is None
     proof = json.loads(receipt["payload"])
-    assert proof == {"submit_id": submit["id"], "files": expected_files}
+    assert {k: v for k, v in proof.items() if k != "scope"} == {
+        "submit_id": submit["id"], "files": expected_files}
+    assert "ToDo/TZ-real.md".casefold() in proof["scope"]
 
     review.open_review(store, "P", "TZ-real")
     assert queue.take_next(store, "W-R", "P").tz == "review:TZ-real"
@@ -298,11 +328,17 @@ def test_real_shared_submit_seals_bytes_before_independent_accept(
     assert integrated
     outcome = integrated[-1]
     if drift:
-        assert outcome.get("reason_code") == "accepted_candidate_bytes_changed"
-        assert "commit" not in outcome
+        # 07.11 (1.3, печать = снимок): дерево ушло от печати — коммитятся байты печати из её
+        # снимка, а изменённый файл остаётся в дереве (раньше — вечное «байты изменены»).
+        assert outcome.get("route") == "snapshot", outcome
+        assert git(root, "show", "HEAD:ToDo/TZ-real.md") == "accepted candidate\n"
+        assert target.read_text(encoding="utf-8") == "changed after submit\n"
     elif foreign:
-        assert outcome.get("reason_code") == "missing_trusted_submission_file_seal"
-        assert "commit" not in outcome
+        # 07.11 (1.3): запись вне зоны не входит в печать — её байты не этой сдачи. Коммитится
+        # запечатанное, чужой файл остаётся в дереве (раньше — вечное «печати нет»).
+        assert len(outcome.get("commit", "")) >= 7, outcome
+        assert outcome.get("later_work") == ["outside.txt"]
+        assert "outside.txt" not in git(root, "show", "--format=", "--name-only", "HEAD")
         with store.read() as tx:
             assert tx.scalar("SELECT count(*) FROM tasks WHERE tz LIKE 'revalidate:%'") == 0
     else:
@@ -311,6 +347,49 @@ def test_real_shared_submit_seals_bytes_before_independent_accept(
         if staged_other:
             assert "staged_other.txt" in git(root, "diff", "--cached", "--name-only")
             assert "staged_other.txt" not in git(root, "show", "--format=", "--name-only", "HEAD")
+
+
+def test_submit_seals_bytes_while_commit_is_off_so_enabling_commit_opens_no_revalidation(
+    env, monkeypatch,
+):
+    """04.11: Nova VPN с commit=false не имел ни одной печати; включение коммита
+    поднимало revalidate:* по каждой уже принятой сдаче. Печать — у submit всегда."""
+    from dev_mcp.fleet import goals, queue, review
+
+    store, root, _, temp = env
+    info = {"commit": False, "claim_trees": False}
+    monkeypatch.setattr(goals, "project_info", lambda _p: dict(info))
+    target = root / "ToDo" / "TZ-off.md"
+    own = norm_path(str(target))
+    add_task(store, "TZ-off", [own])
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='ready' WHERE project='P' AND tz='TZ-off'",
+                  (), event={"kind": "test_setup"})
+        for worker in ("W-A", "W-R"):
+            tx.change("INSERT INTO workers(id,label,kind,first_seen,last_seen) "
+                      "VALUES (?,?,'chatgpt',?,?)",
+                      (worker, worker, now(), now()), event={"kind": "test_setup"})
+    integrator = make(store, temp)
+    assert queue.take_next(store, "W-A", "P").tz == "TZ-off"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("accepted while commit was off\n", encoding="utf-8")
+    queue.submit(store, "W-A", "submitted with commit=false")
+    with store.read() as tx:
+        receipt = tx.one("SELECT payload FROM events WHERE project='P' AND tz='TZ-off' "
+                         "AND kind='submission_file_seal'")
+    assert receipt is not None
+    assert json.loads(receipt["payload"])["files"] == {
+        "ToDo/TZ-off.md": hashlib.sha256(target.read_bytes()).hexdigest()}
+
+    review.open_review(store, "P", "TZ-off")
+    assert queue.take_next(store, "W-R", "P").tz == "review:TZ-off"
+    review.decide(store, "W-R", "accept", "independent approval")
+    info["commit"] = True
+    integrator.tick()
+    outcome = events(store, "integrate")[-1]
+    assert len(outcome.get("commit", "")) >= 7, outcome
+    with store.read() as tx:
+        assert tx.scalar("SELECT count(*) FROM tasks WHERE tz LIKE 'revalidate:%'") == 0
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="NTFS junctions are Windows-only")
@@ -586,6 +665,7 @@ def test_gates_of_projects_run_in_parallel_and_get_changed_paths(env, tmp_path: 
     seen: dict[str, str] = {}
     active, peak = [0], [0]
     lock = threading.Lock()
+    rendezvous = threading.Barrier(2)
 
     def runner(cmd, **kw):
         if cmd == ["fleet-test-gate"]:  # stub must not resolve the host's check.cmd
@@ -593,7 +673,8 @@ def test_gates_of_projects_run_in_parallel_and_get_changed_paths(env, tmp_path: 
             with lock:
                 active[0] += 1
                 peak[0] = max(peak[0], active[0])
-            _time.sleep(0.3)
+            rendezvous.wait(timeout=10)
+            _time.sleep(0.05)
             with lock:
                 active[0] -= 1
             seen[str(kw["cwd"])] = kw["env"]["DEV_MCP_FLEET_CHANGED"]
@@ -615,7 +696,7 @@ def test_gates_of_projects_run_in_parallel_and_get_changed_paths(env, tmp_path: 
     gates = [e for e in integ.tick() if e.get("kind") == "gate"]
     assert len(gates) == 2
     assert peak[0] == 2, "гейты разных проектов идут одновременно"
-    assert seen[str(root)] == "src/a.py"
+    assert "src/a.py" in seen.values()
 
 
 def test_windows_relative_venv_gate_runs_without_cmd_shell(env) -> None:
@@ -740,6 +821,36 @@ def test_unexplained_drift_is_reported_to_the_operator_once(env):
         assert tx.scalar("SELECT COUNT(*) FROM events WHERE kind='manual_platform_required'") == 1
 
 
+def test_reopened_lead_keeps_accepted_byte_provenance(env):
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    (root / 'shared.py').write_text('v = 1\n', encoding='utf-8')
+    add_task(store, 'TZ-A', [f'{rootn}/shared.py'])
+    event(store, 'accept', 'TZ-A')
+    with store.read() as tx:
+        older = tx.scalar("SELECT MAX(id) FROM events WHERE kind='accept'")
+    add_task(store, 'TZ-LEAD', [f'{rootn}/shared.py'])
+    (root / 'shared.py').write_text('v = 2\n', encoding='utf-8')
+    event(store, 'accept', 'TZ-LEAD')
+    v2 = hashlib.sha256((root / 'shared.py').read_bytes()).hexdigest()
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='taken' WHERE tz='TZ-LEAD'", (), event='test_setup')
+    assert integ._superseded_by_later_accept('P', older, {'shared.py': v2}) == {'shared.py'}
+    # A later rejected seal is never blessed by the next milestone's acceptance.
+    v3 = hashlib.sha256(b'v = 3\n').hexdigest()
+    with store.tx() as tx:
+        tx.record_event(kind='submit', project='P', tz='TZ-LEAD')
+        sid = tx.scalar('SELECT MAX(id) FROM events')
+        tx.record_event(kind='submission_file_seal', project='P', tz='TZ-LEAD', tool='fleet',
+                        payload={'submit_id': sid, 'files': {'shared.py': v3}})
+        tx.record_event(kind='reject', project='P', tz='TZ-LEAD')
+    (root / 'shared.py').write_text('v = 4\n', encoding='utf-8')
+    event(store, 'accept', 'TZ-LEAD')
+    assert integ._superseded_by_later_accept('P', older, {'shared.py': v3}) == set()
+    # Accepted v2 remains historical proof even after a newer submit/reject.
+    assert integ._superseded_by_later_accept('P', older, {'shared.py': v2}) == {'shared.py'}
+
+
 def test_old_deferred_accept_is_not_forgotten_behind_many_retries(env):
     """20.10.2026: only the newest 3000 integrate events were read; 406 works were lost."""
     store, root, rootn, temp = env
@@ -832,3 +943,499 @@ def test_integration_request_closed_once_its_source_is_integrated(env):
     assert states["review:request:aaaa1111:3:2"] == "accepted"
     assert states["request:bbbb2222:3"] == "submitted"  # источник ещё отложен — заявка нужна
     assert mod.Integrator._final_integration({"skipped": "коммит не разрешён проектом (x)"}) is False
+
+
+def test_late_bytes_of_unfinished_fleet_task_wait_instead_of_operator(env):
+    """27.10: bytes of an unfinished fleet task are an observable wait, not an operator front."""
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    mine = root / "Mine.py"
+    mine.write_text("accepted = 1\n", encoding="utf-8")
+    add_task(store, "TZ-78", [f"{rootn}/mine.py"])
+    event(store, "accept", "TZ-78")
+    add_task(store, "TZ-79", [f"{rootn}/mine.py"])
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='submitted' WHERE project='P' AND tz='TZ-79'", event="seed")
+    event(store, "write", "TZ-79", path_norm=f"{rootn}/mine.py")
+    mine.write_text("accepted = 1\nlater = 2\n", encoding="utf-8")
+    [integrated] = [x for x in integ.tick() if x["kind"] == "integrate"]
+    payload = integrated["payload"]
+    assert payload["reason_code"] == "accepted_candidate_bytes_changed_by_unfinished"
+    assert payload["waiting_for"] == ["TZ-79"]
+    assert payload["obstacle"] == {"type": "needs_result", "resolver_work": ["TZ-79"]}
+    with store.read() as tx:
+        assert tx.scalar("SELECT COUNT(*) FROM events WHERE kind='manual_platform_required'") == 0
+    assert "Mine.py" not in git(root, "ls-tree", "-r", "--name-only", "HEAD")
+
+
+def test_unfinished_writer_on_unchanged_path_is_not_blamed_for_drift(env):
+    """A foreign writer of sealed B cannot explain dirty bytes of A."""
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    mine = root / "Mine.py"
+    other = root / "Other.py"
+    mine.write_text("accepted = 1\n", encoding="utf-8")
+    other.write_text("other = 1\n", encoding="utf-8")
+    add_task(store, "TZ-78", [f"{rootn}/mine.py", f"{rootn}/other.py"])
+    event(store, "accept", "TZ-78")
+    add_task(store, "TZ-79", [f"{rootn}/other.py"])
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='submitted' WHERE project='P' AND tz='TZ-79'", event="seed")
+    event(store, "write", "TZ-79", path_norm=f"{rootn}/other.py")
+    mine.write_text("accepted = 1\nunattributed = 2\n", encoding="utf-8")
+    [integrated] = [x for x in integ.tick() if x["kind"] == "integrate"]
+    payload = integrated["payload"]
+    assert payload["reason_code"] == "accepted_candidate_bytes_changed"
+    assert payload["reason"] == "shared worktree differs from accepted submission"
+    assert payload["waiting_for"] == []
+
+
+def test_integration_repair_chain_stops_after_two_attempts(env):
+    """27.10: до 36 заявок «почини приёмку» на один источник; две — и смена подхода."""
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    (root / "Mine.py").write_text("x = 1\n", encoding="utf-8")
+    batch = Batch("P", str(root))
+
+    def requests():
+        with store.read() as tx:
+            return [(r["tz"], r["title"]) for r in tx.query(
+                "SELECT tz,title FROM tasks WHERE kind='request' ORDER BY rowid")]
+
+    for attempt in range(5):
+        integ._preflight_repair_request(batch, "TZ-9", ["Mine.py"], f"red {attempt}")
+        with store.tx() as tx:  # каждую заявку взяли и приняли — интеграция снова красная
+            tx.change("UPDATE tasks SET state='accepted' WHERE kind='request'", event={"kind": "seed"})
+    titles = [t for _, t in requests()]
+    assert len(titles) == 3, titles
+    assert sum("неприменимую acceptance-версию P/TZ-9" in t for t in titles) == 2
+    assert "Сменить подход: 2 ремонта" in titles[2]
+
+
+def test_foreign_write_absorbed_by_later_commit_does_not_hold_candidate(env):
+    # 05.11.2026 Nova VPN: веху ведущего ночь держали TZ-170 (frozen, запись 27.09) и TZ-262
+    # (submitted с 19.10), хотя их файлы с тех пор коммитились. Свежая чужая запись — держит.
+    store, root, _, temp = env
+    integrator = make(store, temp)
+    shared = root / "shared.py"
+    shared.write_text("v1\n", encoding="utf-8")
+    for tz in ("TZ-old", "TZ-new"):
+        add_task(store, tz, [])
+        with store.tx() as tx:
+            tx.change("UPDATE tasks SET state='frozen' WHERE tz=?", (tz,), event="test_setup")
+    with store.tx() as tx:
+        tx.record_event(kind="write", project="P", tz="TZ-old", path_norm=norm_path(str(shared)))
+        tx.change("UPDATE events SET ts='2026-09-27T18:02:01+00:00' WHERE tz='TZ-old' AND kind='write'",
+                  (), event="test_setup")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "absorb old write")
+    assert integrator._foreign_writers("P", "TZ-LEAD", str(root), ["shared.py"]) == []
+    with store.tx() as tx:
+        tx.record_event(kind="write", project="P", tz="TZ-new", path_norm=norm_path(str(shared)))
+        tx.change("UPDATE events SET ts='2999-01-01T00:00:00+00:00' WHERE tz='TZ-new' AND kind='write'",
+                  (), event="test_setup")
+    assert integrator._foreign_writers("P", "TZ-LEAD", str(root), ["shared.py"]) == ["TZ-new"]
+
+
+def _lead_setup(store, workers=("W-L", "W-R")):
+    with store.tx() as tx:
+        for worker in workers:
+            tx.change("INSERT INTO workers(id,label,kind,first_seen,last_seen) VALUES (?,?,'chatgpt',?,?)",
+                      (worker, worker, now(), now()), event="setup")
+
+
+def test_later_write_in_seal_scope_does_not_void_the_seal(env, monkeypatch):
+    """05.11: ведущий пишет в своей зоне дальше — файл, ставший грязным после сдачи,
+    давал missing_trusted_submission_file_seal (4231 за сутки). Теперь коммитится запечатанное,
+    позднее остаётся следующей сдаче."""
+    from dev_mcp.fleet import goals, queue, review
+
+    store, root, _, temp = env
+    monkeypatch.setattr(goals, "project_info", lambda _p: {"commit": True, "claim_trees": False})
+    sealed, later = root / "ToDo" / "a.md", root / "ToDo" / "b.md"
+    add_task(store, "TZ-work", [norm_path(str(root / "ToDo"))])
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='ready' WHERE tz='TZ-work'", event="setup")
+    _lead_setup(store)
+    integ = make(store, temp)
+    assert queue.take_next(store, "W-L", "P").tz == "TZ-work"
+    sealed.parent.mkdir(exist_ok=True)
+    sealed.write_text("milestone\n", encoding="utf-8")
+    queue.submit(store, "W-L", "milestone")
+    review.open_review(store, "P", "TZ-work")
+    queue.take_next(store, "W-R", "P")
+    review.decide(store, "W-R", "accept", "independent approval")
+    later.write_text("next window, not reviewed\n", encoding="utf-8")
+    integ.tick()
+    outcome = events(store, "integrate")[-1]
+    assert len(outcome.get("commit", "")) >= 7, outcome
+    assert outcome.get("later_work") == ["ToDo/b.md"]
+    committed = git(root, "show", "--format=", "--name-only", "HEAD")
+    assert "ToDo/a.md" in committed and "ToDo/b.md" not in committed
+    assert "ToDo/b.md" in git(root, "status", "--porcelain")
+    with store.read() as tx:
+        assert tx.scalar("SELECT count(*) FROM tasks WHERE tz LIKE 'revalidate:%'") == 0
+
+
+def test_accepted_revalidation_ends_retries_of_unsealed_accept(env):
+    """05.11: 74 из 78 отложенных приёмок ждали уже принятую ревалидацию и повторялись вечно."""
+    from dev_mcp.fleet import goals, queue, review
+    from unittest.mock import patch
+
+    store, root, _, temp = env
+    target = root / "ToDo" / "historical.md"
+    add_task(store, "TZ-historical", [norm_path(str(target))])
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='ready' WHERE tz='TZ-historical'", event="setup")
+        for worker in ("W-H", "W-review"):
+            tx.change("INSERT INTO workers(id,first_seen,last_seen) VALUES(?,?,?)",
+                      (worker, now(), now()), event="setup")
+    integ = make(store, temp)
+    with patch.object(goals, "project_info", return_value={"commit": True}):
+        queue.take_next(store, "W-H", "P")
+        target.parent.mkdir(exist_ok=True)
+        target.write_text("unsealed historical report\n", encoding="utf-8")
+        queue.submit(store, "W-H", "historically incomplete receipt")
+    with store.tx() as tx:
+        row = tx.one("SELECT id,payload FROM events WHERE kind='submission_file_seal'")
+        data = json.loads(row["payload"])
+        data["files"] = {}
+        data.pop("scope", None)
+        tx.change("UPDATE events SET payload=? WHERE id=?", (json.dumps(data), row["id"]), event="legacy_fixture")
+    review.open_review(store, "P", "TZ-historical")
+    queue.take_next(store, "W-review", "P")
+    review.decide(store, "W-review", "accept", "independent historical approval")
+    integ.tick()
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='accepted' WHERE tz LIKE 'revalidate:%'", event="setup")
+    integ.tick()
+    last = [e for e in events(store, "integrate") if e["tz"] == "TZ-historical"][-1]
+    assert last.get("superseded") is True and "ревалидация" in last["reason"], last
+    before = len(events(store, "integrate"))
+    integ.tick()
+    assert len([e for e in events(store, "integrate")[before:] if e["tz"] == "TZ-historical"]) == 0
+
+
+def _snapshot(store: Store, root: Path, tz: str, rel: str) -> None:
+    """Тень снимка сдачи: blob текущих байтов файла (как snapshot.submission_shadow)."""
+    blob = git(root, "hash-object", "-w", "--", rel).strip()
+    with store.tx() as tx:
+        tx.record_event(kind="submission_snapshot", project="P", tz=tz, worker_id="W1",
+                        payload={"blobs": {rel: blob}, "mode": "shadow"})
+
+
+def test_lead_milestone_commits_snapshot_while_next_round_edits_same_file(env):
+    """06.11: ведущий правит файл через 20 с после приёмки — веха коммитится по снимку."""
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    shared = root / "shared.txt"
+    shared.write_text("milestone\n", encoding="utf-8")
+    add_task(store, "TZ-LEAD", [f"{rootn}/shared.txt"])
+    _snapshot(store, root, "TZ-LEAD", "shared.txt")
+    event(store, "accept", "TZ-LEAD")
+    accepted = shared.read_bytes()
+    shared.write_text("milestone\nnext round\n", encoding="utf-8")
+    [done] = [x for x in integ.tick() if x["kind"] == "integrate"]
+    payload = done["payload"]
+    assert payload.get("route") == "snapshot" and payload.get("commit"), payload
+    assert "Fleet-Route: snapshot" in git(root, "log", "-1", "--format=%B")
+    committed = subprocess.run(["git", "show", "HEAD:shared.txt"], cwd=root,
+                               capture_output=True, check=True).stdout
+    assert committed.replace(b"\r\n", b"\n") == accepted.replace(b"\r\n", b"\n")
+    assert git(root, "diff", "--cached", "--name-only") == ""
+    assert git(root, "status", "--porcelain").strip() == "M shared.txt"
+    assert "next round" in shared.read_text(encoding="utf-8")
+
+
+def _stalled_foreign(store: Store, rootn: str, review_state: str) -> None:
+    from datetime import timedelta
+    add_task(store, "TZ-X", [f"{rootn}/shared.txt"])
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='submitted' WHERE project='P' AND tz='TZ-X'", event="seed")
+    add_task(store, "review:TZ-X:2", [])
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state=?,updated_at=? WHERE project='P' AND tz='review:TZ-X:2'",
+                  (review_state, old), event="seed")
+    event(store, "write", "TZ-X", path_norm=f"{rootn}/shared.txt")
+
+
+def test_frozen_foreign_writer_no_longer_holds_accepted_milestone(env):
+    """05–06.11 Nova: TZ-266/TZ-333 с замороженным ревью всю ночь держали вехи ведущего."""
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    shared = root / "shared.txt"
+    shared.write_text("foreign\n", encoding="utf-8")
+    _stalled_foreign(store, rootn, "frozen")
+    shared.write_text("foreign\nlead\n", encoding="utf-8")
+    add_task(store, "TZ-LEAD", [f"{rootn}/shared.txt"])
+    event(store, "accept", "TZ-LEAD")
+    [done] = [x for x in integ.tick() if x["kind"] == "integrate" and x["tz"] == "TZ-LEAD"]
+    payload = done["payload"]
+    assert payload.get("commit") and payload.get("absorbed_stalled") == ["TZ-X"], payload
+    assert "Fleet-Absorbed: TZ-X" in git(root, "log", "-1", "--format=%B")
+    assert git(root, "status", "--porcelain").strip() == ""
+
+
+def test_live_foreign_writer_still_holds_accepted_milestone(env):
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    shared = root / "shared.txt"
+    shared.write_text("foreign\n", encoding="utf-8")
+    _stalled_foreign(store, rootn, "ready")
+    add_task(store, "TZ-LEAD", [f"{rootn}/shared.txt"])
+    event(store, "accept", "TZ-LEAD")
+    [done] = [x for x in integ.tick() if x["kind"] == "integrate" and x["tz"] == "TZ-LEAD"]
+    payload = done["payload"]
+    assert not payload.get("commit") and payload.get("waiting_for") == ["TZ-X"], payload
+
+
+def test_drift_without_provable_snapshot_keeps_legacy_deferral(env):
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    shared = root / "shared.txt"
+    shared.write_text("milestone\n", encoding="utf-8")
+    add_task(store, "TZ-LEAD", [f"{rootn}/shared.txt"])
+    event(store, "accept", "TZ-LEAD")
+    shared.write_text("changed by hand\n", encoding="utf-8")
+    [done] = [x for x in integ.tick() if x["kind"] == "integrate"]
+    payload = done["payload"]
+    assert not payload.get("commit") and payload.get("reason_code") == "accepted_candidate_bytes_changed"
+
+
+def test_old_lead_round_leaves_file_rewritten_by_later_accepted_round(env):
+    """06.11 Nova: 35 старых раундов ждали байтов файла, который несут следующие принятые."""
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    shared, other = root / "shared.txt", root / "other.txt"
+    add_task(store, "TZ-LEAD", [f"{rootn}/shared.txt", f"{rootn}/other.txt"])
+    shared.write_text("round 1\n", encoding="utf-8")
+    other.write_text("only round 1\n", encoding="utf-8")
+    _snapshot(store, root, "TZ-LEAD", "other.txt")  # снимок старого раунда без shared.txt
+    event(store, "accept", "TZ-LEAD")
+    shared.write_text("round 2\n", encoding="utf-8")
+    _snapshot(store, root, "TZ-LEAD", "shared.txt")
+    event(store, "accept", "TZ-LEAD")
+    shared.write_text("round 3 in progress\n", encoding="utf-8")
+    done = [x["payload"] for x in integ.tick() if x["kind"] == "integrate"]
+    first, second = done[0], done[1]
+    assert first.get("carried_by_later_accept") == ["shared.txt"] and first.get("commit"), first
+    assert second.get("commit") and second.get("route") == "snapshot", second
+    assert git(root, "show", "HEAD:shared.txt").strip() == "round 2"
+    assert git(root, "show", "HEAD:other.txt").strip() == "only round 1"
+
+
+def test_snapshot_validation_failure_falls_back_without_new_tasks(env):
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    broken = root / "broken.py"
+    broken.write_text("def (:\n", encoding="utf-8")
+    add_task(store, "TZ-LEAD", [f"{rootn}/broken.py"])
+    _snapshot(store, root, "TZ-LEAD", "broken.py")
+    event(store, "accept", "TZ-LEAD")
+    broken.write_text("x = 1\n", encoding="utf-8")
+    with store.read() as tx:
+        before = tx.scalar("SELECT COUNT(*) FROM tasks")
+    [done] = [x["payload"] for x in integ.tick() if x["kind"] == "integrate"]
+    assert not done.get("commit") and str(done.get("snapshot_route", "")).startswith("validation:"), done
+    with store.read() as tx:
+        assert tx.scalar("SELECT COUNT(*) FROM tasks") == before
+
+
+def test_sweep_commits_all_accepted_bytes_and_leaves_unaccepted(env):
+    """06.11 Nova: 316 из 336 грязных файлов — ровно принятые байты, коммитов не было."""
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    (root / "a.txt").write_text("accepted a\n", encoding="utf-8")
+    (root / "b.txt").write_text("accepted b\n", encoding="utf-8")
+    add_task(store, "TZ-A", [f"{rootn}/a.txt"])
+    add_task(store, "TZ-LEAD", [f"{rootn}/b.txt"])
+    event(store, "accept", "TZ-A")
+    event(store, "accept", "TZ-LEAD")
+    (root / "wip.txt").write_text("never accepted\n", encoding="utf-8")
+    [done] = integ.sweep_accepted(now=10**10)
+    assert done["ready"] and done["commit"] and done["files"] == 2, done
+    assert git(root, "show", "HEAD:a.txt").strip() == "accepted a"
+    assert git(root, "status", "--porcelain").strip() == "?? wip.txt"
+    assert integ.sweep_accepted(now=10**10 + 1) == []  # не чаще SWEEP_EVERY_S
+
+
+def test_candidate_keeps_clean_file_bytes_of_the_live_tree(env):
+    """06.11 Nova: autocrlf писал канон с CRLF — sha256 ledger_check расходился в кандидате."""
+    store, root, rootn, tmp = env
+    integ = make(store, tmp)
+    canon = root / "canon.md"
+    canon.write_bytes(b"line one\nline two\n")
+    git(root, "-c", "core.autocrlf=true", "add", "canon.md")
+    git(root, "commit", "-q", "-m", "canon")
+    want = hashlib.sha256(canon.read_bytes()).hexdigest()
+    check = root / "check.py"
+    check.write_text(
+        "import hashlib, pathlib, sys\n"
+        f"sys.exit(0 if hashlib.sha256(pathlib.Path('canon.md').read_bytes()).hexdigest() == '{want}' else 3)\n",
+        encoding="utf-8")
+    ok, reason = integ._candidate(str(root), ["check.py"], "P", [f'"{sys.executable}" check.py'])
+    assert ok, reason
+
+
+def _seal_round(env, monkeypatch, files: dict[str, str], *, owns: str = "ToDo"):
+    """Ведущий сдаёт files в зоне owns, независимый ревьюер принимает. → (store, root, integ)."""
+    from dev_mcp.fleet import goals, queue, review
+
+    store, root, _, temp = env
+    monkeypatch.setattr(goals, "project_info", lambda _p: {"commit": True, "claim_trees": False})
+    add_task(store, "TZ-work", [norm_path(str(root / owns))])
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='ready' WHERE tz='TZ-work'", event="setup")
+    _lead_setup(store)
+    integ = make(store, temp)
+    assert queue.take_next(store, "W-L", "P").tz == "TZ-work"
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text, encoding="utf-8")
+    queue.submit(store, "W-L", "milestone")
+    return store, root, integ
+
+
+def _accept(store):
+    from dev_mcp.fleet import queue, review
+    review.open_review(store, "P", "TZ-work")
+    queue.take_next(store, "W-R", "P")
+    review.decide(store, "W-R", "accept", "independent approval")
+
+
+def test_seal_writes_blobs_and_ref_at_submit_time(env, monkeypatch):
+    """LEAD-SYSTEM-DESIGN 1.3: печать = снимок. Байты сдачи — git-объекты под ref с момента
+    сдачи; переписанный через секунду файл не подменяет принятое, коммит несёт байты печати,
+    а `refs/fleet/accepted/<accept>` указывает на снимок до интеграции."""
+    store, root, integ = _seal_round(env, monkeypatch, {"ToDo/a.md": "milestone\n"})
+    snaps = [e for e in events(store, "submission_snapshot") if e.get("mode") == "seal"]
+    assert len(snaps) == 1, events(store, "submission_snapshot")
+    snap = snaps[0]
+    assert snap["ref"] == f"refs/fleet/sealed/{snap['submit_id']}"
+    assert git(root, "rev-parse", snap["ref"]).strip() == snap["commit"]
+    assert git(root, "show", f"{snap['commit']}:ToDo/a.md") == "milestone\n"
+    # Ведущий сразу правит тот же файл — дерево ушло от печати.
+    (root / "ToDo" / "a.md").write_text("next window, not reviewed\n", encoding="utf-8")
+    _accept(store)
+    integ.tick()
+    outcome = events(store, "integrate")[-1]
+    assert outcome.get("route") == "snapshot", outcome
+    assert git(root, "show", "HEAD:ToDo/a.md") == "milestone\n"
+    ref = outcome["accepted_ref"]
+    assert ref == f"refs/fleet/accepted/{outcome['accept_id']}"
+    assert git(root, "rev-parse", ref).strip() == snap["commit"]
+    assert (root / "ToDo" / "a.md").read_text(encoding="utf-8") == "next window, not reviewed\n"
+
+
+def test_lead_state_md_is_outside_the_seal(env, monkeypatch):
+    """1.3: STATE.md ведущего — проекция; его байты не входят в печать и не коммитятся с вехой."""
+    store, root, integ = _seal_round(env, monkeypatch, {
+        "ToDo/lead/LEDGER.json": "{}\n", "ToDo/lead/STATE.md": "state\n"})
+    seal = events(store, "submission_file_seal")[-1]
+    assert set(seal["files"]) == {"ToDo/lead/LEDGER.json"}
+    assert seal["excluded"] == ["ToDo/lead/STATE.md"]
+    _accept(store)
+    integ.tick()
+    committed = git(root, "show", "--format=", "--name-only", "HEAD")
+    assert "ToDo/lead/LEDGER.json" in committed and "STATE.md" not in committed
+
+
+def test_refused_seal_is_typed_and_terminal(env, monkeypatch):
+    """1.3: печать невозможна — событие с причиной; интегратор пишет её в reason_code и не
+    повторяет приёмку вечно (раньше — missing_trusted_submission_file_seal каждые ~20 мин)."""
+    from dev_mcp.fleet import queue
+
+    real = queue._legacy_submission_files
+
+    def refuse(tx, claim, worker_id, scope_out=None, meta=None):
+        if meta is not None:
+            meta["refused"] = "path_is_link"
+        return None
+
+    monkeypatch.setattr(queue, "_legacy_submission_files", refuse)
+    store, root, integ = _seal_round(env, monkeypatch, {"ToDo/a.md": "milestone\n"})
+    monkeypatch.setattr(queue, "_legacy_submission_files", real)
+    refusal = events(store, "submission_seal_refused")
+    assert refusal and refusal[-1]["reason"] == "path_is_link"
+    _accept(store)
+    integ.tick()
+    outcome = events(store, "integrate")[-1]
+    assert outcome.get("reason_code") == "seal_refused:path_is_link", outcome
+    assert not outcome.get("deferred") and "повтор прекращён" in outcome.get("skipped", "")
+    before = len(events(store, "integrate"))
+    integ.tick()
+    assert len(events(store, "integrate")) == before
+
+
+def test_truncated_seal_is_a_typed_refusal(env, monkeypatch):
+    """1.3: зона шире MAX_COMMIT_PATHS — печать с флагом усечения, интегратор — seal_truncated."""
+    from dev_mcp.fleet import integrate as integrate_mod
+
+    monkeypatch.setattr(integrate_mod, "MAX_COMMIT_PATHS", 2)
+    store, root, integ = _seal_round(env, monkeypatch, {
+        "ToDo/a.md": "a\n", "ToDo/b.md": "b\n", "ToDo/c.md": "c\n"})
+    seal = events(store, "submission_file_seal")[-1]
+    assert seal["truncated"] == 3 and len(seal["files"]) == 2
+    _accept(store)
+    with store.read() as tx:
+        accept_id = int(tx.scalar("SELECT MAX(id) FROM events WHERE kind='accept'"))
+    sealed, reason = integ._accepted_file_seal("P", "TZ-work", accept_id, ["ToDo/a.md"])
+    assert sealed is None and reason == "seal_truncated"
+
+
+def test_seal_of_subfolder_project_reads_bytes_under_project_root(tmp_path, monkeypatch):
+    # 08.11: проект-подпапка (Main Hub = `_todo/hub-fleet` в репозитории пульта). Пути porcelain —
+    # от верха репозитория, а байты читались как `root / путь` — печать видела файл «удалённым».
+    from dev_mcp.fleet import goals, queue
+    repo = tmp_path / "Repo"
+    root = repo / "Sub" / "hub"
+    (root / "ToDo").mkdir(parents=True)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "t@t")
+    git(repo, "config", "user.name", "t")
+    (repo / "top.txt").write_text("top\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "init")
+    store = Store.open(str(tmp_path / "fleet.sqlite"))
+    monkeypatch.setattr(goals, "project_info", lambda _p: {"commit": True, "claim_trees": False})
+    target = root / "ToDo" / "TZ-sub.md"
+    with store.tx() as tx:
+        tx.change("INSERT INTO projects(name,root,priority,active) VALUES(?,?,1,1)", ("P", str(root)),
+                  event={"kind": "test_setup"})
+        tx.change("INSERT INTO workers(id,label,kind,first_seen,last_seen) VALUES ('W-A','W-A','chatgpt',?,?)",
+                  (now(), now()), event={"kind": "test_setup"})
+    add_task(store, "TZ-sub", [norm_path(str(target))])
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='ready' WHERE project='P' AND tz='TZ-sub'", (),
+                  event={"kind": "test_setup"})
+    assert queue.take_next(store, "W-A", "P").tz == "TZ-sub"
+    target.write_text("sub candidate\n", encoding="utf-8")
+    queue.submit(store, "W-A", "submitted from a subfolder project")
+    with store.read() as tx:
+        seal = tx.one("SELECT payload FROM events WHERE kind='submission_file_seal'")
+        snap = tx.one("SELECT payload FROM events WHERE kind='submission_snapshot'")
+    files = json.loads(seal["payload"])["files"]
+    assert files == {"Sub/hub/ToDo/TZ-sub.md": hashlib.sha256(target.read_bytes()).hexdigest()}
+    snapshot = json.loads(snap["payload"])
+    assert snapshot.get("written") == 1 and "refused" not in snapshot
+
+
+def test_candidate_result_is_reused_for_same_head_bytes_and_commands(env, monkeypatch):
+    # 08.11: отложенная приёмка заново строила worktree и гоняла приёмку на тех же байтах.
+    store, root, _, temp = env
+    integ = make(store, temp)
+    (root / "base.txt").write_text("changed\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(integ, "_candidate_run", lambda *a, **k: calls.append(1) or (True, ""))
+    assert integ._candidate(str(root), ["base.txt"], "P", ["cmd"]) == (True, "")
+    assert integ._candidate(str(root), ["base.txt"], "P", ["cmd"]) == (True, "")
+    assert len(calls) == 1
+    (root / "base.txt").write_text("changed again\n", encoding="utf-8")
+    integ._candidate(str(root), ["base.txt"], "P", ["cmd"])
+    assert len(calls) == 2  # другие байты — новая проверка
+    monkeypatch.setattr(integ, "_candidate_run", lambda *a, **k: calls.append(1) or (False, "validation_timeout"))
+    (root / "base.txt").write_text("third\n", encoding="utf-8")
+    integ._candidate(str(root), ["base.txt"], "P", ["cmd"])
+    integ._candidate(str(root), ["base.txt"], "P", ["cmd"])
+    assert len(calls) == 4  # сбой среды не запоминается

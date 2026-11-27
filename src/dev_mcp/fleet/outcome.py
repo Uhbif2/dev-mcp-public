@@ -396,7 +396,10 @@ def check_invariant(store: Store) -> list[Violation]:
     install_schema(store)
     violations: list[Violation] = []
     with store.read() as tx:
-        open_rows = tx.query("SELECT id,parent_id FROM outcomes WHERE state='open' ORDER BY id")
+        # Поддерево обязательств продукта (product.py, LEAD-SYSTEM-DESIGN 2.1) — не работа
+        # контроллера: у O-* нет outcome_work, иначе на каждое родился бы «план».
+        open_rows = tx.query("SELECT id,parent_id FROM outcomes WHERE state='open' "
+                             "AND intent_id NOT LIKE 'product:%' ORDER BY id")
         active = {r["id"] for r in open_rows}
         parents = {r["parent_id"] for r in open_rows if r["parent_id"] is not None}
         obstacles = tx.query("SELECT * FROM obstacles WHERE state='open' ORDER BY outcome_id,id")

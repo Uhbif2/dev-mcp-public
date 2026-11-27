@@ -1,10 +1,17 @@
 import pytest
+import shutil
+
+
+@pytest.fixture
+def requires_python_launcher():
+    if not shutil.which('py'):
+        pytest.skip('Windows py launcher is not installed; executable preflight requires it')
 
 from dev_mcp.fleet.spec_preflight import _command, _executable_exists, preflight_task, ProbeNotApplicable
 from dev_mcp.fleet.model import Task
 
 
-def test_document_script_arguments_keep_immutable_preflight_and_do_not_run_fixture(tmp_path):
+def test_document_script_arguments_keep_immutable_preflight_and_do_not_run_fixture(tmp_path, requires_python_launcher):
     script = tmp_path/'tools/tzcheck.py'
     script.parent.mkdir()
     script.write_text('raise RuntimeError("must not execute in fixture")', encoding='utf-8')

@@ -365,6 +365,22 @@ def test_needs_gate(tmp_path: Path):
     assert take_next(store, "W").tz == "TZ-B"
 
 
+def test_submitted_needs_take_and_reject_relocks(tmp_path: Path):
+    store = StubStore.open(tmp_path / "submitted-needs.sqlite")
+    add_project(store, "P")
+    add_worker(store, "W")
+    add_task(store, "TZ-A", state="submitted")
+    add_task(store, "TZ-B", needs=("TZ-A#submitted",))
+    assert take_next(store, "W").tz == "TZ-B"
+
+    # A different not-yet-taken consumer must stop after a rejected source.
+    add_worker(store, "W2")
+    add_task(store, "TZ-C", needs=("TZ-A#submitted",))
+    with store.tx() as db:
+        db.execute("UPDATE tasks SET state='rejected' WHERE project='P' AND tz='TZ-A'")
+    assert take_next(store, "W2") is None
+
+
 def test_resource_is_global_across_projects(tmp_path: Path):
     store = StubStore.open(tmp_path / "resource.sqlite")
     add_project(store, "A")
@@ -1348,3 +1364,121 @@ def test_accepted_watch_survives_sqlite_reopen_and_dependency_thaw(tmp_path: Pat
     assert any(item.startswith("P/watch:pending-dependency:") for item in thaw_frozen(reopened, after_min=20))
     with reopened.tx() as db:
         assert db.one("SELECT state FROM tasks WHERE tz='watch:pending-dependency'")["state"] == "ready"
+
+
+def test_lead_zone_does_not_hold_specialized_take(tmp_path: Path):
+    # 03.11: широкий TZ-LEAD (client/) не держит выдачу профильной TZ-312 (client/win/field)
+    # и наоборот; столкновение по файлу разводит guard.check_write.
+    store = StubStore.open(tmp_path / "lead.sqlite")
+    add_project(store, "P")
+    for worker in ("W1", "W2", "W3", "W4"):
+        add_worker(store, worker)
+    add_task(store, "fix:TZ-LEAD", owns=("/repo/client",), priority=9)
+    add_task(store, "TZ-312", owns=("/repo/client/win/field",), priority=5)
+    add_task(store, "TZ-313", owns=("/repo/client/win/field/x.py",), priority=4)
+    first, second = take_next(store, "W1"), take_next(store, "W2")
+    assert first is not None and second is not None
+    taken = {first.tz, second.tz}
+    assert "fix:TZ-LEAD" in taken and taken & {"TZ-312", "TZ-313"}
+    assert take_next(store, "W3") is None   # профильные между собой по-прежнему разводятся
+
+
+def test_repair_reservation_does_not_hold_lead_charter(tmp_path: Path):
+    store = StubStore.open(tmp_path / "lead-repair-reservation.sqlite")
+    add_project(store, "P")
+    add_worker(store, "W-active")
+    add_worker(store, "W-lead")
+    add_task(store, "TZ-NARROW", owns=("/repo/lead/reviews/report.md",))
+    assert take_next(store, "W-active").tz == "TZ-NARROW"
+
+    add_task(store, "fix:TZ-NARROW", kind="fix", owns=("/repo/lead/reviews",), priority=10)
+    add_task(store, "TZ-LEAD", owns=("/repo/lead",), priority=5)
+    assert take_next(store, "W-lead").tz == "TZ-LEAD"
+
+
+def test_lead_chat_resumes_same_project_after_accepted_submission(tmp_path: Path):
+    from dev_mcp.fleet.queue import peek_next
+
+    store = StubStore.open(tmp_path / "lead-continuity.sqlite")
+    add_project(store, "P")
+    add_project(store, "Q")
+    for worker in ("W-lead", "W-work", "W-new"):
+        add_worker(store, worker)
+    add_task(store, "TZ-LEAD", project="P")
+    add_task(store, "TZ-WORK", project="Q")
+    assert take_next(store, "W-lead", project="P").tz == "TZ-LEAD"
+    assert take_next(store, "W-work", project="Q").tz == "TZ-WORK"
+    add_task(store, "TZ-LEAD", project="Q", priority=10)
+    add_task(store, "TZ-WORK", project="P", priority=10)
+    with store.tx() as tx:
+        tx.execute("UPDATE claims SET state='released',released_at=?", (now(),))
+        tx.execute("UPDATE tasks SET state='accepted' WHERE project='Q' AND tz='TZ-WORK'")
+        tx.execute("UPDATE tasks SET state='ready',author_worker='W-lead' WHERE project='P' AND tz='TZ-LEAD'")
+        tx.record_event(kind="submit", worker_id="W-lead", project="P", tz="TZ-LEAD")
+        tx.record_event(kind="accept", project="P", tz="TZ-LEAD")
+
+    assert peek_next(store, project="P")[0].tz == "TZ-WORK"
+    assert take_next(store, "W-work", project="Q") is None
+    assert take_next(store, "W-lead", project="Q") is None
+    resumed = take_next(store, "W-lead")
+    assert (resumed.project, resumed.tz) == ("P", "TZ-LEAD")
+    with store.read() as tx:
+        assert tx.scalar("SELECT count(*) FROM claims WHERE worker_id='W-lead' AND tz='TZ-LEAD'") == 2
+        assert tx.scalar("SELECT count(*) FROM claims WHERE worker_id='W-lead' AND state='active'") == 1
+    assert take_next(store, "W-new", project="Q").tz == "TZ-LEAD"
+
+
+def test_lead_handoff_expires_without_holding_the_project(tmp_path: Path):
+    from dev_mcp.fleet.queue import peek_next
+
+    store = StubStore.open(tmp_path / "lead-handoff-expired.sqlite")
+    add_project(store, "P")
+    add_worker(store, "W-lead")
+    add_worker(store, "W-new")
+    add_task(store, "TZ-LEAD")
+    assert take_next(store, "W-lead").tz == "TZ-LEAD"
+    with store.tx() as tx:
+        tx.execute("UPDATE claims SET state='released',released_at=?", (now(),))
+        tx.execute("UPDATE tasks SET state='ready',author_worker='W-lead'")
+        tx.record_event(kind="submit", worker_id="W-lead", project="P", tz="TZ-LEAD")
+        tx.record_event(kind="accept", project="P", tz="TZ-LEAD")
+    assert peek_next(store, project="P") == (None, 0)
+    with store.tx() as tx:
+        tx.execute("UPDATE claims SET released_at=?", (now(-2),))
+    assert take_next(store, "W-new", project="P").tz == "TZ-LEAD"
+
+
+def test_visual_review_needs_image_capable_conversation(tmp_path: Path):
+    from dev_mcp.fleet import queue
+
+    store = StubStore.open(tmp_path / "visual.sqlite")
+    add_project(store, "P")
+    add_worker(store, "W-old")
+    add_worker(store, "W-new")
+    add_task(store, "review:TZ-A:1", kind="review")
+    add_task(store, "TZ-B", kind="work")
+    with store.tx() as tx:
+        tx.execute("UPDATE tasks SET body='Compare screenshots/evidence.png' "
+                   "WHERE tz='review:TZ-A:1'")
+        tx.execute("UPDATE workers SET first_seen='2026-11-16T05:00:00+00:00' WHERE id='W-old'")
+        tx.execute("UPDATE workers SET first_seen='2026-11-16T07:00:00+00:00' WHERE id='W-new'")
+    assert take_next(store, "W-old").tz == "TZ-B"
+    assert take_next(store, "W-new").tz == "review:TZ-A:1"
+    assert queue._visual_review_required({"kind": "review", "body": "needs_tools: [read_image]"})
+    assert not queue._visual_review_required({"kind": "work", "body": "evidence.png"})
+
+    # With no alternative task the claim is never created/rejected, and the
+    # operator receives an actionable refusal event.
+    solo = StubStore.open(tmp_path / "visual-only.sqlite")
+    add_project(solo, "P")
+    add_worker(solo, "W-old")
+    add_task(solo, "review:TZ-A:1", kind="review")
+    with solo.tx() as tx:
+        tx.execute("UPDATE tasks SET body='needs_tools: [read_image]'")
+        tx.execute("UPDATE workers SET first_seen='2026-11-16T05:00:00+00:00'")
+    assert take_next(solo, "W-old") is None
+    with solo.read() as tx:
+        assert tx.one("SELECT state FROM tasks WHERE tz='review:TZ-A:1'")["state"] == "ready"
+        assert tx.one("SELECT COUNT(*) AS n FROM claims")["n"] == 0
+        event = tx.one("SELECT payload FROM events WHERE kind='claim_take_refused'")
+        assert event is not None and "новый разговор" in event["payload"]

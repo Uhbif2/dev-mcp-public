@@ -8,7 +8,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-DEBUG_URL = "http://127.0.0.1:9223/json/version"
+DEBUG_URL = "http://localhost:9223/json/version"
 DEBUG_PORT = 9223
 START_TIMEOUT_S = 20.0
 
@@ -47,15 +47,13 @@ def chrome_args() -> list[str]:
         "--restore-last-session",
         "--new-window",
         "--no-first-run",
-        "--disable-background-timer-throttling",
-        "--disable-renderer-backgrounding",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-features=IntensiveWakeUpThrottling,CalculateNativeWinOcclusion",
+        # Без флагов против троттлинга фона (17.11, см. fleet/supervisor.py chrome_argv).
         "https://chatgpt.com/",
     ]
 
 
 def start_priority_keeper() -> None:
+    return  # 17.11.2026: выключен (см. fleet/supervisor.py start_priority_keeper)
     script = Path(__file__).resolve().parents[1] / "extension" / "fleet-tabs" / "fleet-priority.ps1"
     if not script.is_file():
         return

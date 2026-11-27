@@ -18,8 +18,14 @@ os.environ['DEV_MCP_JEV_FROM_CLAUDE'] = '0'
 os.environ.setdefault('DEV_MCP_FLEET_REQUIRE_GREEN_SUBMIT', '0')
 # Датчики мира (fleet/world.py) в тестах не опрашивают живой adb этой машины.
 os.environ['DEV_MCP_FLEET_SENSORS'] = '0'
+# Свидетели обещаний (fleet/witness.py) в тестах не гоняют живые команды проектов.
+os.environ['DEV_MCP_FLEET_WITNESS'] = '0'
 # Host-мьютекс гейтов (world.hold_blocking) в тестах выключен: живые прогоны этой машины не ждём.
 os.environ.setdefault('DEV_MCP_FLEET_GATE_LOCK', '0')
+# Проверка рамки (intents/frame_check.py) — платный вызов OpenRouter: в тестах не запускается.
+os.environ['DEV_MCP_FRAME_CHECK'] = '0'
+# Снимок сдачи (fleet/snapshot.py) идёт фоновым потоком с git: в тестах выключен, свои тесты зовут его явно.
+os.environ.setdefault('DEV_MCP_FLEET_SUBMIT_SNAPSHOT', '0')
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +37,17 @@ def isolated_platform_mode(monkeypatch):
     """
     from dev_mcp.fleet import platform_manual
     monkeypatch.setattr(platform_manual, 'enabled', lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def legacy_task_generators_for_existing_tests(monkeypatch):
+    """Older producer tests explicitly exercise the historical enabled mode.
+
+    Production is fail-closed; tests/fleet/test_generators.py overrides this
+    fixture in its own switch assertions.
+    """
+    from dev_mcp.fleet import generators
+    monkeypatch.setattr(generators, 'enabled', lambda: True)
 
 
 @pytest.fixture(autouse=True)
@@ -51,3 +68,14 @@ def isolated_owner_channel(monkeypatch, tmp_path):
     inbox = tmp_path / '_isolated_intent_inbox'
     inbox.mkdir(exist_ok=True)
     monkeypatch.setattr(controller, 'INTENT_INBOX', inbox)
+
+
+
+
+@pytest.fixture(autouse=True)
+def _fresh_process_caches():
+    """15.11: кеши холостых тактов (разбор ТЗ, умолчания проектов интенций) — на тест свои."""
+    from dev_mcp.fleet import goals, queue_intake
+    goals._INTENT_DEFAULTS.clear()
+    queue_intake._PARSED.clear()
+    yield

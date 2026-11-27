@@ -207,8 +207,6 @@ def test_production_controller_invokes_regater_tick(setup, monkeypatch):
     fired = threading.Event()
     monkeypatch.setattr(Regater, "tick", lambda self: fired.set() or [])
     monkeypatch.setattr(controller_module, "run_daily_drill_scheduler", lambda _stop: None)
-    monkeypatch.setattr(controller_module, "run_cross_review_worker",
-                        lambda _store, _stop: None)
 
     def finish_tick(_self):
         found = fired.wait(2)

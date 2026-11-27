@@ -6,6 +6,7 @@ The server supplies allowed_roots. The source's raw intent supplies no rights.
 from __future__ import annotations
 
 from dev_mcp import machine
+from dev_mcp.json_book import write_json
 
 import hashlib
 import json
@@ -384,7 +385,10 @@ def route_proven_understood(store: Store, tree: OutcomeTree) -> OutcomeTree:
             or aggregate["state"] not in ("open", "dropped") or cancelled):
         return tree
     staging = Path(root["root"])
-    kind, target = stage_check.routing(staging)
+    from dev_mcp.fleet import relocation
+    relocated = relocation.current_target(store, tree.project, staging, tree.nodes[0].spec)
+    kind, target = stage_check.routing(staging, **(
+        {'relocated_target': relocated} if relocated is not None else {}))
     size = stage_check.size(staging)
     # Тройка нужна неясным большим задачам; small/medium идут одной версией.
     triple = tree.triple and size == "large"
@@ -399,7 +403,8 @@ def route_proven_understood(store: Store, tree: OutcomeTree) -> OutcomeTree:
     if os.path.normcase(str(destination)) != os.path.normcase(str(raw.absolute())):
         raise SpawnError("target contains a path alias")
     allowed = tuple(_canonical(Path(p)) for p in tree.nodes[0].authority.get("project_roots", ()))
-    if not any(destination != parent and destination.is_relative_to(parent) for parent in allowed):
+    if relocated is None and not any(
+            destination != parent and destination.is_relative_to(parent) for parent in allowed):
         raise SpawnError("target outside trusted roots or target is the root itself")
     origin = {"source_id": str(tree.nodes[0].spec["source_id"]),
               "external_id": str(tree.nodes[0].spec["external_id"])}
@@ -490,14 +495,13 @@ def route_proven_understood(store: Store, tree: OutcomeTree) -> OutcomeTree:
             IntentEnvelope(origin["source_id"], origin["external_id"], tree.revision,
                            (staging / ".intent/intent.md").read_text(encoding="utf-8"),
                            tree.nodes[0].authority, _now()), project)
-        component.write_text(_canonical_json(next_manifest) + "\n", encoding="utf-8")
+        write_json(component, next_manifest, trailing_newline=True)
     elif not component.exists():
-        component.write_text(_canonical_json(_manifest(
+        write_json(component, _manifest(
             IntentEnvelope(str(tree.nodes[0].spec["source_id"]),
                            str(tree.nodes[0].spec["external_id"]), tree.revision,
                            (staging / ".intent/intent.md").read_text(encoding="utf-8"),
-                           tree.nodes[0].authority, _now()), project)) + "\n",
-                             encoding="utf-8")
+                           tree.nodes[0].authority, _now()), project), trailing_newline=True)
     elif component.is_symlink() or not component.is_file():
         raise SpawnError("target component manifest unsafe")
     digest = hashlib.sha256(component.read_bytes()).hexdigest()
@@ -511,7 +515,8 @@ def route_proven_understood(store: Store, tree: OutcomeTree) -> OutcomeTree:
         _persist_tree(store, destination, next_tree, digest, inherited_understood=True)
     except Exception:
         if previous_manifest_bytes is not None:
-            component.write_bytes(previous_manifest_bytes)
+            write_json(component, json.loads(previous_manifest_bytes),
+                           trailing_newline=previous_manifest_bytes.endswith(b"\n"))
         raise
     if takeover:
         with store.tx() as tx:

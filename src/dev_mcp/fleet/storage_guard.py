@@ -14,7 +14,10 @@ import threading
 from datetime import datetime, timezone
 from typing import Any
 
-MIN_FREE_BYTES = 8 * 1024 ** 3
+# Emergency admission is intentionally below the observed 7.9 GiB idle
+# background (17.11.2026), and above the 256 MiB compaction crash reserve.
+# Build-specific 8 GiB admission remains a separate, stricter run resource.
+MIN_FREE_BYTES = 6 * 1024 ** 3
 COMPACT_BELOW_BYTES = 12 * 1024 ** 3
 _BACKUP = re.compile(r"fleet-\d{8}-\d{6}(?:-\d+)?\.sqlite$")
 
@@ -119,7 +122,7 @@ def run_worker(store: Any, stop_event: Any, *, interval_s: float = 60) -> None:
             if state != previous:
                 alert = {"ts": datetime.now(timezone.utc).isoformat(), "kind": "storage_pressure",
                          "state": "active" if state == "down" else "resolved", "free_bytes": free,
-                         "message": f"Диск флота: свободно {free / 1024**3:.1f} ГиБ; порог сборок 8 ГиБ."}
+                         "message": f"Диск флота: свободно {free / 1024**3:.1f} ГиБ; аварийный порог {MIN_FREE_BYTES / 1024**3:.1f} ГиБ."}
                 with (home / "data" / "owner-alerts.jsonl").open("a", encoding="utf-8") as out:
                     out.write(json.dumps(alert, ensure_ascii=False) + "\n")
         except Exception as exc:
@@ -130,6 +133,24 @@ def run_worker(store: Any, stop_event: Any, *, interval_s: float = 60) -> None:
             except Exception:
                 logging.getLogger(__name__).exception("storage heartbeat unavailable")
         stop_event.wait(interval_s)
+
+
+def admission() -> tuple[bool, str]:
+    """Fresh host-volume emergency admission; shared by queue and heavy runs.
+
+    Use the same volume and threshold as the storage heartbeat, not a second
+    cached sensor (or an obsolete event observed before the disk filled).
+    """
+    home = Path(__file__).resolve().parents[3]
+    try:
+        free = shutil.disk_usage(home).free
+    except OSError as exc:
+        return False, f"storage: диск не проверен ({type(exc).__name__}); выдача/запуск отложены"
+    if free < MIN_FREE_BYTES:
+        return False, (f"storage: недостаточно места: свободно {free / 1024**3:.1f} ГиБ, "
+                       f"аварийный порог {MIN_FREE_BYTES / 1024**3:.1f} ГиБ; "
+                       "выдача/тяжёлый запуск отложены, файлы не удаляются")
+    return True, ""
 
 
 def health(store: Any) -> str:

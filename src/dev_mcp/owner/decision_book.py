@@ -1,6 +1,6 @@
 """Scoped decision provenance and fail-closed owner-question resolver.
 
-No direct access to memory_service or Obsidian: a Jev/Gemini broker supplies typed,
+No direct access to memory_service or Obsidian: a Jev broker supplies typed,
 access-filtered observations. This is a library, not an agent-facing tool.
 """
 from __future__ import annotations
@@ -19,7 +19,7 @@ from dev_mcp.fleet.store import Store
 
 OWNER_SOURCES = frozenset({"owner_tz", "owner_reply", "owner_intent", "decision_file"})
 MEMORY_SOURCES = frozenset({"memory_service_rule", "memory_service_organic", "obsidian"})
-BROKERS = frozenset({"jev", "gemini"})
+BROKERS = frozenset({"jev"})
 _KEY = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_.:/#-]{0,255}$")
 
 

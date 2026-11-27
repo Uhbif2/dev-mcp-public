@@ -30,10 +30,43 @@ def test_project_forecast_builds_dependency_snapshot_once(tmp_path):
     queries = []
     store._connection().set_trace_callback(queries.append)
     result = queue.peek_projects(store)
-    scans = [q for q in queries if q == 'SELECT project,tz,state,needs,resources FROM tasks']
+    scans = [q for q in queries if q.startswith('SELECT project,tz,state,needs,resources FROM tasks WHERE state NOT IN')]
     assert len(scans) == 1, scans
     assert [p for p, _, _ in result] == [f'P{i:02d}' for i in range(12)]
     assert [n for _, _, n in result] == [i % 2 for i in range(12)]
+
+
+def test_forecast_ignores_terminal_history_but_keeps_referenced_proofs(tmp_path, monkeypatch):
+    import json
+    from dev_mcp.fleet import world
+    store = seed(tmp_path)
+    now = datetime.now(timezone.utc).isoformat()
+    with store.tx() as tx:
+        tx._conn.executemany(
+            'INSERT INTO tasks(project,tz,state,needs,created_at,updated_at) VALUES(?,?,?,?,?,?)',
+            [('P01', f'old-{i}', 'accepted', '["ancient-input"]', now, now) for i in range(2500)])
+        tx.change("UPDATE tasks SET needs=? WHERE project='P01' AND tz='TZ-1'",
+                  (json.dumps(['old-4#contract']),), event='seed')
+        tx.change("INSERT INTO tasks(project,tz,state,needs,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                  ('P01', 'TZ-2', 'ready', '["missing-proof"]', now, now), event='seed')
+        tx.change("INSERT INTO tasks(project,tz,state,needs,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                  ('P01', 'TZ-3', 'ready', '["old-rejected"]', now, now), event='seed')
+        tx.change("INSERT INTO tasks(project,tz,state,created_at,updated_at) VALUES(?,?,?,?,?)",
+                  ('P01', 'old-rejected', 'rejected', now, now), event='seed')
+    seen = []
+    build = world.build_index
+    def measured(rows, *args):
+        seen.append(len(rows))
+        return build(rows, *args)
+    monkeypatch.setattr(world, 'build_index', measured)
+    compact = queue.peek_projects(store)
+    assert max(seen) < 20, 'closed history must not enter the refresh dependency graph'
+    p1 = next((task, count) for project, task, count in compact if project == 'P01')
+    assert p1[0].tz == 'TZ-1' and p1[1] == 1
+    def full_snapshot(tx):
+        return queue._rows(tx.query('SELECT project,tz,state,needs,resources FROM tasks')), world.block_refs(tx)
+    monkeypatch.setattr(queue, '_dependency_snapshot', full_snapshot)
+    assert queue.peek_projects(store) == compact
 
 
 def test_blocker_explanation_never_acquires_write_transaction(tmp_path, monkeypatch):

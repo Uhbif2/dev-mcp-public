@@ -17,8 +17,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,17 +28,80 @@ from typing import Any, Iterator
 
 _LOCK = threading.Lock()
 _MAX_ARG_CHARS = 300
+_REDACTED = '[REDACTED]'
+# server.py: write_file.content, edit_file.old_string/new_string,
+# apply_patch.patch, request_note.summary/detail. Остальные — на будущее.
+_CONTENT_KEYS = frozenset({
+    'content', 'old_string', 'new_string', 'patch', 'text', 'body', 'data',
+    'detail', 'summary', 'payload', 'script', 'stdin', 'message', 'prompt', 'code',
+})
+_CONTENT_SUFFIXES = ('_content', '_contents', '_text', '_body', '_data', '_patch', '_payload')
+_SECRET_KEY_PARTS = ('key', 'token', 'secret', 'password')
+_SECRET_VALUE = re.compile(
+    r'(?i)\b(?:Bearer\s+\S+|sk-[A-Za-z0-9_-]+|'
+    r'(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]+|'
+    r'xox[a-z0-9]*-[A-Za-z0-9-]+|AKIA[A-Z0-9]{16})'
+)
+# Пароли без узнаваемого префикса, переданные как URL query или --token=...
+_SECRET_ASSIGNMENT = re.compile(
+    r'(?i)(?:^|[?&,\s-])[\w-]*(?:key|token|secret|password)[\w-]*\s*[=:]'
+)
+_SECRET_CLI_FLAG = re.compile(r'(?i)^--?[\w-]*(?:key|token|secret|password)[\w-]*$')
 
 
-def _trim(value: Any) -> Any:
-    """Аргументы режем: в write прилетает целый файл, в журнале он не нужен."""
+def _is_content_key(key: str) -> bool:
+    name = key.casefold()
+    return name in _CONTENT_KEYS or name.endswith(_CONTENT_SUFFIXES)
+
+
+def _has_secret(value: str) -> bool:
+    return bool(_SECRET_VALUE.search(value) or _SECRET_ASSIGNMENT.search(value))
+
+
+def _fingerprint(value: Any) -> dict[str, int | str]:
+    """Только размер исходного текста и префикс SHA-256, без его фрагментов."""
     if isinstance(value, str):
+        raw = value.encode('utf-8')
+        length = len(value)
+    elif isinstance(value, bytes):
+        raw = value
+        length = len(value)
+    else:
+        serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        raw = serialized.encode('utf-8')
+        length = len(serialized)
+    return {'length': length, 'sha256': hashlib.sha256(raw).hexdigest()[:12]}
+
+
+def _trim(value: Any, *, key: str = '') -> Any:
+    """Рекурсивно скрываем содержимое и секреты до записи в JSONL."""
+    name = key.casefold()
+    if any(part in name for part in _SECRET_KEY_PARTS):
+        return _REDACTED
+    if _is_content_key(name):
+        return _fingerprint(value)
+    if isinstance(value, str):
+        if _has_secret(value):
+            return _REDACTED
         return value if len(value) <= _MAX_ARG_CHARS else value[:_MAX_ARG_CHARS] + f'…(+{len(value) - _MAX_ARG_CHARS})'
     if isinstance(value, dict):
-        return {k: _trim(v) for k, v in value.items()}
+        return {k: _trim(v, key=str(k)) for k, v in value.items()}
     if isinstance(value, list):
-        return [_trim(v) for v in value[:10]]
+        result = []
+        mask_next = False
+        for item in value[:10]:
+            result.append(_REDACTED if mask_next else _trim(item))
+            mask_next = isinstance(item, str) and bool(_SECRET_CLI_FLAG.fullmatch(item))
+        return result
     return value
+
+
+def _safe_reason(reason: str) -> str:
+    # edit_file при ошибке сравнения включает несколько строк исходного файла.
+    marker = '\nБлиже всего — строка'
+    if marker in reason:
+        reason = reason.split(marker, 1)[0] + '\n[content redacted]'
+    return _REDACTED if _has_secret(reason) else reason
 
 
 def _first_day(path: Path) -> str:
@@ -125,14 +190,14 @@ class Audit:
             'ts': now.isoformat(timespec='seconds'),
             'tool': tool,
             'decision': decision,
-            'reason': reason,
+            'reason': _safe_reason(reason),
             'result_bytes': result_bytes,
             # Сколько вызов занял. Без этого числа жалоба «сервер тормозит»
             # проверяется только замерами со стороны: журнал знал ЧТО вызывали,
             # но не знал, сколько это шло, и медленный инструмент было не
             # отличить от медленного транспорта.
             'dur_ms': dur_ms,
-            'agent': agent or '',
+            'agent': _trim(agent or ''),
             'args': _trim(args),
         }
         if inferred:

@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 
 from dev_mcp.fleet import world
+from dev_mcp.fleet import storage_guard, queue
 from dev_mcp.fleet.queue import take_next, thaw_frozen
 from dev_mcp.fleet.store import Store
 
@@ -172,6 +173,72 @@ def test_named_unaccepted_dependency_wins_over_resource(store: Store) -> None:
     assert thaw_frozen(store) == []
 
 
+
+
+
+def test_structured_resource_wait_thaws_with_generators_disabled(store: Store, monkeypatch) -> None:
+    from dev_mcp.fleet import generators
+    add(store, "LIVE", resources=["телефон"])
+    sense(store, "down")
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='frozen' WHERE project='P' AND tz='LIVE'",
+                  event={"kind": "test_setup"})
+        tx.record_event(kind="block", project="P", tz="LIVE", ts=now(-1), payload={
+            "origin": "fleet_auto", "gate": "resource",
+            "resource_wait": ["телефон"], "reason": "телефон недоступен"})
+    monkeypatch.setattr(generators, "enabled", lambda: False)
+    assert thaw_frozen(store) == []
+    sense(store, "up")
+    assert any("ресурс телефон вернулся" in value for value in thaw_frozen(store))
+    with store.read() as tx:
+        assert tx.one("SELECT state FROM tasks WHERE tz='LIVE'")["state"] == "ready"
+        assert tx.one("SELECT kind FROM events WHERE tz='LIVE' ORDER BY id DESC LIMIT 1")["kind"] == "resource_return"
+
+
+def test_owner_freeze_not_thawed_by_resource_return(store: Store) -> None:
+    add(store, "OWNER", resources=["телефон"])
+    sense(store, "down")
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET state='frozen' WHERE tz='OWNER'",
+                  event={"kind": "test_setup"})
+        tx.record_event(kind="freeze", project="P", tz="OWNER", ts=now(-1),
+                        payload={"origin": "owner", "reason": "owner decision"})
+    sense(store, "up")
+    assert thaw_frozen(store) == []
+    with store.read() as tx:
+        assert tx.one("SELECT state FROM tasks WHERE tz='OWNER'")["state"] == "frozen"
+
+
+
+
+def test_test_run_has_two_slots_and_reports_both_holders(monkeypatch) -> None:
+    from dev_mcp.fleet import world
+    import types
+    monkeypatch.setenv('DEV_MCP_FLEET_GATE_LOCK', '1')
+    monkeypatch.setattr(world, "config", lambda: {
+        "test-run": {"scope": "run", "global": True,
+                     "run_match": r"\bpytest\b", "capacity": 2}})
+    monkeypatch.setattr(world, "_foreign_runs", lambda _: [])
+    monkeypatch.setattr(world, "claim_resources", lambda *args: [])
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(
+        virtual_memory=lambda: types.SimpleNamespace(available=8 * 1024 ** 3)))
+    first, err1 = world.hold_for_run(None, "", ["pytest"], "first", wait_s=0)
+    second, err2 = world.hold_for_run(None, "", ["pytest"], "second", wait_s=0)
+    try:
+        assert first is not None and second is not None
+        assert err1 == err2 == ""
+        assert "test-run" in world.busy_run_resources(world.config(), ttl_s=0)
+        third, err3 = world.hold_for_run(None, "", ["pytest"], "third", wait_s=0)
+        assert third is None and "first" in err3 and "second" in err3
+    finally:
+        if second:
+            second()
+        if first:
+            first()
+    fourth, err4 = world.hold_for_run(None, "", ["pytest"], "fourth", wait_s=0)
+    assert fourth is not None and not err4
+    fourth()
+
 class FakeAdb:
     def __init__(self, body: bytes, status: bytes = b"OKAY") -> None:
         self.sock = socket.socket()
@@ -308,6 +375,21 @@ def test_level_dependency_satisfied_by_provide_submit_or_accept() -> None:
     assert world.unmet_needs("P", ["API#impl"], [], index, W) == ["API#impl"]
     index[("P", "API")].update(state="submitted", provided=set())
     assert world.unmet_needs("P", ["API#contract"], [], index, W) == []
+
+
+def test_submitted_dependency_relocks_after_reject() -> None:
+    index = idx({"API": ("taken", [], [])})
+    assert world.unmet_needs("P", ["API"], [], index, W) == ["API"]
+    assert world.unmet_needs("P", ["API#submitted"], [], index, W) == ["API#submitted"]
+    index[("P", "API")]["provided"] = {"submitted"}
+    assert world.unmet_needs("P", ["API#submitted"], [], index, W) == ["API#submitted"]
+    index[("P", "API")]["state"] = "submitted"
+    assert world.unmet_needs("P", ["API"], [], index, W) == ["API"]
+    assert world.unmet_needs("P", ["API#submitted"], [], index, W) == []
+    index[("P", "API")]["state"] = "rejected"
+    assert world.unmet_needs("P", ["API#submitted"], [], index, W) == ["API#submitted"]
+    index[("P", "API")]["state"] = "accepted"
+    assert world.unmet_needs("P", ["API#submitted"], [], index, W) == []
 
 
 def test_checkpoint_provide_unlocks_consumer(store: Store) -> None:
@@ -611,3 +693,111 @@ def test_disk_sensor_needs_a_margin_to_come_back_up(store: Store, monkeypatch) -
     assert world.record(store, {"build-disk": (world.UP, "just above")}) == []
     monkeypatch.setattr("shutil.disk_usage", lambda p: SimpleNamespace(free=160))
     assert world.record(store, {"build-disk": (world.UP, "clear")}) == ["build-disk"]
+
+
+def test_emergency_storage_blocks_take_and_is_explained_by_why_predicate(
+        store: Store, monkeypatch) -> None:
+    add(store, "DISK")
+    monkeypatch.setattr(storage_guard, "admission", lambda: (False, "storage: свободно 5 ГиБ"))
+    with store.read() as tx:
+        skipped = []
+        assert list(queue._available(tx, "W1", skipped=skipped)) == []
+        assert skipped == [("P", "DISK", "storage: свободно 5 ГиБ")]
+    assert take_next(store, "W1") is None
+    with store.read() as tx:
+        assert tx.scalar("SELECT COUNT(*) FROM claims") == 0
+    monkeypatch.setattr(storage_guard, "admission", lambda: (True, ""))
+    assert take_next(store, "W1") is not None
+
+
+def test_quick_and_operator_pytest_share_low_ram_slot(monkeypatch):
+    from types import SimpleNamespace
+    import psutil
+    cfg = {"test-run": {"scope": "run", "global": True,
+                         "run_match": r"\bpytest\b", "capacity": 2}}
+    monkeypatch.setattr(world, "config", lambda: cfg)
+    monkeypatch.setattr(storage_guard, "admission", lambda: (True, ""))
+    available = [int(1.5 * 1024**3)]
+    monkeypatch.setattr(psutil, "virtual_memory",
+                        lambda: SimpleNamespace(available=available[0]))
+    first, _ = world.hold_for_run(None, "", ["py", "-3", "-m", "pytest", "-q"],
+                                  "Q5-quick", wait_s=0)
+    assert callable(first)
+    try:
+        other, why = world.hold_for_run(None, "", ["python", "-m", "pytest"],
+                                         "Claude-operator", wait_s=0)
+        assert other is None and "занят" in why
+    finally:
+        first()
+    second, _ = world.hold_for_run(None, "", ["python", "-m", "pytest"],
+                                    "Claude-operator", wait_s=0)
+    assert callable(second)
+    second()
+
+
+def test_ram_drop_does_not_reopen_first_slot_while_second_still_running(monkeypatch):
+    from types import SimpleNamespace
+    import psutil
+    cfg = {"test-run": {"scope": "run", "global": True,
+                         "run_match": r"\bpytest\b", "capacity": 2}}
+    monkeypatch.setattr(world, "config", lambda: cfg)
+    monkeypatch.setattr(storage_guard, "admission", lambda: (True, ""))
+    available = [3 * 1024**3]
+    monkeypatch.setattr(psutil, "virtual_memory",
+                        lambda: SimpleNamespace(available=available[0]))
+    first, _ = world.hold_for_run(None, "", ["pytest"], "first", wait_s=0)
+    second, _ = world.hold_for_run(None, "", ["pytest"], "second", wait_s=0)
+    assert callable(first) and callable(second)
+    try:
+        first()
+        available[0] = 1024**3
+        third, reason = world.hold_for_run(None, "", ["pytest"], "quick", wait_s=0)
+        assert third is None and "test-run#1" in reason
+    finally:
+        second()
+
+
+def test_emergency_storage_blocks_test_and_build_for_all_run_clients(monkeypatch):
+    monkeypatch.setenv("DEV_MCP_FLEET_GATE_LOCK", "1")
+    cfg = {
+        "test-run": {"scope": "run", "global": True, "run_match": r"\bpytest\b", "capacity": 2},
+        "heavy-build": {"scope": "run", "global": True, "run_match": r"\bbuild\b"},
+    }
+    monkeypatch.setattr(world, "config", lambda: cfg)
+    monkeypatch.setattr(storage_guard, "admission", lambda: (False, "storage: 5 ГиБ"))
+    for argv in (["pytest", "-q"], ["python", "build.py"]):
+        release, why = world.hold_for_run(None, "", argv, "operator", wait_s=0)
+        assert release is None and "НЕ запущена" in why
+        release, why = world.hold_blocking(argv, "integrator", wait_s=0)
+        assert release is None and "НЕ запущена" in why
+    release, _ = world.hold_for_run(None, "", ["git", "status"], "operator", wait_s=0)
+    assert callable(release)
+    release()
+
+
+def test_adb_devices_probe_is_the_phone_sensor_not_rc_of_listing(store: Store, monkeypatch) -> None:
+    # 04.11–05.11 Nova VPN: «until: adb devices» даёт rc=0 и без телефона — fix:request:fc143e9d
+    # 10 раз за ночь таял, брался и снова блокировался «нет устройства».
+    from dev_mcp.fleet import probe
+    assert world.is_adb_listing(["adb", "devices"]) and world.is_adb_listing(["C:/sdk/adb.exe", "devices", "-l"])
+    assert not world.is_adb_listing(["adb", "shell", "getprop"])
+    assert "adb-ready" in frozen_with_probe(store, "B", "adb devices")
+    with store.tx() as tx:
+        tx.change("UPDATE projects SET root=?", (str(Path(store.path).parent),), event={"kind": "test_setup"})
+    state = [world.DOWN]
+    monkeypatch.setattr(world, "_adb_devices", lambda: (state[0], "x"))
+    never = lambda argv, cwd: pytest.fail("клиент adb запускать нельзя")  # noqa: E731
+    assert probe.run_due(store, StubPolicy(), never) == ["P/B rc=1"]
+    assert thaw_frozen(store) == []
+    with store.tx() as tx:
+        tx.change("UPDATE events SET ts=? WHERE kind='probe_run'", (now(-3),), event={"kind": "test_setup"})
+    state[0] = world.UP
+    assert probe.run_due(store, StubPolicy(), never) == ["P/B rc=0"]
+
+
+def test_usb_phone_hint_reports_only_what_windows_sees():
+    from dev_mcp.fleet.world import usb_phone_hint
+    assert "кабель" in usb_phone_hint([])
+    no_adb = usb_phone_hint(["PHONEB CAMON 19 Pro"])
+    assert "без интерфейса ADB" in no_adb and "Отладка по USB" in no_adb and "экран" not in no_adb
+    assert "Разрешить отладку" in usb_phone_hint(["ADB Interface", "PHONEB CAMON 19 Pro"])

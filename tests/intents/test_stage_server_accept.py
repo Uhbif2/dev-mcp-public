@@ -171,9 +171,9 @@ def test_external_wait_is_visible_to_the_launcher_without_author_rework(tmp_path
     from dev_mcp.fleet.tools import FleetContext,_external_waiting_lines
     store,spawned = _project(tmp_path)
     tz = _submitted(store,spawned.tree,'understood')
-    stages._external_pending(store,spawned.tree.project,tz,'digest','down','Gemini offline')
+    stages._external_pending(store,spawned.tree.project,tz,'digest','down','external offline')
     lines = _external_waiting_lines(FleetContext(store))
-    assert any('Gemini offline' in line and 'ожидает внешнюю проверку' in line for line in lines)
+    assert any('external offline' in line and 'ожидает внешнюю проверку' in line for line in lines)
     stages._external_resumed(store,spawned.tree.project,tz,'digest')
     assert _external_waiting_lines(FleetContext(store)) == []
 
@@ -191,45 +191,27 @@ def test_implemented_red_reopens_author_with_specific_problem(tmp_path: Path):
     store.close()
 
 
-def test_understood_approved_after_single_gemini_critique(tmp_path: Path, monkeypatch):
+def test_understood_accepted_even_when_frame_check_unavailable(tmp_path: Path, monkeypatch):
+    # 03.11.2026 (тень): OpenRouter недоступен — стадия всё равно принята, событие записано.
+    import subprocess
+    from dev_mcp.intents import frame_check
     store, spawned = _project(tmp_path)
     _understood(spawned.directory)
-    seen = []
-    def critique(_store, project, stage, root, tz, *, single=False):
-        seen.append((project, stage, root, tz, single))
-        return []
-    monkeypatch.setattr(stages, "_gemini_critique", critique)
+    monkeypatch.setenv("DEV_MCP_FRAME_CHECK", "1")
+    monkeypatch.setattr(frame_check, "SCRIPT", tmp_path / "frame_check.py")
+    (tmp_path / "frame_check.py").write_text("", encoding="utf-8")
+    calls = []
+
+    def start(store_, project, tz_, root):
+        calls.append(tz_)
+        return frame_check.run(store_, project, tz_, root, data=tmp_path, runner=lambda argv, **kw:
+                               subprocess.CompletedProcess(argv, 2, b"no OPENROUTER_API_KEY", b""))
+    monkeypatch.setattr(frame_check, "start", start)
     tz = _submitted(store, spawned.tree, "understood")
     assert open_review(store, spawned.tree.project, tz) == "server-accepted:" + tz
-    assert seen and seen[0][-1] is True
-    assert _task(store, spawned.tree.project, tz)["state"] == "accepted"
-    assert _review_count(store, spawned.tree.project) == 0
-    store.close()
-
-
-def test_understood_revise_comes_back_to_author(tmp_path: Path, monkeypatch):
-    store, spawned = _project(tmp_path)
-    _understood(spawned.directory)
-    monkeypatch.setattr(stages, "_gemini_critique",
-                        lambda *args, **kwargs: [stages.StageProblem("invalid_result","Gemini потребовал пересмотра: нет доказательств")])
-    tz = _submitted(store, spawned.tree, "understood")
-    assert open_review(store, spawned.tree.project, tz) == "server-revise:" + tz
-    row = _task(store, spawned.tree.project, tz)
-    assert row["state"] == "ready" and "нет доказательств" in row["body"]
-    assert _review_count(store, spawned.tree.project) == 0
-    store.close()
-
-
-def test_unavailable_gemini_waits_without_reopening_author(tmp_path: Path, monkeypatch):
-    store, spawned = _project(tmp_path)
-    _understood(spawned.directory)
-    monkeypatch.setattr(stages, "_gemini_critique",
-                        lambda *args, **kwargs: [
-                            stages.StageProblem("external_pending","недоступна независимая критика Gemini (сервер, не агент)")])
-    tz = _submitted(store, spawned.tree, "understood")
-    assert open_review(store, spawned.tree.project, tz) == "server-wait:" + tz
-    assert _task(store, spawned.tree.project, tz)["state"] == "submitted"
-    assert _review_count(store, spawned.tree.project) == 0
+    assert _task(store, spawned.tree.project, tz)["state"] == "accepted" and calls == [tz]
+    with store.read() as tx:
+        assert tx.one("SELECT 1 FROM events WHERE kind='intent.frame_check_unavailable' AND tz=?", (tz,))
     store.close()
 
 
@@ -278,8 +260,9 @@ def test_triple_candidate_structural_check_replaces_review(tmp_path: Path):
 def test_understood_invalid_nontriple_routing_not_accepted(tmp_path: Path, monkeypatch):
     store, spawned = _project(tmp_path)
     _understood(spawned.directory, kind="change", target="new")
-    monkeypatch.setattr(stages, "_gemini_critique", lambda *args, **kwargs: [])
     tz = _submitted(store, spawned.tree, "understood")
     assert open_review(store, spawned.tree.project, tz) == "server-revise:" + tz
     assert _task(store, spawned.tree.project, tz)["state"] == "ready"
     store.close()
+
+

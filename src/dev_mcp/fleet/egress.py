@@ -23,6 +23,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from dev_mcp.json_book import write_json
 from typing import Callable, Iterable
 from urllib.parse import unquote, urlsplit
 
@@ -303,9 +304,7 @@ def write_state(path: Path, selector: Selector, port: int) -> None:
     state = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "port": port,
              "route": cur.label if cur else None,
              "routes": [{"label": r.label, "loc": selector.last_loc.get(r.label)} for r in selector.routes]}
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    write_json(path, state)
 
 
 def pac_for(port: int) -> str:

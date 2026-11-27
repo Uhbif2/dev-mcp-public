@@ -6,6 +6,7 @@ import socket
 import sys
 import threading
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -146,12 +147,14 @@ def test_one_event_and_owner_alert_per_cause_then_recovery(store: Store, tmp_pat
     assert not net_sensor.publish(store, up, alerts_path=alerts)
     notices = [json.loads(line) for line in alerts.read_text(encoding="utf-8").splitlines()]
     assert [row["state"] for row in notices] == ["active", "active", "resolved"]
-    assert "порт не слушает" in notices[0]["message"]
+    assert "Chrome→ChatGPT неизвестен" in notices[0]["message"]
+    assert "Включи VPN" not in notices[0]["message"]
+    assert notices[0]["browser_route"] == "unknown"
     assert notices[0]["proxy_enabled"] is True
     with store.read() as tx:
         rows = tx.query("SELECT kind,payload FROM events WHERE kind LIKE 'chatgpt_%' ORDER BY id")
         assert [r["kind"] for r in rows] == ["chatgpt_unreachable", "chatgpt_unreachable", "chatgpt_reachable"]
-        assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.UP
+        assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.UNKNOWN
 
 
 def test_first_up_is_baseline_not_recovery(store: Store, tmp_path: Path) -> None:
@@ -160,7 +163,7 @@ def test_first_up_is_baseline_not_recovery(store: Store, tmp_path: Path) -> None
     assert not net_sensor.publish(store, net_sensor.Result(world.UP, "ok", False, False), alerts_path=target)
     assert not target.exists()
     with store.read() as tx:
-        assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.UP
+        assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.UNKNOWN
 
 
 def test_extension_three_consecutive_cloudflare_failures_block_even_with_trace_up(store: Store,
@@ -174,10 +177,13 @@ def test_extension_three_consecutive_cloudflare_failures_block_even_with_trace_u
         assert net_sensor.report_extension(store, "не найдено поле ввода", "Unable to load site... VPN", alerts_path=alerts) == count
     with store.read() as tx:
         assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.DOWN
-    assert not net_sensor.tick(store, sync=True, sensor=up, alerts_path=alerts)
+    # Server trace UP refines the browser-only alert without opening the gate.
+    assert net_sensor.tick(store, sync=True, sensor=up, alerts_path=alerts)
+    with store.read() as tx:
+        assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.DOWN
     assert net_sensor.report_extension(store, "composer появился", "нормальная страница", alerts_path=alerts) == 0
     assert net_sensor.tick(store, sync=True, sensor=up, alerts_path=alerts)
-    assert [json.loads(x)["state"] for x in alerts.read_text(encoding="utf-8").splitlines()] == ["active", "resolved"]
+    assert [json.loads(x)["state"] for x in alerts.read_text(encoding="utf-8").splitlines()] == ["active", "active", "resolved"]
 
 
 def test_bad_composer_without_cloudflare_page_does_not_block(store: Store) -> None:
@@ -199,10 +205,21 @@ def test_down_resource_blocks_queue_task(store: Store, tmp_path: Path, monkeypat
                   "resources,acceptance,body,created_at,updated_at) "
                   "VALUES('P','T1','chat','ready',1,'work','','','[]','[]',?,'[]','','2026','2026')",
                   (json.dumps([net_sensor.RESOURCE]),), event="setup")
+    # Egress-only failure cannot prove the Chrome resource is DOWN.
     assert net_sensor.publish(store, net_sensor.Result(world.DOWN, "proxy_disabled", False, False))
+    with store.read() as tx:
+        assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.UNKNOWN
+    for _ in range(3):
+        net_sensor.report_extension(store, "не найдено поле ввода", "Unable to load site")
+    # Browser failures alone block the launch gate; VPN advice is independent.
+    with store.read() as tx:
+        assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.DOWN
+    net_sensor.tick(store, sync=True,
+                    sensor=lambda: net_sensor.Result(world.DOWN, "network_error", True, True))
     with store.read() as tx:
         assert world.down_resources(tx, [net_sensor.RESOURCE]) == [net_sensor.RESOURCE]
     assert take_next(store, "W1") is None
+    assert net_sensor.report_extension(store, "composer ok", "") == 0
     assert net_sensor.publish(store, net_sensor.Result(world.UP, "ok", True, True))
     assert take_next(store, "W1").tz == "T1"
 
@@ -214,25 +231,25 @@ def test_one_transient_trace_failure_does_not_stop_fleet_but_second_does(store, 
     net_sensor.tick(store,sync=True,sensor=lambda:up,alerts_path=alerts)
     net_sensor.tick(store,sync=True,sensor=lambda:down,alerts_path=alerts)
     with store.read() as tx:
-        assert world.last_state(tx,net_sensor.RESOURCE)[0] == world.UP
+        assert world.last_state(tx,net_sensor.RESOURCE)[0] == world.UNKNOWN
         observed = json.loads(tx.one("SELECT payload FROM events WHERE kind='chatgpt_probe' ORDER BY id DESC LIMIT 1")['payload'])
         assert observed['observed_state'] == world.DOWN and observed['awaiting_confirmation']
     net_sensor.tick(store,sync=True,sensor=lambda:down,alerts_path=alerts)
     with store.read() as tx:
-        assert world.last_state(tx,net_sensor.RESOURCE)[0] == world.DOWN
+        assert world.last_state(tx,net_sensor.RESOURCE)[0] == world.UNKNOWN
     assert net_sensor.tick(store,sync=True,sensor=lambda:up,alerts_path=alerts)
 
 
-def test_unknown_startup_and_stopped_proxy_still_block_immediately(store, tmp_path):
+def test_unknown_browser_route_is_not_blocked_by_server_proxy_failure(store, tmp_path):
     alerts = tmp_path/'alerts.jsonl'
     down = net_sensor.Result(world.DOWN,'proxy_disabled',False,False)
     net_sensor.tick(store,sync=True,sensor=lambda:down,alerts_path=alerts)
     with store.read() as tx:
-        assert world.last_state(tx,net_sensor.RESOURCE)[0] == world.DOWN
+        assert world.last_state(tx,net_sensor.RESOURCE)[0] == world.UNKNOWN
     net_sensor.tick(store,sync=True,sensor=lambda:net_sensor.Result(world.UP,'ok',True,True),alerts_path=alerts)
     net_sensor.tick(store,sync=True,sensor=lambda:net_sensor.Result(world.DOWN,'proxy_not_listening',True,False),alerts_path=alerts)
     with store.read() as tx:
-        assert world.last_state(tx,net_sensor.RESOURCE)[0] == world.DOWN
+        assert world.last_state(tx,net_sensor.RESOURCE)[0] == world.UNKNOWN
 
 
 def test_independent_sensor_publishes_without_controller_and_legacy_tick_does_not_duplicate(store,tmp_path,monkeypatch):
@@ -252,7 +269,7 @@ def test_independent_sensor_publishes_without_controller_and_legacy_tick_does_no
     try:
         assert published.wait(3)
         with store.read() as tx:
-            assert world.last_state(tx,net_sensor.RESOURCE)[0] == world.UP
+            assert world.last_state(tx,net_sensor.RESOURCE)[0] == world.UNKNOWN
             assert not tx.one("SELECT 1 FROM events WHERE kind='controller_tick'")
         assert not net_sensor.tick(store,sensor=lambda:pytest.fail('duplicate sensor'))
     finally:
@@ -260,3 +277,139 @@ def test_independent_sensor_publishes_without_controller_and_legacy_tick_does_no
         stop.set()
         worker.join(timeout=5)
     assert not worker.is_alive()
+
+
+@pytest.mark.parametrize(
+    ("egress", "browser", "vpn"),
+    [
+        (world.UP, "working", False),
+        (world.UP, "failed", False),
+        (world.DOWN, "working", False),
+        (world.DOWN, "failed", True),
+        (world.DOWN, "unknown", False),
+    ],
+)
+def test_vpn_action_requires_both_failed_routes_and_browser_attempts(
+    egress: str, browser: str, vpn: bool,
+) -> None:
+    result = net_sensor.Result(egress, "network_error", True, True)
+    text = net_sensor._message(result, net_sensor.BrowserRoute(browser, failed_attempts=3 if browser == "failed" else 0))
+    assert ("Включи VPN" in text) is vpn
+    assert "Egress сервера" in text or "egress сервера" in text
+    assert "Chrome→ChatGPT" in text
+
+
+def test_chrome_quick_send_receipt_overrides_down_server_egress(
+    store: Store, tmp_path: Path,
+) -> None:
+    quick = tmp_path / "quick" / "jobs.json"
+    quick.parent.mkdir()
+    recent = datetime.now(timezone.utc).isoformat()
+    quick.write_text(json.dumps({"q": {
+        "messages": [{"role": "owner", "text": "sent by Chrome", "ts": recent}],
+    }}), encoding="utf-8")
+    assert net_sensor._browser_route(store).state == "working"
+    alerts = tmp_path / "owner-alerts.jsonl"
+    assert net_sensor.publish(store, net_sensor.Result(world.DOWN, "network_error", False, False), alerts_path=alerts)
+    with store.read() as tx:
+        assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.UP
+    event = json.loads(alerts.read_text(encoding="utf-8").splitlines()[-1])
+    assert event["server_egress"] == world.DOWN
+    assert event["browser_route"] == "working"
+    assert "действий не нужно" in event["message"]
+    assert "Включи VPN" not in event["message"]
+    old = (datetime.now(timezone.utc) - timedelta(seconds=net_sensor.BROWSER_ROUTE_WINDOW_S + 5)).isoformat()
+    quick.write_text(json.dumps({"q": {
+        "messages": [{"role": "owner", "text": "old", "ts": old}],
+    }}), encoding="utf-8")
+    assert net_sensor._browser_route(store).state == "unknown"
+    quick.write_text(json.dumps({"q": {
+        "answer_source": "browser",
+        "messages": [{"role": "agent", "text": "finished Chrome answer", "ts": recent}],
+    }}), encoding="utf-8")
+    assert net_sensor._browser_route(store).answers == 1
+    quick.write_text(json.dumps({"q": {
+        "answer_source": "mcp",
+        "messages": [{"role": "agent", "text": "MCP answer, not Chrome proof", "ts": recent}],
+    }}), encoding="utf-8")
+    assert net_sensor._browser_route(store).state == "unknown"
+
+
+def test_regular_agent_generating_tab_probe_is_browser_route_evidence(store: Store) -> None:
+    now = datetime.now(timezone.utc)
+    earlier = (now - timedelta(minutes=3)).isoformat()
+    with store.tx() as tx:
+        tx.change("CREATE TABLE worker_activity(worker_id TEXT PRIMARY KEY, claim_id INTEGER NOT NULL, "
+                  "state TEXT NOT NULL, stall_s INTEGER NOT NULL, seen_at TEXT NOT NULL)",
+                  event="fixture")
+        tx.change("INSERT INTO worker_activity VALUES(?,?,?,?,?)",
+                  ("W1", 1, "generating", 0, earlier), event="fixture")
+    assert net_sensor._browser_route(store, now=now).state == "working"
+    old = (now - timedelta(seconds=net_sensor.BROWSER_ROUTE_WINDOW_S + 5)).isoformat()
+    with store.tx() as tx:
+        tx.change("UPDATE worker_activity SET seen_at=?", (old,), event="fixture")
+    assert net_sensor._browser_route(store, now=now).state == "unknown"
+    with store.tx() as tx:
+        tx.change("UPDATE worker_activity SET seen_at=?,state='idle'", (earlier,), event="fixture")
+    assert net_sensor._browser_route(store, now=now).state == "unknown"
+
+
+def test_extension_page_failures_need_three_attempts_and_no_success(
+    store: Store, tmp_path: Path,
+) -> None:
+    alerts = tmp_path / "alerts.jsonl"
+    down = net_sensor.Result(world.DOWN, "network_error", True, True)
+    assert net_sensor._browser_route(store).state == "unknown"
+    assert "Включи VPN" not in net_sensor._message(down, net_sensor._browser_route(store))
+    for count in (1, 2):
+        assert net_sensor.report_extension(store, "не найдено поле ввода", "Unable to load site", alerts_path=alerts) == count
+        assert net_sensor._browser_route(store).state == "unknown"
+    assert net_sensor.report_extension(store, "не найдено поле ввода", "Unable to load site", alerts_path=alerts) == 3
+    assert net_sensor._browser_route(store).state == "failed"
+    assert "Включи VPN" in net_sensor._message(down, net_sensor._browser_route(store))
+    # Browser failure alone is not evidence that server egress also failed.
+    assert "Включи VPN" not in net_sensor._message(
+        net_sensor.Result(world.DOWN, "extension_cloudflare", True, True), net_sensor._browser_route(store))
+    assert net_sensor.report_extension(store, "composer ok", "", alerts_path=alerts) == 0
+    assert net_sensor._browser_route(store).state == "unknown"
+
+
+def test_extension_outage_with_successful_server_trace_never_demands_vpn(
+    store: Store, tmp_path: Path,
+) -> None:
+    alerts = tmp_path / "alerts.jsonl"
+    for _ in range(3):
+        net_sensor.report_extension(store, "не найдено поле ввода", "Unable to load site", alerts_path=alerts)
+    net_sensor.tick(store, sync=True, sensor=lambda: net_sensor.Result(world.UP, "ok", True, True), alerts_path=alerts)
+    notice = json.loads(alerts.read_text(encoding="utf-8").splitlines()[-1])
+    assert notice["server_egress"] == world.UP
+    assert notice["browser_route"] == "failed"
+    assert "Включи VPN" not in notice["message"]
+    with store.read() as tx:
+        assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.DOWN
+
+
+def test_new_confirmed_browser_failures_override_older_success_and_stop_launches(
+    store: Store, tmp_path: Path,
+) -> None:
+    quick = tmp_path / "quick" / "jobs.json"
+    quick.parent.mkdir()
+    quick.write_text(json.dumps({"q": {"messages": [{
+        "role": "owner", "ts": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+    }]}}), encoding="utf-8")
+    assert net_sensor._browser_route(store).state == "working"
+    for n in (1, 2, 3):
+        assert net_sensor.report_extension(
+            store, "не найдено поле ввода", "Unable to load site",
+        ) == n
+    assert net_sensor._browser_route(store).state == "failed"
+    with store.read() as tx:
+        assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.DOWN
+    assert net_sensor.tick(store, sync=True, sensor=lambda: net_sensor.Result(
+        world.UP, "ok", True, True))
+    with store.read() as tx:
+        assert world.last_state(tx, net_sensor.RESOURCE)[0] == world.DOWN
+    notice = json.loads(net_sensor._alert_path(store).read_text(encoding="utf-8").splitlines()[-1])
+    assert notice["server_egress"] == world.UP
+    assert notice["browser_route"] == "failed"
+    assert "Включи VPN" not in notice["message"]

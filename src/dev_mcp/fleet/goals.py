@@ -150,10 +150,16 @@ def _load_doc() -> dict:
         mtime = path.stat().st_mtime
     except OSError:
         return {}
+    # 17.11: проверка нового gate/ресурса — пробный прогон в снимке, минуты (и может ждать слот
+    # test-run). Под общей блокировкой она заморозила весь dev-mcp: ~50 потоков записи/run/
+    # fleet_list ждали _lock, а прогон ждал слот, занятый одним из них. Теперь проверка идёт
+    # ВНЕ блокировки в вызвавшем потоке; остальные, пока она идёт, получают прежний конфиг.
     with _lock:
         if _cache['path'] == path and _cache['mtime'] == mtime:
             return _cache['data']  # type: ignore[return-value]
         if _cache['path'] == path and _cache.get('rejected_mtime') == mtime:
+            return _cache['data']  # type: ignore[return-value]
+        if _cache['path'] == path and _cache.get('verifying_mtime') == mtime:
             return _cache['data']  # type: ignore[return-value]
         try:
             data = tomllib.loads(path.read_text(encoding='utf-8'))
@@ -163,62 +169,75 @@ def _load_doc() -> dict:
                 _cache['rejected_mtime'] = mtime
                 return _cache['data']  # type: ignore[return-value]
             data = {}
-        if _cache['path'] == path and _cache['mtime'] is not None:
-            old = _cache['data'] if isinstance(_cache['data'], dict) else {}
-            old_projects = old.get('projects', {})
-            new_projects = data.get('projects', {})
-            if not isinstance(old_projects, dict) or not isinstance(new_projects, dict):
-                _cache['rejected_mtime'] = mtime
-                return old
-            for name, details in new_projects.items():
-                if not isinstance(details, dict):
-                    continue
-                proposed_gate = str(details.get('gate') or '').strip()
-                previous_details = old_projects.get(name, {})
-                previous_gate = (str(previous_details.get('gate') or '').strip()
-                                 if isinstance(previous_details, dict) else '')
-                if proposed_gate == previous_gate:
-                    continue
-                if not proposed_gate:
-                    reason = 'removing a gate requires an explicit checked change'
-                    _cache['rejected_mtime'] = mtime
-                    _report_gate_rejection(str(name), proposed_gate, reason)
-                    return old
-                try:
-                    verdict = _verify_gate_change(str(name), proposed_gate)
-                    ok, reason = verdict.ok, verdict.reason
-                except Exception as exc:
-                    ok, reason = False, f'{type(exc).__name__}: {exc}'
-                if not ok:
-                    _cache['rejected_mtime'] = mtime
-                    _report_gate_rejection(str(name), proposed_gate, reason)
-                    return old
-            # Disallow removing an active gate by dropping the whole project.
-            if any(isinstance(info, dict) and info.get('gate') and
-                   name not in new_projects for name, info in old_projects.items()):
-                _cache['rejected_mtime'] = mtime
-                return old
-            # World/resource commands share the same last-known-good activation
-            # boundary as gates. A changed cwd also changes execution semantics.
-            try:
-                previous = _resource_commands(old)
-                proposed = _resource_commands(data)
-                for identity in previous:
-                    if identity not in proposed:
-                        raise ValueError(f'removing executable resource {identity} requires verification')
-                for (resource, key), (command, cwd) in proposed.items():
-                    if previous.get((resource, key)) == (command, cwd):
-                        continue
-                    result = _verify_resource_change(resource, key, command, cwd)
-                    if not result.ok:
-                        raise ValueError(f'{resource}.{key}: {result.reason}')
-            except Exception as exc:
-                _cache['rejected_mtime'] = mtime
-                _report_gate_rejection('Fleet Platform', repr(data.get('resources')),
-                                       str(exc), source='fleet-projects.toml:resources')
-                return old
+        if not (_cache['path'] == path and _cache['mtime'] is not None):
+            _cache.update(path=path, mtime=mtime, data=data, rejected_mtime=None)
+            return data
+        old = _cache['data'] if isinstance(_cache['data'], dict) else {}
+        _cache['verifying_mtime'] = mtime
+    try:
+        accepted = _accept_change(old, data, mtime)
+    finally:
+        with _lock:
+            if _cache.get('verifying_mtime') == mtime:
+                _cache['verifying_mtime'] = None
+    with _lock:
+        if not accepted:
+            _cache['rejected_mtime'] = mtime
+            return _cache['data']  # type: ignore[return-value]
         _cache.update(path=path, mtime=mtime, data=data, rejected_mtime=None)
         return data
+
+
+def _accept_change(old: dict, data: dict, mtime: float) -> bool:
+    """Checked activation of a changed config; runs WITHOUT _lock (may take minutes)."""
+    old_projects = old.get('projects', {})
+    new_projects = data.get('projects', {})
+    if not isinstance(old_projects, dict) or not isinstance(new_projects, dict):
+        return False
+    for name, details in new_projects.items():
+        if not isinstance(details, dict):
+            continue
+        proposed_gate = str(details.get('gate') or '').strip()
+        previous_details = old_projects.get(name, {})
+        previous_gate = (str(previous_details.get('gate') or '').strip()
+                         if isinstance(previous_details, dict) else '')
+        if proposed_gate == previous_gate:
+            continue
+        if not proposed_gate:
+            _report_gate_rejection(str(name), proposed_gate,
+                                   'removing a gate requires an explicit checked change')
+            return False
+        try:
+            verdict = _verify_gate_change(str(name), proposed_gate)
+            ok, reason = verdict.ok, verdict.reason
+        except Exception as exc:
+            ok, reason = False, f'{type(exc).__name__}: {exc}'
+        if not ok:
+            _report_gate_rejection(str(name), proposed_gate, reason)
+            return False
+    # Disallow removing an active gate by dropping the whole project.
+    if any(isinstance(info, dict) and info.get('gate') and
+           name not in new_projects for name, info in old_projects.items()):
+        return False
+    # World/resource commands share the same last-known-good activation
+    # boundary as gates. A changed cwd also changes execution semantics.
+    try:
+        previous = _resource_commands(old)
+        proposed = _resource_commands(data)
+        for identity in previous:
+            if identity not in proposed:
+                raise ValueError(f'removing executable resource {identity} requires verification')
+        for (resource, key), (command, cwd) in proposed.items():
+            if previous.get((resource, key)) == (command, cwd):
+                continue
+            result = _verify_resource_change(resource, key, command, cwd)
+            if not result.ok:
+                raise ValueError(f'{resource}.{key}: {result.reason}')
+    except Exception as exc:
+        _report_gate_rejection('Fleet Platform', repr(data.get('resources')),
+                               str(exc), source='fleet-projects.toml:resources')
+        return False
+    return True
 
 
 def resources_info() -> dict:
@@ -229,14 +248,35 @@ def resources_info() -> dict:
 def project_info(project: str) -> dict:
     info = _load().get(project)
     if isinstance(info, dict):
-        return info
+        # 06.11: свидетели, канон, зависимости, гейт и частота выкатки — у проекта
+        # (ops/lead/fleet.toml, белый список ключей; project_config.py).
+        from . import project_config
+        return project_config.overlay(project, info)
     return _intent_project_defaults(project)
+
+
+_INTENT_DEFAULTS: dict[str, tuple[float, dict]] = {}
+_INTENT_DEFAULTS_TTL_S = 60.0
 
 
 def _intent_project_defaults(project: str) -> dict:
     """Проект интенции (сервер завёл его сам, intents/spawn.py) — без строки в
     fleet-projects.toml: принятая работа коммитится в его собственный git (13.10:
-    у local-library принятый код не попадал ни в какую историю)."""
+    у local-library принятый код не попадал ни в какую историю).
+
+    15.11: на 60 с из памяти — фоновые такты звали это на каждый проект и каждый раз
+    открывали реестр SQLite и манифесты: заметная доля холостого CPU dev-mcp."""
+    import time
+    now = time.monotonic()
+    hit = _INTENT_DEFAULTS.get(project)
+    if hit is not None and now - hit[0] < _INTENT_DEFAULTS_TTL_S:
+        return dict(hit[1])
+    value = _intent_project_defaults_uncached(project)
+    _INTENT_DEFAULTS[project] = (now, dict(value))
+    return value
+
+
+def _intent_project_defaults_uncached(project: str) -> dict:
     import json
     registered = _registered_intent_root(project)
     if registered is not None and (registered / '.git').is_dir():
@@ -271,8 +311,13 @@ def _registered_intent_root(project: str) -> Path | None:
             spec, authority = json.loads(raw_spec), json.loads(raw_authority)
             if root.is_symlink() or not root.is_dir() or root.resolve() != root.absolute():
                 continue
-            if not any(root != Path(p).resolve() and root.is_relative_to(Path(p).resolve())
-                       for p in authority.get('project_roots', ())):
+            from . import relocation
+            with sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True, timeout=1) as grant_db:
+                grant_db.row_factory = sqlite3.Row
+                relocated = relocation.authorized_target(grant_db, project, root, spec)
+            if relocated is None and not any(
+                    root != Path(p).resolve() and root.is_relative_to(Path(p).resolve())
+                    for p in authority.get('project_roots', ())):
                 continue
             manifest = root / 'component.json'
             if manifest.is_symlink():

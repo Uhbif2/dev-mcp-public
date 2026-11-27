@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 import re
-import signal
 import subprocess
 import threading
 import time
@@ -21,6 +20,8 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from dev_mcp.process_execution import start_process, finish_process
 
 _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
 _CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
@@ -82,6 +83,7 @@ class Job:
     finished_at: float | None = None
     returncode: int | None = None
     stopped: bool = False
+    agent: str = ''  # initiating worker; empty only for the operator
     # Задача не запускалась фоновой: её начал синхронный `run`, но она не уложилась
     # в бюджет одного вызова MCP и была передана сюда, чтобы клиент не потерял
     # результат вместе с оборванным соединением. См. JobRegistry.adopt.
@@ -111,17 +113,21 @@ class JobRegistry:
             fh = log_path.open('w', encoding='utf-8', errors='replace')
             fh.write(f'# {" ".join(argv)}\n# cwd={cwd}\n\n')
             fh.flush()
-            proc = subprocess.Popen(  # noqa: S603 — argv собран политикой, shell=False
-                argv,
-                cwd=cwd,
-                env=env,
-                stdout=fh,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                shell=False,
-                creationflags=_CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW,
-            )
+            try:
+                proc = start_process(
+                    argv,
+                    cwd=cwd,
+                    env=env,
+                    stdout=fh,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    shell=False,
+                    creationflags=_CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW,
+                )
+            except BaseException:
+                fh.close()
+                raise
             job = Job(
                 job_id=job_id,
                 argv=list(argv),
@@ -132,9 +138,13 @@ class JobRegistry:
                 _log_fh=fh,
             )
             self._jobs[job_id] = job
+            proc._dev_mcp_finite = timeout_s is not None
         if timeout_s is not None:
             threading.Thread(target=self._kill_after, args=(job_id, max(0.0, timeout_s)),
                              daemon=True).start()
+        # Internal ownership cleanup is separate from consumer callbacks.
+        threading.Thread(target=self._notify_on_exit, args=(job_id, lambda _: None),
+                         daemon=True).start()
         return job
 
     def adopt(
@@ -214,6 +224,7 @@ class JobRegistry:
             return
         try:
             job.proc.wait()
+            finish_process(job.proc, preserve_children=not getattr(job.proc, '_dev_mcp_finite', False))
         except OSError:
             return
         self.get(job_id)  # реап: проставит returncode/finished_at и закроет лог
@@ -250,28 +261,15 @@ class JobRegistry:
         job = self.get(job_id)
         if job is None:
             return False
-        if job.returncode is not None:
+        if job.returncode is not None and not getattr(job.proc, '_dev_mcp_job', None):
             return True
-        try:
-            stopped = subprocess.run(  # noqa: S603,S607 — фиксированный argv, наш процесс
-                ['taskkill', '/F', '/T', '/PID', str(job.proc.pid)],
-                capture_output=True,
-                timeout=15,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-            if stopped.returncode != 0 and job.proc.poll() is None:
-                raise OSError('taskkill did not stop the job')
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                job.proc.send_signal(getattr(signal, 'CTRL_BREAK_EVENT', signal.SIGTERM))
-            except (OSError, ValueError):
-                pass
-            job.proc.terminate()
-        try:
-            job.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            job.proc.kill()
+        was_stopped = job.stopped
         job.stopped = True
+        try:
+            finish_process(job.proc, kill=True)
+        except BaseException:
+            job.stopped = was_stopped
+            raise
         with self._lock:
             self._reap_locked()
         return True

@@ -221,35 +221,6 @@ def test_background_completion_cannot_credit_successor_after_handoff(tmp_path, m
     assert [(r["tz"], r["rc"]) for r in rows] == [("TZ-X", 0)]
 
 
-def test_old_client_can_use_visual_service_through_existing_run(tmp_path, monkeypatch):
-    from dev_mcp.fleet import gemini
-
-    server, store, root, _ = _make_server(tmp_path)
-    _seed_task(store, root)
-    (root / "owned.txt").write_bytes(b"test")
-    frame = root / "frame.png"
-    frame.write_bytes(b"\x89PNG\r\n\x1a\nframe")
-    _tool_fn(server, "fleet_join")("visual-old-client")
-    _tool_fn(server, "fleet_take")("W1")
-    with store.tx() as tx:
-        claim = tx.one("SELECT id FROM claims WHERE worker_id='W1' AND state='active'")
-        tx.change("INSERT INTO claim_paths(claim_id,path_norm) VALUES(?,?)",
-                  (claim["id"], norm_path(str(frame))), event="seed")
-    calls = []
-    def inspect(*args, **kwargs):
-        calls.append(kwargs)
-        return {"ok": False, "defects": [{"severity": "P1", "where": "heading", "what": "bad spacing"}]}
-    monkeypatch.setattr(gemini, "ask", inspect)
-    response = _tool_fn(server, "run")(
-        root=str(root), argv=["fleet.cmd", "look", "frame.png", "--rubric", "readability"], agent="W1")
-    assert "bad spacing" in response, response
-    assert len(calls) == 1
-    denied = _tool_fn(server, "run")(
-        root=str(root), argv=["fleet.cmd", "look", "frame.png"], agent="W-missing")
-    assert "нет активного" in denied
-    assert len(calls) == 1
-
-
 def test_all_fleet_tools_are_directly_callable(tmp_path: Path) -> None:
     server, store, root, _ = _make_server(tmp_path)
     _seed_task(store, root)
@@ -325,6 +296,21 @@ def test_cached_blind_seal_cannot_supply_claim_or_skip_verifier(tmp_path):
     assert 'только на чтение' in malformed
     with store.read() as tx:
         assert not tx.one("SELECT id FROM events WHERE kind='blind_seal'")
+
+
+def test_extension_activity_history_is_sampled_and_served(tmp_path: Path) -> None:
+    server, store, root, _ = _make_server(tmp_path)
+    report = _tool_fn(server, "fleet_extension_report")
+    activity = _tool_fn(server, "fleet_activity_24h")
+    assert json.loads(activity()) == []
+    assert "lease updated" in report("test", 1, 0)
+    rows = json.loads(activity())
+    assert len(rows) == 1
+    assert set(rows[0]) == {"ts", "working_regular", "working_quick", "waiting", "open_quick"}
+    assert rows[0]["working_quick"] == 0
+    assert len(json.loads(activity())) == 1  # read endpoint never writes
+    assert "lease updated" in report("test", 1, 0)
+    assert len(json.loads(activity())) == 1  # same minute is deduplicated
 
 
 def test_chatgpt_extension_report_real_registered_tool_and_global_launch_gate(
@@ -461,7 +447,9 @@ def test_chatgpt_owner_alert_is_first_pult_line_and_clears_on_recovery(
         encoding="utf-8",
     )
     assert console.main(["--db", str(store.path)]) == 0
-    assert capsys.readouterr().out.splitlines()[0] == "! Включи VPN: порт 10808 не слушает."
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first.startswith("! Egress сервера: unknown")
+    assert "Включи VPN" not in first
     with alerts.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps({"kind": "chatgpt_reachable", "state": "resolved"}) + "\n")
     assert console.main(["--db", str(store.path)]) == 0
@@ -702,7 +690,8 @@ def test_request_note_auto_expands_free_same_project_path_and_triages_access_imm
     assert not (tmp_path / "logs" / "requests.jsonl").exists()
 
 
-def test_denied_permission_request_releases_claim_without_owner_wait(tmp_path: Path) -> None:
+def test_denied_permission_request_keeps_claim_and_records_operator_item(tmp_path: Path) -> None:
+    # No48 H item 3 (owner 09.11): a denied binary is not a dead end and not a freeze.
     server, store, root, _ = _make_server(tmp_path)
     _seed_task(store, root)
     assert "worker_id: W1" in _tool_fn(server, "fleet_join")("permission-blocked")
@@ -718,11 +707,12 @@ def test_denied_permission_request_releases_claim_without_owner_wait(tmp_path: P
         "W1",
     )
     assert "разобрана автоматически: denied" in result
-    assert "claim автоматически освобождён" in result
-    assert "не жди владельца" in result
+    assert "manual-platform:" in result
     with store.tx() as tx:
-        assert tx.one("SELECT state FROM tasks WHERE project='demo' AND tz='TZ-X'")["state"] == "frozen"
-        assert tx.one("SELECT state FROM claims WHERE worker_id='W1' ORDER BY id DESC LIMIT 1")["state"] == "released"
+        assert tx.one("SELECT state FROM tasks WHERE project='demo' AND tz='TZ-X'")["state"] == "taken"
+        assert tx.one("SELECT state FROM claims WHERE worker_id='W1' ORDER BY id DESC LIMIT 1")["state"] == "active"
+        row = tx.one("SELECT project,tz FROM events WHERE kind='manual_platform_required'")
+        assert (row["project"], row["tz"]) == ("demo", "TZ-X")
 
 
 def test_fleet_join_same_autostart_label_is_idempotent(tmp_path: Path) -> None:
@@ -900,6 +890,41 @@ def test_public_review_cycle_and_submit_refuses_review_task(tmp_path: Path) -> N
     assert source["state"] == "accepted"
     assert review["state"] == "accepted"
     assert claim["state"] == "released"
+
+
+def test_lead_progress_submit_continues_in_same_chat(tmp_path: Path, monkeypatch) -> None:
+    from dev_mcp.fleet import goals
+
+    server, store, root, _ = _make_server(tmp_path)
+    monkeypatch.setattr(goals, "project_info", lambda project: {
+        "goal": "Читатель открывает отчёт.",
+        "lead_focus": {"action": "Открой отчёт через клиент.", "evidence": "Читатель видит первоисточник."},
+    })
+    _seed_task(store, root, tz="TZ-LEAD")
+    ledger = root / "ToDo" / "lead" / "LEDGER.json"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text('{"obligations":[{"id":"O-test"}]}', encoding="utf-8")
+    with store.tx() as tx:
+        tx.change("UPDATE tasks SET acceptance='[]' WHERE tz='TZ-LEAD'", event="seed")
+
+    assert "worker_id: W1" in _tool_fn(server, "fleet_join")("lead-chat")
+    assert "TZ-LEAD" in _tool_fn(server, "fleet_take")("W1")
+    checkpoint = _tool_fn(server, "fleet_checkpoint")("W1", "Исходное состояние", "Повторить запрос")
+    assert "Открой отчёт через клиент." in checkpoint and "Читатель видит первоисточник." in checkpoint
+    assert "Отказано" not in _tool_fn(server, "write_file")(str(root / "owned.txt"), "new code", agent="W1")
+    with store.read() as tx:
+        first = tx.scalar("SELECT id FROM claims WHERE worker_id='W1' AND state='active'")
+
+    submit = _tool_fn(server, "fleet_submit")
+    response = submit("W1", "Проверенное изменение в файле продукта", claim_id=first)
+    assert "server-progress:TZ-LEAD" in response, response
+    assert "Следующая задача уже выдана тебе" in response
+    assert "проверить пользовательский результат после интеграции" in response
+    with store.read() as tx:
+        claims = tx.query("SELECT id,tz,state FROM claims WHERE worker_id='W1' ORDER BY id")
+        assert [(row["tz"], row["state"]) for row in claims] == [
+            ("TZ-LEAD", "released"), ("TZ-LEAD", "active")]
+        assert claims[1]["id"] != first
 
 
 def test_write_without_agent_is_inferred_and_revoked_inference_is_denied(
@@ -1279,6 +1304,9 @@ def test_owner_console_needs_password_and_stays_inside_its_command_list(tmp_path
     assert "неверный пароль" in unlock("W1", "wrong-password-here")
     opened = unlock("W1", "correct-horse-battery")
     assert "сессия владельца открыта" in opened
+    # 20.11.2026: команда с аргументом одной строкой разбирается, а не отказывает.
+    active_demo = console("W1", "active demo")
+    assert "в demo" in active_demo and "неизвестная команда" not in active_demo
 
     assert "неизвестная команда" in console("W1", "revoke", ["W2", "x"])
     legacy_approve = console("W1", "approve", ["anything"])

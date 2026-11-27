@@ -4,3 +4,9 @@ goal = 'Build and verify the app in this workspace.'
 sources = ['GOAL.md']
 gate = 'python -m pytest -q'
 commit = false
+
+# Optional nightly modes; empty lists mean disabled. Review selected projects only.
+[nightly_review]
+projects = []
+gap_projects = []
+docs_projects = []

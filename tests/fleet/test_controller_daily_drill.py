@@ -42,8 +42,10 @@ def test_controller_registers_background_daily_worker(monkeypatch, tmp_path: Pat
     assert not (tmp_path / "reports").exists(), "daily drill must never use production DB root"
 
 
-def test_server_daily_tick_creates_independent_isolated_report(tmp_path: Path) -> None:
+def test_server_daily_tick_creates_independent_isolated_report(tmp_path: Path, monkeypatch) -> None:
     """Run the real daily entrypoint via the actual scheduler, not a mocked green verdict."""
+    from dev_mcp.fleet import generators
+    monkeypatch.setattr(generators, 'enabled', lambda: True)
     sandbox = tmp_path / "fleet-drill-sandbox"
     fixed = datetime(2026, 10, 9, 13, 0, tzinfo=timezone.utc)
     stop = threading.Event()
@@ -93,7 +95,6 @@ def test_real_server_controller_fails_closed_then_delivers_with_trusted_route(
     must reach the real delivery.on_accept and record an Operator-backed receipt.
     """
     monkeypatch.setattr(controller, "run_daily_drill_scheduler", lambda stop: None)
-    monkeypatch.setattr(controller, "run_cross_review_worker", lambda store, stop: None)
     db = tmp_path / "fleet.sqlite"
     store = Store.open(str(db))
     old = "a" * 64

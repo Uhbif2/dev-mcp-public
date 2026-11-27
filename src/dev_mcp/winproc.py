@@ -42,6 +42,48 @@ def install() -> None:
         original(self, *args, **kwargs)
 
     subprocess.Popen.__init__ = __init__  # type: ignore[method-assign]
+    _lower_background_threads()
+
+
+# 08.11: контроллер, интегратор, интейк, пробы — потоки ВНУТРИ процесса сервера, который держит
+# NORMAL ради отзывчивости запросов агентов. Их работа (~1,4 ядра до оптимизации) шла с той же
+# приоритетностью, что окна владельца. Фоновым потокам — ниже обычного; потоки запросов не трогаем.
+BACKGROUND_THREAD_PREFIXES = ("dev-mcp-", "fleet-", "bite-", "submit-snapshot:", "frame-check:",
+                              "intent-")
+_THREAD_PRIORITY_BELOW_NORMAL = -1
+
+
+def _thread_api():  # type: ignore[no-untyped-def]
+    """kernel32 с типами: без них 64-битный псевдо-дескриптор потока усекается и вызов молчит."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentThread.restype = wintypes.HANDLE
+    kernel.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+    kernel.SetThreadPriority.restype = wintypes.BOOL
+    kernel.GetThreadPriority.argtypes = [wintypes.HANDLE]
+    kernel.GetThreadPriority.restype = ctypes.c_int
+    return kernel
+
+
+def is_background(name: str) -> bool:
+    return str(name or "").startswith(BACKGROUND_THREAD_PREFIXES)
+
+
+def _lower_background_threads() -> None:
+    import threading
+    original_run = threading.Thread.run
+
+    def run(self):  # type: ignore[no-untyped-def]
+        if is_background(self.name):
+            try:
+                _thread_api().SetThreadPriority(_thread_api().GetCurrentThread(),
+                                                _THREAD_PRIORITY_BELOW_NORMAL)
+            except Exception:  # noqa: BLE001 — приоритет не повод не работать
+                pass
+        return original_run(self)
+
+    threading.Thread.run = run  # type: ignore[method-assign]
 
 
 def normalize_serving_priority() -> dict[str, int]:

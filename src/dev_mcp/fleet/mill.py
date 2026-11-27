@@ -22,7 +22,9 @@ MILL_PROJECT = "Mill Works"
 INTERVAL_S = float(os.environ.get("DEV_MCP_FLEET_MILL_INTERVAL_S", 600))
 RUN_TIMEOUT_S = 3600.0
 TICK_TIMEOUT_S = 300.0
-SOURCES = ("fleet", "claude_code")
+# Owner messages first: both share the free relay quota, and the fleet backlog (232 segments
+# on 25.11) used it up before any Claude Code owner turn was labelled (19-25.11: no Case).
+SOURCES = ("claude_code", "fleet")
 
 Runner = Callable[[list[str], Path, float], subprocess.CompletedProcess]
 
@@ -190,8 +192,14 @@ def tick(store: Any, *, policy: Any | None = None, run: Runner = _run,
             new_tz.append(path.stem)
     if done.returncode == 0:
         report["tick"] = {k: out.get(k) for k in ("completed", "renewed", "open_pairs", "pool")}
-    if new_tz:
-        report["bootstrap"] = sync_selected(store, MILL_PROJECT, str(root), new_tz, policy=policy)
+    from .generators import enabled as task_generators_enabled
+    # Owner, 25.11.2026: the 15.11 task-generator switch also cut the memory pipeline (no
+    # extraction batch accepted after 15.11 19:17, 224 Cases waiting). Mill Works
+    # extraction batches are exempt; repair rounds and other generators stay off.
+    allowed = (new_tz if task_generators_enabled()
+               else [tz for tz in new_tz if tz.startswith("TZ-EX-batch-")])
+    if allowed:
+        report["bootstrap"] = sync_selected(store, MILL_PROJECT, str(root), allowed, policy=policy)
     report["new_tz"] = new_tz
     return report
 

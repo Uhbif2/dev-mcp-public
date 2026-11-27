@@ -22,7 +22,8 @@ def _git(root: Path, *args: str) -> str:
 
 @pytest.fixture
 def sealed_node_repo(tmp_path: Path) -> tuple[Path, str, str]:
-    assert shutil.which("node"), "Node.js required for sealed Node acceptance regression"
+    if not shutil.which("node"):
+        pytest.skip("Node.js is not installed; sealed Node acceptance requires node")
     root = tmp_path / "repo with spaces"
     root.mkdir()
     _git(root, "init", "-b", "main")

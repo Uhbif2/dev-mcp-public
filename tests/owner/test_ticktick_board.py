@@ -570,3 +570,50 @@ def test_live_bucket_is_a_monitor_not_a_queue_count():
     assert tb.state_tag({"actions": [], "load": {"running": 0, "ready": 0, "stuck": 1}}, section) == "застряло"
     assert tb.state_tag({"actions": [], "load": {"running": 1}}, section) == "в-работе"
     assert tb.state_tag({"actions": [], "load": {}}, section) == "ждёт-условий"  # a busy section is not this card
+
+
+def test_world_need_is_one_reminded_task_that_closes_itself(tmp_path, monkeypatch):
+    from dev_mcp.fleet import world
+    store, fake, b, _ = board(tmp_path)
+    orig = fake.call
+    def call(name, args):
+        if name == "complete_task":
+            fake.tasks[args["task_id"]]["status"] = 2
+            return {}
+        return orig(name, args)
+    fake.call = call
+    need = {"resource": "телефон", "since": "2026-11-04T19:04:37+00:00", "need": "",
+            "waiting": [("Nova VPN", "review:x:2")], "detail": "телефон на USB без интерфейса ADB", "live": "down"}
+    needs = [need]
+    monkeypatch.setattr(world, "owner_needs", lambda store: list(needs))
+    b.sync(SNAP, system_lines=["s"])
+    made = [t for t in fake.tasks.values() if t["title"].startswith("Нужно от тебя: телефон")]
+    assert len(made) == 1 and made[0]["reminders"] == ["TRIGGER:PT0S"] and "без интерфейса ADB" in made[0]["content"]
+    b.sync(SNAP, system_lines=["s"])
+    assert len([t for t in fake.tasks.values() if t["title"].startswith("Нужно от тебя")]) == 1
+    fake.tasks[made[0]["id"]]["status"] = 2          # owner closed it, sensor still down
+    b.sync(SNAP, system_lines=["s"]); b.sync(SNAP, system_lines=["s"])
+    assert [c["title"] for c in fake.comments if c["task"] == made[0]["id"]] == [
+        "Датчик всё ещё не видит ресурс: телефон на USB без интерфейса ADB"]
+    needs.clear()
+    b.sync(SNAP, system_lines=["s"])
+    assert "телефон" not in b.state["world_needs"]
+    needs.append(need)                                 # next episode → new task
+    b.sync(SNAP, system_lines=["s"])
+    assert len([t for t in fake.tasks.values() if t["title"].startswith("Нужно от тебя")]) == 2
+
+
+def test_world_need_closes_when_resource_returns(tmp_path, monkeypatch):
+    from dev_mcp.fleet import world
+    store, fake, b, _ = board(tmp_path)
+    orig = fake.call
+    done = []
+    fake.call = lambda n, a: (done.append(a["task_id"]) or {}) if n == "complete_task" else orig(n, a)
+    needs = [{"resource": "stand", "since": "2026-11-04T19:00:00+00:00", "need": "", "waiting": [("P", "T")],
+              "detail": "d", "live": "down"}]
+    monkeypatch.setattr(world, "owner_needs", lambda store: list(needs))
+    b.sync(SNAP, system_lines=["s"])
+    tid = b.state["world_needs"]["stand"]["id"]
+    needs.clear()
+    b.sync(SNAP, system_lines=["s"])
+    assert done == [tid]

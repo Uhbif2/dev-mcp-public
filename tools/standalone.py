@@ -18,6 +18,10 @@ import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'src'))
+from dev_mcp.json_book import write_json
+sys.path.insert(0, str(ROOT / 'src'))
+from dev_mcp.json_book import write_json
 
 
 def autostart(root: Path, manifest: Path, port: int, *, remove: bool = False):
@@ -45,7 +49,7 @@ def autostart(root: Path, manifest: Path, port: int, *, remove: bool = False):
     backup.write_bytes(before)
     if manifest.read_bytes() != before:
         raise RuntimeError('autostart manifest changed concurrently; retry after reviewing it')
-    manifest.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding='utf-8')
+    write_json(manifest, document, indent=2)
     if json.loads(manifest.read_text(encoding='utf-8')) != document:
         raise RuntimeError('autostart readback failed')
     return {'autostart': not remove, 'entry': name, 'backup': str(backup)}
@@ -151,7 +155,7 @@ def start(root: Path, port: int, core_only: bool) -> dict:
     import psutil
     record = {'pid': child.pid, 'created': psutil.Process(child.pid).create_time(),
               'port': port, 'core_only': core_only}
-    (root / 'data/standalone-process.json').write_text(json.dumps(record), encoding='utf-8')
+    write_json(root / 'data/standalone-process.json', record)
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline and child.poll() is None:
         try:

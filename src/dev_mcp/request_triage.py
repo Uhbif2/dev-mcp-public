@@ -24,6 +24,7 @@ review.cmd скопилось 127 решений, из них 83 заявки ki
 from __future__ import annotations
 
 import ntpath
+import re
 import os
 from typing import Any
 
@@ -68,6 +69,27 @@ def _requested_lists(entry: dict[str, Any]) -> list[str]:
     return [str(x).strip() for x in items if str(x).strip()]
 
 
+# No48 H: build toolchains of the project's own code; a build manifest names its tool.
+_TOOLCHAINS = {
+    'cargo': ('cargo', 'cargo.toml', 'cargo.lock'), 'rustc': ('rustc',),
+    'gradle': ('gradle', 'gradlew', 'build.gradle', 'build.gradle.kts', 'settings.gradle'),
+    'go': ('go', 'go.mod'), 'dotnet': ('dotnet', '.csproj', '.sln'),
+}
+
+
+def _toolchain(text: str) -> str:
+    raw = (text or '').lower()
+    for sep in ('\\', '/', ',', ';', ':', '(', ')', '[', ']', '"', "'"):
+        raw = raw.replace(sep, ' ')
+    words = set(raw.split())
+    for tool, marks in _TOOLCHAINS.items():
+        for word in words:
+            stem = word[:-4] if word.endswith('.exe') else word
+            if stem in marks or any(m.startswith('.') and word.endswith(m) for m in marks):
+                return tool
+    return ''
+
+
 def decide(entry: dict[str, Any], policy: Any) -> tuple[str, str]:
     """(decision, note): decision — 'approved' | 'denied'. Периметр не меняется никогда."""
     kind = str(entry.get('kind') or 'other').strip().lower()
@@ -88,6 +110,14 @@ def decide(entry: dict[str, Any], policy: Any) -> tuple[str, str]:
         allowed = [str(b) for b in getattr(policy, 'exec_allowed_bin', [])]
         if path and not ntpath.isabs(path) and _stem(path) in {_stem(b) for b in allowed}:
             return 'approved', f'«{path}» уже разрешён (exec_allowed_bin). Запускай через run с cwd в exec_roots.'
+        # No48 H (owner 09.11): building the project's own code is a class, not a question.
+        toolchain = _toolchain(f'{path} {entry.get("summary") or ""}')
+        if toolchain and _stem(toolchain) in {_stem(b) for b in allowed}:
+            return 'approved', (
+                f'Класс «сборка своего кода» разрешён владельцем (№48 §H): {toolchain} уже в '
+                'exec_allowed_bin. Запускай через run с cwd в корне своего проекта (exec_roots); '
+                'вопрос владельцу не нужен.'
+            )
         tasks = sorted(getattr(policy, 'tasks', {}) or {})
         return 'denied', (
             f'Новые исполняемые файлы автомат не разрешает ({name[:80]}). Разрешены: '

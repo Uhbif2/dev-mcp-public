@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import {
   RECOVERY_DEFAULTS,
   accountActionWait,
+  pacedAccountActionWait,
+  ACCOUNT_ACTIONS_PER_HOUR,
   attemptedRecovery,
   chatUrl,
   legacySession,
@@ -11,6 +13,7 @@ import {
   observeSession,
   projectPage,
   rememberSession,
+  accountOverloaded,
 } from "../recovery.js";
 
 const session = {
@@ -64,6 +67,19 @@ test("recovery does not overwrite drafts, active generations, unlocked tabs or o
   assert.equal(observeSession(session, page({ ...displaced, label: "owner-main" }), null, 1).protected, true);
 });
 
+test("общий потолок защищает быстрые открытия, reload и отправки без придуманной квоты ChatGPT", () => {
+  const now = 5_000_000;
+  const cfg = { accountActionGapSec: 15 };
+  let account = { history: [], lastActionAt: 0 };
+  for (let i = 0; i < ACCOUNT_ACTIONS_PER_HOUR; i++) {
+    account = markAccountAction(account, now - 1000, i % 3 === 0 ? "quick-open" :
+      i % 3 === 1 ? "quick-send" : "reload", i, "pult-q1");
+  }
+  assert.equal(pacedAccountActionWait(account, now, cfg), 3600_000 - 1000);
+  assert.equal(pacedAccountActionWait(account, now + 3600_000, cfg), 0);
+  assert.equal(pacedAccountActionWait({ history: [], lastActionAt: now }, now + 1000, cfg), 14000);
+});
+
 test("all paced interface actions share one 15 second lane", () => {
   let account = markAccountAction({}, 1_000, "reload", 1, "f1");
   assert.equal(accountActionWait(account, 1_000), 15_000);
@@ -71,5 +87,16 @@ test("all paced interface actions share one 15 second lane", () => {
   assert.equal(accountActionWait(account, 16_000), 0);
   account = markAccountAction(account, 61_000, "send-attempt", 2, "f2");
   assert.deepEqual(account.history.map((item) => item.type), ["reload", "send-attempt"]);
+});
+
+test("W11-7: overload level resets after twice the last pause with no further overload", () => {
+  const now=10_000_000;
+  const one=accountOverloaded({},now);
+  assert.equal(one.overloadLevel,1);
+  const two=accountOverloaded(one,now+60_000);
+  assert.equal(two.overloadLevel,2);
+  const after=accountOverloaded(two,now+60_000+40*60_000);
+  assert.equal(after.overloadLevel,1);
+  assert.equal(after.overloadUntil,now+41*60_000+10*60_000);
 });
 

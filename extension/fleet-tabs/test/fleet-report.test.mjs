@@ -1,6 +1,30 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { callTool, fleetState, parseLaunchGate, reportExtension } from '../fleet.js';
+import http from 'node:http';
+
+test('real transport timeout identifies initialize versus tools/call', async () => {
+  for (const blocked of ['initialize', 'tools/call']) {
+    const server = http.createServer(async (req, res) => {
+      if (req.method === 'DELETE') { res.end(); return; }
+      let body = ''; for await (const chunk of req) body += chunk;
+      const packet = JSON.parse(body);
+      if (packet.method === blocked) return;
+      res.setHeader('content-type', 'application/json');
+      res.setHeader('mcp-session-id', 'test-timeout-session');
+      if (packet.method === 'notifications/initialized') { res.statusCode = 202; res.end(); return; }
+      res.end(JSON.stringify({jsonrpc:'2.0',id:packet.id,result:{}}));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      await assert.rejects(callTool(`http://127.0.0.1:${server.address().port}`, 'fleet_list', {},
+        {timeoutMs:250}), blocked === 'initialize' ? /MCP initialize: таймаут/ : /MCP tools\/call fleet_list: таймаут/);
+    } finally {
+      server.closeAllConnections();
+      await new Promise(resolve => server.close(resolve));
+    }
+  }
+});
 
 test('fleet_list DOWN gate is parsed without making its read into a write', async () => {
   assert.deepEqual(parseLaunchGate('gate: chatgpt-reachable=down; launches=0'),

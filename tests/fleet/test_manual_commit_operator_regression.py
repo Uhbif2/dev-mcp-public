@@ -127,7 +127,7 @@ def independent_accept(s: Scenario) -> None:
     assert submit is not None and receipt is not None
     assert receipt["id"] > submit["id"]
     assert receipt["tool"] == "fleet" and receipt["worker_id"] is None
-    assert json.loads(receipt["payload"]) == {
+    assert {k: v for k, v in json.loads(receipt["payload"]).items() if k != "scope"} == {
         "submit_id": submit["id"],
         "files": {OWNED: hashlib.sha256((s.root / OWNED).read_bytes()).hexdigest()},
     }
@@ -175,15 +175,18 @@ def test_real_entrypoint_commits_only_server_accepted_bytes_once(scenario: Scena
     assert_only_accepted_committed(s)
 
 
-def test_late_foreign_worktree_bytes_are_deferred_without_commit(scenario: Scenario):
+def test_late_foreign_worktree_bytes_are_never_committed(scenario: Scenario):
+    """07.11 (LEAD-SYSTEM-DESIGN 1.3, печать = снимок): поздняя правка после приёмки не попадает
+    в историю. Раньше интеграция откладывалась навсегда; теперь коммитятся байты печати из её
+    снимка, а поздняя правка остаётся незакоммиченной в дереве."""
     s = scenario
     independent_accept(s)
     (s.root / OWNED).write_text("unattributed late edit\n", encoding="utf-8")
     records = s.integrator.tick()
-    deferred = [e["payload"] for e in records
-                if e.get("payload", {}).get("reason_code") == "accepted_candidate_bytes_changed"]
-    assert deferred and OWNED in deferred[-1]["deferred_paths"], records
-    assert git(s.root, "rev-parse", "HEAD") == s.baseline
+    routed = [e["payload"] for e in records if e.get("payload", {}).get("route") == "snapshot"]
+    assert routed, records
+    assert git(s.root, "show", f"HEAD:{OWNED}") == APPROVED.strip()
+    assert git(s.root, "show", "--format=", "--name-only", "HEAD").splitlines() == [OWNED]
     assert (s.root / OWNED).read_text(encoding="utf-8") == "unattributed late edit\n"
     assert git(s.root, "ls-files", "--stage", "--", STAGED) == s.staged_index
 

@@ -192,11 +192,30 @@ def test_deleting_module_blocks_relative_importers(
 
 def test_project_with_pytest_gate_collects_tests_from_candidate(ctx) -> None:
     root, store, _ = ctx
-    # Committed test references a module that exists only in the dirty tree.
-    (root / 'test_candidate.py').write_text('from pkg.missing import item\n', encoding='utf-8')
+    # Only a collection error in an accepted file can block its candidate.
+    # Pre-existing collection failures outside changed paths are ignored.
+    candidate = root / 'test_candidate.py'
+    candidate.write_text('from pkg.shared import result\n', encoding='utf-8')
     git(root, 'add', '-A')
-    git(root, 'commit', '-q', '-m', 'test dependency')
+    git(root, 'commit', '-q', '-m', 'working test baseline')
     (root / 'src' / 'pkg' / 'missing.py').write_text('item = 2\n', encoding='utf-8')
+    integ = Integrator(store, root.parent / 'cursor.json',
+                       project_info=lambda _: {'commit': True, 'gate': 'pytest -q'})
+    candidate.write_text('from pkg.missing import item\n', encoding='utf-8')
+    task(store, 'TZ-A', [candidate])
+    accept(store, 'TZ-A')
+    event = integration(integ.tick(), 'TZ-A')
+    assert event['deferred'] and 'pytest_collection_failed' in event['reason']
+    assert git(root, 'show', 'HEAD:test_candidate.py') == 'from pkg.shared import result\n'
+
+
+def test_unrelated_root_test_collection_failure_does_not_block_candidate(ctx) -> None:
+    root, store, _ = ctx
+    # An already-broken root test importing an absent module is not owned by
+    # this accept; 3da52ce must still allow the unrelated source change.
+    (root / 'test_broken.py').write_text('from pkg.missing import item\n', encoding='utf-8')
+    git(root, 'add', '-A')
+    git(root, 'commit', '-q', '-m', 'pre-existing collection error')
     integ = Integrator(store, root.parent / 'cursor.json',
                        project_info=lambda _: {'commit': True, 'gate': 'pytest -q'})
     changed = root / 'src' / 'pkg' / 'shared.py'
@@ -204,8 +223,8 @@ def test_project_with_pytest_gate_collects_tests_from_candidate(ctx) -> None:
     task(store, 'TZ-A', [changed])
     accept(store, 'TZ-A')
     event = integration(integ.tick(), 'TZ-A')
-    assert event['deferred'] and 'pytest collect:' in event['reason']
-    assert git(root, 'show', 'HEAD:src/pkg/shared.py') == 'result = 1\n'
+    assert event['commit']
+    assert git(root, 'show', 'HEAD:src/pkg/shared.py') == 'result = 3\n'
 
 
 def test_deferred_obstacle_is_linked_and_resolved_for_mapped_outcome(ctx) -> None:
@@ -271,8 +290,10 @@ def test_candidate_sees_untracked_server_intent_checker(ctx) -> None:
     assert 'check.py' not in git(root, 'ls-files')
 
 
-def test_failed_candidate_opens_one_repair_request_for_author(ctx) -> None:
-    """17.10: accept с провалом импорта/приёмки ретраился сутками без решателя."""
+def test_failed_candidate_is_acceptance_state_not_a_repair_request(ctx) -> None:
+    """17.10: accept с провалом ретраился сутками без решателя — тогда интегратор заводил request.
+    06.11 (LEAD-SYSTEM-DESIGN 1.5): сбой проверки — состояние приёмки (deferred с причиной), а не
+    заявка: генератор плодил request:* по каждому сбою среды."""
     root, store, integ = ctx
     shared = root / 'src' / 'pkg' / 'shared.py'
     consumer = root / 'src' / 'pkg' / 'consumer.py'
@@ -286,7 +307,7 @@ def test_failed_candidate_opens_one_repair_request_for_author(ctx) -> None:
     integ.tick()
     with store.read() as tx:
         rows = tx.query("SELECT tz,body FROM tasks WHERE project='P' AND tz LIKE 'request:%'")
-    assert len(rows) == 1, [r['tz'] for r in rows]
+    assert rows == [], [r['tz'] for r in rows]
 
 
 def test_async_gate_holds_only_its_project_and_accept_survives(ctx) -> None:

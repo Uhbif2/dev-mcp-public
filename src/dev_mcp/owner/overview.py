@@ -298,8 +298,9 @@ def _fleet_summary(tx: Any) -> dict[str, Any]:
                                "WHERE t.state='ready' AND p.active=1") or 0),
         "release": ({"at": str(release["ts"]),
                      "success": release["kind"] == "platform_deployed"} if release else None),
+        # 08.11: точные виды по индексу вместо LIKE по 1,9 млн событий (3,8 с на сводку).
         "overloads": int(tx.scalar("SELECT COUNT(*) FROM events WHERE "
-                                   "lower(kind) LIKE '%overload%' AND ts>=?", (since,)) or 0),
+                                   "kind IN ('account_overload','overload') AND ts>=?", (since,)) or 0),
         "pending_notices": _pending_notices(tx),
         "system_alerts": attention(tx),
     }
@@ -373,11 +374,27 @@ def _intervention_summary(tx: Any, *, project: str | None = None) -> dict[str, A
     today, yesterday = dates[-1], dates[-2]
     today_count = sum(daily[today].values())
     yesterday_count = sum(daily[yesterday].values())
+    from dev_mcp.fleet import platform_manual
+    scan=tx.one("SELECT ts FROM events WHERE kind='intervention_scan' ORDER BY id DESC LIMIT 1")
+    try:
+        observed=datetime.fromisoformat(str(scan['ts']).replace('Z','+00:00')) if scan else None
+        if observed is not None and observed.tzinfo is None:
+            observed=None
+    except ValueError:
+        observed=None
+    collection=('disabled' if platform_manual.enabled() else 'stale'
+                if observed is None or (now-observed).total_seconds()>1800 else 'current')
+    commands=tx.query("SELECT ts FROM events WHERE kind='owner_cli_manual' AND ts>=?"+
+                      (' AND project=?' if project is not None else ''),
+                      (dates[0],project) if project is not None else (dates[0],))
+    operator_today=sum(str(r['ts'])[:10]==today for r in commands)
+    operator_yesterday=sum(str(r['ts'])[:10]==yesterday for r in commands)
     return {
         "goal": 0, "today": today_count, "yesterday": yesterday_count,
         "rising": today_count > yesterday_count, "available": bool(exists),
         "by_day": daily,
         "by_class": dict(sorted(by_class.items())),
+        'collection':collection,'operator_today':operator_today,'operator_yesterday':operator_yesterday,
     }
 
 
@@ -392,6 +409,8 @@ def snapshot(store: Store, *, project: str | None = None) -> dict[str, Any]:
         return _empty("error", "Некорректный фильтр проекта")
     try:
         with store.read() as tx:
+            from dev_mcp.fleet.results import available
+            artifacts = available(tx, project=project)
             interventions = _intervention_summary(tx, project=project)
             fleet = _fleet_summary(tx)
             present = tx.scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='outcomes'")
@@ -399,6 +418,7 @@ def snapshot(store: Store, *, project: str | None = None) -> dict[str, Any]:
                 empty = _empty("empty", "Пока нет зарегистрированных результатов",
                                interventions=interventions)
                 empty["human"]["fleet"] = fleet
+                _append_artifacts(empty, artifacts)
                 empty["revision"] = _revision({k: v for k, v in empty.items() if k != "revision"})
                 return empty
             where = " WHERE project=?" if project is not None else ""
@@ -410,6 +430,7 @@ def snapshot(store: Store, *, project: str | None = None) -> dict[str, Any]:
                 empty = _empty("empty", "Пока нет зарегистрированных результатов",
                                interventions=interventions)
                 empty["human"]["fleet"] = fleet
+                _append_artifacts(empty, artifacts)
                 empty["revision"] = _revision({k: v for k, v in empty.items() if k != "revision"})
                 return empty
             project_roots = {str(r["name"]): str(r["root"]) for r in tx.query(
@@ -556,5 +577,17 @@ def snapshot(store: Store, *, project: str | None = None) -> dict[str, Any]:
         "interventions": interventions,
         "human": _human_projection(rows, evidence, project_roots, fleet, completed, owner_requests, owner_planning),
     }
+    _append_artifacts(data, artifacts)
     data["revision"] = _revision(data)
     return data
+
+
+def _append_artifacts(data: dict, artifacts: list[dict]) -> None:
+    done = data.setdefault('human', {}).setdefault('done', [])
+    for result in artifacts[:12]:
+        done.append({'id': 'result-' + str(result['event_id']),
+                     'title': 'Проверенные изменения: ' + _human_line(str(result['project'])),
+                     'text': 'Изменения приняты, интегрированы и доступны в архиве. Это не подтверждение развёртывания или вашей приёмки.',
+                     'artifact': Path(result['artifact']).as_uri(),
+                     'folder': Path(result['artifact']).parent.as_uri(),
+                     'revision': result['revision'], 'sha256': result['sha256']})

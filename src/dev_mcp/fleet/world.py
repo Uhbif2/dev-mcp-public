@@ -22,11 +22,28 @@
     sensor = "adb"        # спрашивает уже запущенный демон adb на 127.0.0.1:5037
     need = "подключи Android-телефон"
 
-Датчик `adb` не запускает клиент adb: на машине их несколько разных версий, а клиент чужой
-версии убивает демон — и обрывает агентам живую сессию с телефоном. Демон не запущен — состояние
-`unknown`: ничего не запрещаем, работает старое поведение (агент сам запустит демон).
+Ресурс одного устройства (20.11.2026): `device = "<regex>"` — ресурс up, только когда готово
+(`device`) устройство, чья строка `adb devices -l` (serial, product:, model:, device:) подходит
+под regex без учёта регистра; другие подключённые телефоны его не поднимают. Пример:
+
+    [resources."планшет-samsung"]
+    world = true
+    sensor = "adb"
+    device = "model:SM_T735"
+    need = "подключи планшет Tablet TAB-A1 (ADB по USB или Wi-Fi)"
+
+Без `device` ресурс, как раньше, up при любом готовом устройстве. Ошибка в regex — unknown.
+
+Демон adb — один, свой и долгоживущий (05.11.2026). Раньше датчик только спрашивал демон, а демон
+поднимал первый `run adb …` агента — внутри Job Object команды с KILL_ON_JOB_CLOSE: команда
+кончилась — демон убит, телефон видит обрыв, следующий вызов поднимает демон заново и телефон
+снова спрашивает «Разрешить отладку?». Без демона датчик видел `unknown`, и подключённый владельцем
+телефон система не замечала. Теперь: `adb = "<путь>"` у ресурса — датчик сам поднимает демон этим
+бинарём вне задания (`ensure_adb_server`), а `run adb …` агентов идёт тем же бинарём (`pin_adb`):
+клиент другой версии демон не перезапускает.
 """
 from __future__ import annotations
+from datetime import datetime, timezone
 
 import json
 import os
@@ -88,6 +105,21 @@ def _adb_devices(host: str = "127.0.0.1", port: int = 5037, timeout: float = 2.0
 _USB_HINT_CACHE: tuple[float, str] = (0.0, "")
 
 
+def usb_phone_hint(names: list[str]) -> str:
+    """Только то, что Windows видит сейчас (-PresentOnly). 05.11.2026: прежний текст выдавал
+    догадку за факт — «HiOS усыпил отладку, разблокируй экран», хотя экран был разблокирован.
+    На деле PHONEB был на USB с PID 201C (передача файлов), без интерфейса ADB: отладка по USB
+    на телефоне выключена. С интерфейсом ADB и пустым adb — ждёт подтверждения ключа."""
+    if not names:
+        return "Windows не видит телефон по USB вовсе (кабель «только зарядка», порт или режим на телефоне)"
+    shown = ", ".join(names[:3])
+    if any("adb" in n.casefold() for n in names):
+        return ("телефон на USB с интерфейсом ADB (" + shown + "), но adb его не видит: на телефоне "
+                "ждёт «Разрешить отладку по USB?» или отладку надо выключить и включить")
+    return ("телефон на USB без интерфейса ADB (" + shown + "): на телефоне выключена «Отладка по USB» "
+            "(Windows видит только передачу файлов) — включи её в «Для разработчиков»")
+
+
 def _usb_android_hint() -> str:
     """Что про телефон видит сама Windows: USB-устройство Android есть, а adb пуст — ждёт отладка
     по USB / разрешение на телефоне; USB-устройства нет вовсе — кабель «только зарядка», порт,
@@ -100,7 +132,7 @@ def _usb_android_hint() -> str:
         return text
     script = (
         "Get-PnpDevice -PresentOnly -EA 0 | Where-Object { $_.InstanceId -like 'USB*' -and "
-        "($_.FriendlyName -match 'ADB|Android|MTP|Composite|TECNO|Portable|MediaTek|MTK') } | "
+        "($_.FriendlyName -match 'ADB|Android|MTP|Composite|PHONEB|Portable|MediaTek|MTK') } | "
         "ForEach-Object { $_.FriendlyName }"
     )
     try:
@@ -111,11 +143,7 @@ def _usb_android_hint() -> str:
         names = sorted({x.strip() for x in str(done.stdout or "").splitlines() if x.strip()})
     except (OSError, subprocess.SubprocessError) as exc:
         return f"USB не проверен ({type(exc).__name__})"
-    if names:
-        text = ("Windows видит USB: " + ", ".join(names[:3])
-                + " — но adb пуст (отладка по USB / разрешение на телефоне)")
-    else:
-        text = "Windows не видит телефон по USB вовсе (кабель «только зарядка», порт или режим на телефоне)"
+    text = usb_phone_hint(names)
     _USB_HINT_CACHE = (time.monotonic(), text)
     return text
 
@@ -171,8 +199,132 @@ def _disk(info: Mapping[str, Any]) -> tuple[str, str]:
         return UNKNOWN, "свободное место не проверено"
 
 
+ADB_RESTART_EVERY_S = 60.0
+_adb_start_lock = threading.Lock()
+_adb_started_at = 0.0
+
+
+def adb_binary(cfg: Mapping[str, Mapping[str, Any]] | None = None) -> str | None:
+    """Закреплённый бинарь adb ресурса с датчиком adb (поле `adb`), если он есть на диске."""
+    cfg = config() if cfg is None else cfg
+    for info in cfg.values():
+        if str(info.get("sensor") or "") == "adb" and info.get("adb"):
+            path = str(info["adb"])
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def ensure_adb_server(binary: str | None = None, *, wait_s: float = 6.0) -> bool:
+    """Поднять демон adb вне Job Object вызывающего, если он не отвечает. Не чаще раза в минуту."""
+    global _adb_started_at
+    if _adb_devices(timeout=1.0)[0] != UNKNOWN:
+        return True
+    binary = binary or adb_binary()
+    if not binary:
+        return False
+    with _adb_start_lock:
+        if time.monotonic() - _adb_started_at < ADB_RESTART_EVERY_S:
+            return False
+        _adb_started_at = time.monotonic()
+        import subprocess
+        # 21.11 (№116 п. 7): без DETACHED_PROCESS. Вместе с ним CREATE_NO_WINDOW игнорируется (WinAPI),
+        # процесс остаётся вовсе без консоли, и любой его консольный потомок получает ВИДИМОЕ окно.
+        # NO_WINDOW даёт свою скрытую консоль, её наследуют потомки; вне Job Object выводит BREAKAWAY.
+        base = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for flags in (base | 0x01000000, base):  # CREATE_BREAKAWAY_FROM_JOB, затем без него
+            try:
+                subprocess.Popen([binary, "start-server"], creationflags=flags, close_fds=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                break
+            except OSError:
+                continue
+        else:
+            return False
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        if _adb_devices(timeout=1.0)[0] != UNKNOWN:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def pin_adb(argv: list[str]) -> list[str]:
+    """`run adb …` агента — закреплённым бинарём и при живом демоне вне задания команды."""
+    if not argv or re.sub(r"\.exe$", "", os.path.basename(str(argv[0])).lower()) != "adb":
+        return argv
+    binary = adb_binary()
+    if not binary:
+        return argv
+    ensure_adb_server(binary)
+    return [binary, *argv[1:]]
+
+
+ADB_FORBIDDEN = ("kill-server", "start-server", "reconnect", "-P", "-L")
+
+
+def adb_refusal(argv: list[str]) -> str:
+    """Команда агента, которая убила бы или подменила общий демон adb, — отказ с причиной."""
+    if not argv or re.sub(r"\.exe$", "", os.path.basename(str(argv[0])).lower()) != "adb":
+        return ""
+    bad = [arg for arg in argv[1:] if arg in ADB_FORBIDDEN]
+    if not bad:
+        return ""
+    return (f"adb {bad[0]} запрещён: демон adb общий и долгоживущий, его держит датчик телефона "
+            "(05.11: демон, который убивали и поднимали команды агентов, обрывал телефон всем и "
+            "заставлял владельца заново разрешать отладку). Нет устройства — это ресурс «телефон», "
+            "а не повод перезапускать демон.")
+
+
+def _adb_device_lines(host: str = "127.0.0.1", port: int = 5037,
+                      timeout: float = 2.0) -> list[str] | None:
+    """`host:devices-l`: строки `serial  state  product:… model:… device:…`; None — демон молчит."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            cmd = b"host:devices-l"
+            sock.sendall(b"%04x" % len(cmd) + cmd)
+            if _recv(sock, 4) != b"OKAY":
+                return None
+            size = int(_recv(sock, 4), 16)
+            body = _recv(sock, size).decode("utf-8", "replace") if size else ""
+    except (OSError, ValueError):
+        return None
+    return [" ".join(line.split()) for line in body.splitlines() if line.strip()]
+
+
+def device_state(pattern: str, lines: list[str] | None) -> tuple[str, str]:
+    """Состояние ресурса одного устройства по строкам `adb devices -l` (fail closed)."""
+    try:
+        rx = re.compile(pattern, re.I)
+    except re.error as exc:
+        return UNKNOWN, f"ошибка в device={pattern!r}: {exc}"
+    if lines is None:
+        return UNKNOWN, "adb-сервер недоступен"
+    ready = [line for line in lines if len(line.split(" ")) > 1 and line.split(" ")[1] == "device"]
+    mine = [line for line in ready if rx.search(line)]
+    if mine:
+        return UP, "устройство: " + "; ".join(line.split(" ")[0] for line in mine)
+    seen = [line for line in lines if rx.search(line)]
+    return DOWN, (f"нет готового устройства под {pattern!r}"
+                  + (f" (видно: {'; '.join(seen)})" if seen else "")
+                  + (f"; готовы другие: {', '.join(line.split(' ')[0] for line in ready)}"
+                     if ready else ""))
+
+
+def _adb_sensor(info: Mapping[str, Any]) -> tuple[str, str]:
+    state = _adb_devices()
+    if state[0] == UNKNOWN and info.get("adb") and ensure_adb_server(str(info["adb"])):
+        state = _adb_devices()
+    pattern = str(info.get("device") or "").strip()
+    if pattern and state[0] != UNKNOWN:
+        return device_state(pattern, _adb_device_lines())
+    return state
+
+
 SENSORS: dict[str, Callable[[Mapping[str, Any]], tuple[str, str]]] = {
-    "adb": lambda info: _adb_devices(),
+    "adb": _adb_sensor,
     "tcp": _tcp,
     "http": _http,
     "disk": _disk,
@@ -309,9 +461,11 @@ def block_refs(db: Any, project: str | None = None) -> dict[tuple[str, str], lis
     35 задач, хотя ни одной из них телефон не нужен. Задача, замороженная только из-за задач на
     ресурсе мира, сама становится задачей-доказательством в этом мире.
     """
-    sql = ("SELECT t.project,t.tz,(SELECT kind||''||payload FROM events e WHERE e.project=t.project "
-           "AND e.tz=t.tz AND e.kind IN ('block','freeze','thaw','reactivate','approve') "
-           "ORDER BY e.id DESC LIMIT 1) AS last FROM tasks t WHERE t.state='frozen'")
+    # 08.11: MAX(id) по индексу вместо сортировки всех событий задачи (на каждой выдаче задачи).
+    sql = ("SELECT t.project,t.tz,(SELECT kind||''||payload FROM events WHERE id=(SELECT MAX(e.id) "
+           "FROM events e WHERE e.project=t.project AND e.tz=t.tz "
+           "AND e.kind IN ('block','freeze','thaw','reactivate','approve'))) AS last "
+           "FROM tasks t WHERE t.state='frozen'")
     args: tuple[Any, ...] = ()
     if project:
         sql += " AND t.project=?"
@@ -446,6 +600,9 @@ def _satisfied(
         return True
     if state == "rejected" or tz in seen:
         return False
+    # #submitted is a lifecycle gate, never an early provide:* checkpoint.
+    if level == "submitted":
+        return state == "submitted"
     if level and (state == "submitted" or level in (info.get("provided") or ())):
         return True
     dep_world = frozenset(info.get("resources") or ()) & world
@@ -530,21 +687,70 @@ def claim_resources(store: Any, worker_id: str) -> list[str]:
         return [str(r["resource"]) for r in rows]
 
 
+# 21.11.2026 (№116 п. 8.4): run_match искал подстроку во ВСЕХ аргументах — `git diff build/x`,
+# `rg bundle`, `adb shell … build.prop` и `product_update inspect` вставали в очередь за тяжёлой
+# сборкой (heavy-build, build-disk). Аргументы этих программ — данные, а не команда сборки.
+# Обёртки (cmd /c, powershell, py -c) по-прежнему сверяются целиком: неоднозначное — строго.
+_DATA_ARG_EXES = frozenset({
+    "git", "rg", "grep", "findstr", "where", "which", "type", "cat", "head", "tail", "ls", "dir",
+    "adb", "fastboot", "certutil", "fc", "diff", "file", "wc", "sort",
+})
+_READ_ONLY_VERBS = frozenset({"inspect", "status", "list", "show", "help", "--help", "-h",
+                              "--version", "version"})
+_VERB_SCRIPT = re.compile(r"(?i)(?:^|[\\/.])(?:product_update|publish_update)(?:\.py)?$")
+
+
+def run_match_text(argv: Iterable[str]) -> str:
+    """Текст команды для сверки с run_match (пусто — команда не берёт ресурсы `scope = "run"`)."""
+    args = [str(a) for a in argv]
+    if not args:
+        return ""
+    exe = re.sub(r"(?i)\.(exe|cmd|bat|com)$", "", os.path.basename(args[0].strip('"'))).lower()
+    if exe in _DATA_ARG_EXES:
+        return ""
+    for i, arg in enumerate(args[1:], 1):
+        if _VERB_SCRIPT.search(arg):
+            verb = next((a for a in args[i + 1:] if not a.startswith("-") or a in _READ_ONLY_VERBS), "")
+            if verb.lower() in _READ_ONLY_VERBS:
+                return ""
+            break
+    return " ".join(args)
+
+
 def _run_needs(cfg: Mapping[str, Mapping[str, Any]], argv: Iterable[str],
                resources: Iterable[str] = ()) -> list[str]:
-    import re
     scoped = run_scoped(cfg)
     names = set(resources) | {name for name in scoped if cfg[name].get("global") is True}
-    text = " ".join(str(a) for a in argv)
+    text = run_match_text(argv)
     need: list[str] = []
     for name in sorted(names & scoped):
         pattern = str(cfg[name].get("run_match") or "")
         try:
-            if not pattern or re.search(pattern, text, re.IGNORECASE):
+            if not pattern or (text and re.search(pattern, text, re.IGNORECASE)):
                 need.append(name)
         except re.error:
             need.append(name)  # invalid policy fails closed
     return need
+
+
+ADB_READY = "adb-ready"
+
+
+def is_adb_listing(argv: Iterable[str]) -> bool:
+    """`adb devices [-l]` — rc=0 и без телефона: как проба препятствия он пуст.
+
+    04.11–05.11 Nova VPN: fix:request:fc143e9d 10 раз за ночь — block «until: adb devices» →
+    проба rc=0 → thaw → take → снова «нет устройства». Такую пробу сервер заменяет датчиком."""
+    args = [str(a) for a in argv]
+    if len(args) < 2 or re.sub(r"\.exe$", "", os.path.basename(args[0]).lower()) != "adb":
+        return False
+    rest = [a for a in args[1:] if a != "-l"]
+    return rest == ["devices"]
+
+
+def adb_ready(argv: list[str], cwd: str) -> int:
+    """Проба `adb-ready`: 0 — у демона adb есть устройство в состоянии `device`. Клиента не запускает."""
+    return 0 if _adb_devices()[0] == UP else 1
 
 
 DISK_ADMISSION = "disk-admission"
@@ -586,6 +792,14 @@ def hold_for_run(store: Any, worker_id: str, argv: Iterable[str], who: str,
     need = _run_needs(cfg, argv, claim_resources(store, worker_id))
     taken: list[str] = []
 
+    # Both fleet workers and quick/Claude operator runs use this path.
+    # Lightweight commands remain allowed during emergency storage pressure.
+    if {"heavy-build", "test-run"} & set(need):
+        from .storage_guard import admission as storage_admission
+        allowed, reason = storage_admission()
+        if not allowed:
+            return None, reason + ". Команда НЕ запущена."
+
     # Disk admission is a fresh, cheap host observation, outside any writer.
     # A stale UP event must not start another large job on a full volume.
     for name in need:
@@ -606,16 +820,21 @@ def hold_for_run(store: Any, worker_id: str, argv: Iterable[str], who: str,
 
     deadline = time.monotonic() + wait_s
     for name in sorted(need):
-        holder = _acquire_run(name, _scan_pattern(cfg[name]), who, deadline)
+        slot, holder = _acquire_run_slot(name, cfg[name], who, deadline)
         if holder:
             release()
             return None, (
-                f"ресурс «{name}» сейчас занят: {holder}. Команда НЕ запущена. Сделай пока то, что "
-                f"не требует «{name}», и повтори run позже — это не ошибка задачи и не повод для "
-                "fleet_block."
+                f"ресурс «{name}» сейчас занят: {_holder_age(holder) if ';' not in holder else holder}. "
+                "Команда НЕ запущена. ETA неизвестно: слот освободится после завершения процесса; "
+                "повтори run позже. Это не ошибка задачи и не повод для fleet_block."
             )
-        taken.append(name)
+        taken.append(slot)
     return release, ""
+
+
+def command_resources(argv: Iterable[str]) -> list[str]:
+    """Resources of a finite command, independent of an agent's task declaration."""
+    return _run_needs(config(), argv)
 
 
 # 17.10.2026 (сессия Beta App): мьютекс жил только в памяти процесса dev-mcp и только на
@@ -681,12 +900,79 @@ def _acquire_run(name: str, pattern: str, who: str, deadline: float) -> str:
         time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
 
 
+def _holder_age(holder: str) -> str:
+    """Elapsed wall-clock time; completion time is not predictable."""
+    match = re.search(r' с (\d{2}:\d{2}:\d{2})$', holder)
+    if not match:
+        return holder + ' (время удержания неизвестно)'
+    try:
+        old = time.strptime(match.group(1), '%H:%M:%S')
+        now = time.localtime()
+        seconds = ((now.tm_hour - old.tm_hour) * 3600 +
+                   (now.tm_min - old.tm_min) * 60 + now.tm_sec - old.tm_sec) % 86400
+        return f'{holder}, удерживает {seconds // 60} мин'
+    except ValueError:
+        return holder
+
+
+def _acquire_run_slot(name: str, info: Mapping[str, Any], who: str,
+                      deadline: float) -> tuple[str, str]:
+    """Independent slots for lightweight pytest, with a RAM-aware second permit."""
+    capacity = max(1, min(4, int(info.get('capacity', 1))))
+    if capacity > 1:
+        try:
+            import psutil
+            if psutil.virtual_memory().available < 2 * 1024 ** 3:
+                capacity = 1
+        except (ImportError, OSError):
+            capacity = 1
+    if capacity == 1:
+        if int(info.get('capacity', 1)) > 1:
+            # RAM may fall below 2 GiB while a second slot is already live.
+            # Do not admit another run through free slot #0 in that case.
+            with _run_guard:
+                other = [f'{slot}: {_holder_age(holder)}' for slot, holder in _run_holders.items()
+                         if slot.startswith(name + '#') and slot != name + '#0']
+            if other:
+                return '', '; '.join(other)
+        holder = _acquire_run(name + '#0' if info.get('capacity', 1) != 1 else name,
+                              _scan_pattern(info), who, deadline)
+        return (name + '#0' if info.get('capacity', 1) != 1 else name, holder)
+    slots = [f'{name}#{i}' for i in range(capacity)]
+    pattern = _scan_pattern(info)
+    while True:
+        # 25.11 (ночное ревью, HIGH): как и при capacity=1, живые чужие прогоны (scan_processes)
+        # занимают слоты — иначе внешний heavy-процесс не уменьшал число допусков.
+        foreign = _foreign_runs(pattern) if pattern else []
+        with _run_guard:
+            held = sum(1 for slot in slots if slot in _run_holders)
+        if held + len(foreign) < capacity:
+            for slot in slots:
+                lock = _run_lock(slot)
+                if lock.acquire(blocking=False):
+                    with _run_guard:
+                        _run_holders[slot] = f"{who} с {time.strftime('%H:%M:%S')}"
+                    return slot, ''
+        if time.monotonic() >= deadline:
+            with _run_guard:
+                holders = [f'{slot}: {_holder_age(_run_holders.get(slot, "?"))}' for slot in slots]
+            if foreign:
+                holders.append("вне учёта dev-mcp — " + "; ".join(foreign[:3]))
+            return '', '; '.join(holders)
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
+
 def hold_blocking(argv: Iterable[str], who: str, wait_s: float) -> tuple[Callable[[], None] | None, str]:
     """Тот же замок для гейтов и приёмок интегратора (без захвата агента): ждать до wait_s."""
     if os.environ.get("DEV_MCP_FLEET_GATE_LOCK", "1") == "0":
         return (lambda: None), ""
     cfg = config()
     need = _run_needs(cfg, argv)
+    if {"heavy-build", "test-run"} & set(need):
+        from .storage_guard import admission as storage_admission
+        allowed, reason = storage_admission()
+        if not allowed:
+            return None, reason + ". Команда НЕ запущена."
     taken: list[str] = []
 
     def release() -> None:
@@ -699,10 +985,146 @@ def hold_blocking(argv: Iterable[str], who: str, wait_s: float) -> tuple[Callabl
     deadline = time.monotonic() + wait_s
     for name in sorted(need):
         if cfg[name].get("sensor") == "disk":
+            state,detail=_disk(cfg[name])
+            if state!=UP:
+                release()
+                return None,f'ресурс «{name}» недоступен: {detail}'
             continue
-        holder = _acquire_run(name, _scan_pattern(cfg[name]), who, deadline)
+        slot, holder = _acquire_run_slot(name, cfg[name], who, deadline)
         if holder:
             release()
             return None, f"ресурс «{name}» занят: {holder}"
-        taken.append(name)
+        taken.append(slot)
     return release, ""
+
+
+def command_available(argv: Iterable[str]) -> bool:
+    """A cheap admission probe. Execution must still acquire its own permit."""
+    release,busy=hold_blocking(argv,'admission probe',wait_s=0)
+    if release is None:
+        return False
+    release()
+    return not busy
+
+
+BUSY_TTL_S = 5.0
+_busy_cache: dict[str, Any] = {"at": -1e9, "busy": {}}
+
+
+def busy_run_resources(cfg: Mapping[str, Mapping[str, Any]] | None = None, *,
+                       ttl_s: float = BUSY_TTL_S) -> dict[str, str]:
+    """Ресурсы `scope = "run"`, занятые прямо сейчас: имя → кто держит / почему недоступен.
+
+    Наблюдение для допуска к выдаче, не разрешение на запуск: сам `run` берёт замок заново.
+    03.11.2026: ревью Beta App выдавались, пока `heavy-build` держал операторский
+    check_all; ревьюер блокировался, задача оттаивала и выдавалась снова — 416 взятий
+    за 4,5 ч. Занятость, известная до выдачи, не должна становиться захватом.
+    """
+    if os.environ.get("DEV_MCP_FLEET_GATE_LOCK", "1") == "0":
+        return {}
+    now = time.monotonic()
+    if cfg is None and now - float(_busy_cache["at"]) < ttl_s:
+        return dict(_busy_cache["busy"])
+    use = config() if cfg is None else cfg
+    busy: dict[str, str] = {}
+    for name in sorted(run_scoped(use)):
+        info = use[name]
+        if info.get("sensor") == "disk":
+            state, detail = _disk(info)
+            if state != UP:
+                busy[name] = f"недоступен: {detail}"
+            continue
+        with _run_guard:
+            holder = _run_holders.get(name, "")
+            if int(info.get('capacity', 1)) > 1:
+                slots = [f'{name}#{i}' for i in range(min(4, int(info['capacity'])))]
+                occupied = [_run_holders.get(slot, '') for slot in slots]
+                if all(occupied):
+                    holder = '; '.join(occupied)
+                else:
+                    holder = ''
+        if not holder:
+            foreign = _foreign_runs(_scan_pattern(info))
+            if foreign:
+                holder = "вне учёта dev-mcp — " + "; ".join(foreign[:2])
+        if holder:
+            busy[name] = holder
+    if cfg is None:
+        _busy_cache.update(at=now, busy=dict(busy))
+    return busy
+
+
+def acceptance_run_needs(acceptance: Iterable[str],
+                         cfg: Mapping[str, Mapping[str, Any]] | None = None) -> list[str]:
+    """Ресурсы `scope = "run"`, без которых не запустится хотя бы одна команда приёмки."""
+    from .exec_preflight import parse_command
+    use = config() if cfg is None else cfg
+    need: set[str] = set()
+    for command in acceptance:
+        try:
+            argv = parse_command(str(command))
+        except (ValueError, TypeError):
+            continue
+        need.update(_run_needs(use, argv))
+    return sorted(need)
+
+
+def run_resource_snapshot() -> tuple:
+    """Wake signal only; does not acquire, release or authorize execution."""
+    cfg=config()
+    with _run_guard:
+        owned=tuple(sorted(_run_holders.items()))
+    foreign=[]
+    for name,info in sorted(cfg.items()):
+        pattern=_scan_pattern(info)
+        if pattern:
+            foreign.append((name,tuple(_foreign_runs(pattern))))
+    return owned,tuple(foreign)
+
+
+OWNER_NEED_AFTER_S = 15 * 60
+
+
+def owner_needs(store: Any, *, now: datetime | None = None,
+                after_s: float = OWNER_NEED_AFTER_S) -> list[dict[str, Any]]:
+    """Ресурс мира, который нужен работе и давно лежит, — то, что может сделать только владелец.
+
+    05.11.2026: «подключи PHONEB» владелец узнавал от оператора в чате, а не от системы. Условие
+    уровневое: датчик down дольше after_s (телефон моргает десятки раз в сутки — моргание не
+    повод звать человека) и есть живые задачи с этим ресурсом. Текст — свежий ответ датчика,
+    а не запись перехода: запись могла устареть или быть догадкой.
+    """
+    now = now or datetime.now(timezone.utc)
+    cfg = config()
+    out: list[dict[str, Any]] = []
+    with store.read() as tx:
+        for name, info in sorted(cfg.items()):
+            sensor = info.get("sensor")
+            if not sensor:
+                continue
+            state, since = last_state(tx, name)
+            if state != DOWN:
+                continue
+            try:
+                at = datetime.fromisoformat(since.replace(" ", "T"))
+                at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if (now - at).total_seconds() < after_s:
+                continue
+            waiting = [(str(r["project"]), str(r["tz"])) for r in tx.query(
+                "SELECT t.project,t.tz FROM tasks t, json_each(t.resources) j "
+                "WHERE j.value=? AND t.state IN ('ready','frozen','taken') ORDER BY t.project,t.tz",
+                (name,))]
+            if not waiting:
+                continue
+            out.append({"resource": name, "since": at.isoformat(), "waiting": waiting,
+                        "need": str(info.get("need") or "")})
+    for item in out:
+        probe = SENSORS.get(str(cfg[item["resource"]].get("sensor")))
+        try:
+            state, detail = probe(cfg[item["resource"]]) if probe else (DOWN, "")
+        except Exception as exc:  # noqa: BLE001 — датчик не должен ронять доску
+            state, detail = DOWN, f"датчик не ответил ({type(exc).__name__})"
+        item["detail"], item["live"] = detail, state
+    return [i for i in out if i["live"] != UP]

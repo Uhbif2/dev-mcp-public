@@ -57,7 +57,14 @@ def _draft(root: Path) -> Path:
     return path
 
 
-def test_controller_tick_registers_draft_once_with_real_fixture_probe(tmp_path):
+def test_controller_tick_registers_draft_once_with_real_fixture_probe(tmp_path, monkeypatch):
+    from dev_mcp.fleet import generators
+    monkeypatch.setattr(generators, 'enabled', lambda: True)
+    from dev_mcp.fleet import spec_preflight
+    real_exists = spec_preflight._executable_exists
+    monkeypatch.setattr(spec_preflight, '_executable_exists',
+                        lambda argv, root: True if argv and argv[0] == 'py'
+                        else real_exists(argv, root))
     root = tmp_path / "project"
     root.mkdir()
     source = _draft(root)

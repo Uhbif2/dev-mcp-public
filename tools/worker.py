@@ -26,6 +26,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from dev_mcp.json_book import read_json, write_json
+
 IMPORT_LABEL = "импортирован, исполнитель неизвестен"
 
 
@@ -64,19 +66,18 @@ def _state_path(label: str) -> pathlib.Path:
 def _write_state(label: str, worker_id: str, kind: str) -> pathlib.Path:
     path = _state_path(label)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(
-        {"worker_id": worker_id, "label": label, "kind": kind, "updated_at": _now()},
-        ensure_ascii=False, indent=2
-    ), encoding="utf-8")
+    write_json(path, {"worker_id": worker_id, "label": label, "kind": kind,
+                      "updated_at": _now()}, indent=2)
     return path
 
 
 def _read_state(path: pathlib.Path) -> dict[str, Any] | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    if not path.exists():
         return None
-    return data if data.get("worker_id") else None
+    data = read_json(path, strict=True)
+    if not isinstance(data, dict) or not data.get("worker_id"):
+        raise RuntimeError(f"Worker JSON book invalid: {path}")
+    return data
 
 
 def _current_state(name: str | None = None) -> dict[str, Any]:

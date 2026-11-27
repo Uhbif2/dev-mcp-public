@@ -11,6 +11,7 @@ MAX_REOPEN times; after that the stage is handed to the controller's generic
 from __future__ import annotations
 
 from dev_mcp import machine
+from dev_mcp.json_book import write_json
 
 import json
 import logging
@@ -232,8 +233,7 @@ PLAYBOOK = {
 `intent/hypotheses.md`: «## Гипотезы», «## Эксперименты», «## Метрики»,
 «## Воспроизведение» и «## Риски». Для каждого опыта назови измеряемый
 критерий, контроль и команду; данные владельца не отправляй наружу.
-Сравни три независимых варианта и оформи свод разногласий.
-Критику Gemini запрашивает СЕРВЕР после твоей сдачи и пишет в `intent/consensus/<стадия>-gemini.md`; ты её не добываешь и задачу из-за неё не блокируешь — сдавай, когда своя приёмка зелёная. Вердикт revise вернётся к тебе текстом.""",
+Сравни три независимых варианта и оформи свод разногласий.""",
     "experiments": """\
 Проведи реальные пробы (прототипы, замеры, тесты, установки в безопасной песочнице).
 Каждый опыт — `experiments/<id>/README.md` с разделами «## Гипотеза»,
@@ -241,8 +241,7 @@ PLAYBOOK = {
 Команды должны быть повторяемыми; разрушительные проверки — только после согласования.""",
     "verified": """\
 Другой агент повторяет ключевые эксперименты. `intent/verification.md`: «## Повторы»,
-«## Независимый агент», «## Критика Gemini» (ссылка на серверный файл), «## Расхождения».
-Критику Gemini запрашивает СЕРВЕР после твоей сдачи и пишет в `intent/consensus/<стадия>-gemini.md`; ты её не добываешь и задачу из-за неё не блокируешь — сдавай, когда своя приёмка зелёная. Вердикт revise вернётся к тебе текстом.""",
+«## Независимый агент», «## Расхождения».""",
     "report": """\
 `intent/report.md`: «## Вывод», «## Эксперименты», «## Уверенность»,
 «## Что дальше». Для каждого вывода ссылка на воспроизводимый опыт;
@@ -346,7 +345,7 @@ def task_body(outcome_id: str, stage: str, required: str, *, triple: bool = Fals
     return (f"[intent-template] outcome={outcome_id}\n"
             f"Стадия: {stage}\nНужно доказать: {required}\n\n"
             + ("Три независимых кандидата + свод: проверь версии, разногласия,"
-               " выполни проверочный спайк. Критику Gemini запрашивает СЕРВЕР после твоей сдачи и пишет в `intent/consensus/<стадия>-gemini.md`; ты её не добываешь и задачу из-за неё не блокируешь — сдавай, когда своя приёмка зелёная. Вердикт revise вернётся к тебе текстом."
+               " выполни проверочный спайк. "
                " Только свод принимается как доказательство стадии.\n" if triple and triple_stage(stage) else "")
             + COMMON.format(stage=stage, map_path=(machine.HUB / 'MAP.md').as_posix(),
                             stack_path=machine.STACK_JSON.as_posix(),
@@ -366,7 +365,7 @@ def materialize(directory: Path, raw_intent: str, *, triple: bool = False,
     target.mkdir(exist_ok=True)
     (target / "intent.md").write_text(raw_intent, encoding="utf-8")
     shutil.copyfile(Path(stage_check.__file__), directory / CHECKER_REL)
-    (target / "options.json").write_text(json.dumps({"triple": triple}), encoding="utf-8")
+    write_json(target / "options.json", {"triple": triple})
     if initialize_git:
         ensure_git(directory)
 
@@ -375,6 +374,7 @@ def materialize(directory: Path, raw_intent: str, *, triple: bool = False,
 # каждой правке stage_check.py, иначе копии в проектах застревают на старой (18.10: 12 из 13
 # копий были версиями eef008a/1e9413f/3d495c7 и не обновлялись).
 LEGACY_CHECKER_SHA256 = {
+    '5db2bc167126e85871ec21e3ddcfa96fd48d5bafb50c395caf9696994b889690',  # before exact relocation support
     'c50d613046bba9c3d401b4d79b38cf42514e7e8429074106005179e1c3b4660f',  # 77944c0
     '2d5f21730aee412fbad8915ee32a7d97123ac145a07bcf230acac1ab1f094bac',  # eef008a
     'df4d1dbbe5db67c6bff8576e08aad31662124799d12bacc96c84e905df2452a7',  # 1e9413f
@@ -546,88 +546,6 @@ def _clip(text: str, limit: int) -> str:
     return text[:cut if cut > limit // 2 else limit] + "\n[обрезано сервером]\n"
 
 
-def _gemini_critique(store: Any, project: str, stage: str, root: Path,
-                    tz: str, *, single: bool = False) -> list[StageProblem]:
-    """Cross-model critique is server-observed, never the author's declaration."""
-    import hashlib
-    from dev_mcp.fleet import gemini
-    folder = root / "intent"
-    try:
-        if stage == "verified":
-            content = _clip((folder / "hypotheses.md").read_text(encoding="utf-8"), 20000)
-            content += "\n## НЕЗАВИСИМАЯ ПРОВЕРКА\n" + _clip((
-                folder / "verification.md").read_text(encoding="utf-8"), 30000)
-            for report in sorted((root / "experiments").glob("*/README.md"))[:12]:
-                content += "\n## ОПЫТ " + report.parent.name + "\n"
-                content += _clip(report.read_text(encoding="utf-8"), 6000)
-        elif single:
-            document = {'understood':'understood.md','approach_selected':'approaches.md',
-                        'hypotheses_plan':'hypotheses.md','report':'report.md'}[stage]
-            content = _clip((folder/document).read_text(encoding='utf-8'),30000)
-        else:
-            content = "\n".join(_clip((folder / "candidates" / stage / f"{i}.md").read_text(
-                encoding="utf-8"), 15000) for i in range(1, 4))
-            content += "\n## СВОД\n" + _clip((folder / "consensus" / f"{stage}.md").read_text(
-                encoding="utf-8"), 30000)
-    except OSError:
-        return [StageProblem("invalid_result", "нет документов для независимой критики")]
-    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    with store.read() as tx:
-        history = tx.query("SELECT payload FROM events WHERE kind='intent.gemini_critique' "
-                           "AND project=? AND tz=? ORDER BY id DESC LIMIT 20", (project, tz))
-    for old in history:
-        data = json.loads(old["payload"])
-        if data.get("digest") == digest:
-            _external_resumed(store, project, tz, digest)
-            if data.get("verdict") == "approve":
-                return []
-            return [StageProblem("invalid_result", "Gemini потребовал пересмотра: "
-                                 + str(data.get("critique", ""))[:800])]
-    # A pending submission is held by its actual artifact digest and observed
-    # relay state, not by a new author claim or by every prover timer tick.
-    # An altered artifact or relay state change bypasses backoff immediately.
-    service_state = "up" if gemini._listening() else "down"
-    previous = _last_external_event(store, project, tz)
-    if previous and previous["kind"] == "intent.stage_waiting_external":
-        data = json.loads(previous["payload"])
-        if data.get("digest") == digest and data.get("service_state") == service_state:
-            delay = min(3600, 30 * 2 ** min(16, max(1, int(data.get("attempt", 1)))))
-            age = (datetime.now(timezone.utc) -
-                   datetime.fromisoformat(previous["ts"])).total_seconds()
-            if age < delay:
-                return [StageProblem("external_pending", str(data.get("reason", "")), digest)]
-    schema = {"type": "OBJECT", "properties": {
-        "verdict": {"type": "STRING", "enum": ["approve", "revise"]},
-        "critique": {"type": "STRING"}}, "required": ["verdict", "critique"]}
-    answer = gemini.ask(
-        ("Ты независимый критик. Проверь одиночный документ и доказательства. " if single else
-         "Ты независимый критик предпродакшена. Сравни три версии и свод. ") +
-        "Найди ошибки, несогласия, недоказанные утверждения. "
-        "Ответь revise, если спайки не разрешили спорные вопросы. "
-        "Пометка «[обрезано сервером]» — ограничение пересылки, не дефект документа.\n" + content,
-        # gemini-auto-flash answers in ~20 s even on 'Say ok' (13.10.2026): 25 s made
-        # every critique fail and the understood stage of ai-relay-upgrade loop.
-        schema=schema, timeout=CRITIQUE_TIMEOUT_S)
-    if not isinstance(answer, dict) or answer.get("verdict") not in ("approve", "revise") or not (
-            isinstance(answer.get("critique"), str) and answer["critique"].strip()):
-        reason = ("недоступна независимая критика Gemini (сервер, не агент: "
-                  + str(gemini.last_error() or "нет ответа")[:200] + ")")
-        return [_external_pending(store, project, tz, digest, service_state, reason)]
-    _external_resumed(store, project, tz, digest)
-    with store.tx() as tx:
-        tx.record_event(kind="intent.gemini_critique", project=project, tz=tz,
-                        payload={"digest": digest, "verdict": answer["verdict"],
-                                 "critique": answer["critique"][:3000]})
-    critique = folder / "consensus" / f"{stage}-gemini.md"
-    critique.parent.mkdir(parents=True, exist_ok=True)
-    critique.write_text("model: gemini\n## Критика\n" + answer["critique"][:3000]
-                        + "\n## Вердикт\n" + answer["verdict"] + "\n", encoding="utf-8")
-    if answer["verdict"] != "approve":
-        return [StageProblem("invalid_result",
-                             "Gemini потребовал пересмотра: " + answer["critique"][:800])]
-    return []
-
-
 EXECUTABLE_SERVER_STAGES = frozenset((
     "executable_goal", "implemented", "delivered", "executable_plan"))
 DOCUMENT_SERVER_STAGES = frozenset((
@@ -721,13 +639,16 @@ def accept_submitted_stage(store: Any, project: str, tz: str) -> str | None:
           and stage in EXECUTABLE_SERVER_STAGES | DOCUMENT_SERVER_STAGES):
         spec = json.loads(row["outcome_spec"] or "{}")
         is_triple = bool(spec.get("triple")) and triple_stage(stage)
+        from dev_mcp.fleet import relocation
+        relocated = relocation.current_target(store, project, root, spec)
+        route_kwargs = {'relocated_target': relocated} if relocated is not None else {}
         problems = stage_check.check(root, stage, strict=bool(spec.get("triple")),
-                                     triple=is_triple)
+                                     triple=is_triple, **route_kwargs)
         if stage == "understood" and not problems:
             try:
                 grants = json.loads(row["outcome_authority"] or "{}").get("project_roots", ())
                 kind, _ = stage_check.routing(
-                    root, allowed_roots=tuple(Path(p) for p in grants))
+                    root, allowed_roots=tuple(Path(p) for p in grants), **route_kwargs)
                 if kind != "build" and not grants:
                     raise ValueError("отсутствуют доверенные project_roots")
             except (ValueError, OSError) as exc:
@@ -739,9 +660,6 @@ def accept_submitted_stage(store: Any, project: str, tz: str) -> str | None:
             problems.extend(errors)
         if stage == "executable_plan" and not problems:
             problems.extend(_plan_registered(store, project, root))
-        if stage in DOCUMENT_SERVER_STAGES and not problems:
-            problems.extend(_gemini_critique(store, project, stage, root, tz,
-                                             single=not is_triple))
     else:
         return None
 
@@ -790,6 +708,11 @@ def accept_submitted_stage(store: Any, project: str, tz: str) -> str | None:
                    "payload": {"producer": "server-stage-check", "stage": stage}},
         )
         _retire_stage_reviews(tx,project,tz,now)
+    if stage == "understood" and not candidate:
+        # 03.11.2026 (владелец: «разрешаю подключать во флот»): проверка рамки — после
+        # собственной приёмки и критики Gemini, в тени: стадия уже принята и ничего не ждёт.
+        from . import frame_check
+        frame_check.start(store, project, tz, root)
     return "server-accepted:" + tz
 
 
@@ -889,33 +812,30 @@ def _stage_problems(store: Any, row: Any) -> list[StageProblem]:
     stage, tz = row["title"], row["tz"]
     spec_data = json.loads(row["spec"])
     is_triple = bool(spec_data.get("triple")) and triple_stage(stage)
+    from dev_mcp.fleet import relocation
+    relocated = relocation.current_target(store, row['project'], Path(row['root']), spec_data)
+    route_kwargs = {'relocated_target': relocated} if relocated is not None else {}
     problems = [
         StageProblem("invalid_result", detail)
         for detail in stage_check.check(Path(row["root"]), stage,
                                         strict=bool(spec_data.get("triple")),
-                                        triple=is_triple)
+                                        triple=is_triple, **route_kwargs)
     ]
     if stage == "understood" and not problems:
         try:
             grants = json.loads(row["authority"]).get("project_roots", ())
             stage_check.routing(Path(row["root"]),
-                                allowed_roots=tuple(Path(path) for path in grants))
+                                allowed_roots=tuple(Path(path) for path in grants), **route_kwargs)
         except (ValueError, OSError) as exc:
             problems.append(StageProblem("invalid_result", f"target не разрешён: {exc}"))
     if is_triple:
         _, errors = _triple_workers(store, row["project"],
                                     row["id"].rsplit(":", 1)[0], stage, consensus=True)
         problems.extend(StageProblem("invalid_result", error) for error in errors)
-        if not problems:
-            problems.extend(_gemini_critique(store, row["project"], stage,
-                                             Path(row["root"]), tz))
     if stage == "verified" and spec_data.get("kind") == "investigate":
         problems.extend(StageProblem("invalid_result", error) for error in
                         _research_independence(store, row["project"],
                                                row["id"].rsplit(":", 1)[0]))
-        if not problems:
-            problems.extend(_gemini_critique(store, row["project"], stage,
-                                             Path(row["root"]), tz))
     if stage == "owner_approved":
         problems.extend(StageProblem("invalid_result", error) for error in
                         _ops_owner_approval(store, row["project"], Path(row["root"])))

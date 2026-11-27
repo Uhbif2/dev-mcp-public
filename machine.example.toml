@@ -12,4 +12,3 @@ worktree_base = 'C:\work\.fleet-wt'
 # owner_project = 'Owner Inbox'
 # Optional host integrations:
 # lens_docs = ['C:\work\skills\art-director\SKILL.md']
-# gemini_relay = 'C:\work\ai-relay\relay.mjs'

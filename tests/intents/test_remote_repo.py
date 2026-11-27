@@ -188,3 +188,33 @@ def test_missing_security_policy_blocks_every_network_write(project, monkeypatch
     monkeypatch.setattr(rr, 'POLICY_PATH', tmp_path / 'absent-policy.toml')
     assert rr.push_after_proven_stage(store, 'demo', root)['status'] == 'blocked'
     assert not any(args[0] == 'gh' or args[:2] == ('git', 'push') for args in network['calls'])
+
+
+def test_slow_network_publish_does_not_hold_registry_write_gate(project, monkeypatch) -> None:
+    from contextlib import contextmanager
+    import time
+
+    store, root = project
+    _fake_network(monkeypatch)  # GitHub calls stay mocked.
+    elapsed: list[float] = []
+    original_tx = store.tx
+    original_publish = rr._publish
+
+    @contextmanager
+    def measured_tx():
+        started = time.monotonic()
+        try:
+            with original_tx() as tx:
+                yield tx
+        finally:
+            elapsed.append(time.monotonic() - started)
+
+    def slow_publish(root, project):
+        assert store._gate.depth == 0
+        time.sleep(1.05)
+        return original_publish(root, project)
+
+    monkeypatch.setattr(store, "tx", measured_tx)
+    monkeypatch.setattr(rr, "_publish", slow_publish)
+    assert rr.push_after_proven_stage(store, "demo", root)["status"] == "pushed"
+    assert elapsed and max(elapsed) < 1.0

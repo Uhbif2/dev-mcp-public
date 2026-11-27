@@ -1,5 +1,25 @@
 # Fleet Platform — post-accept delivery (TZ-13)
 
+## Local owner result bundles
+
+The server can finish the local coding-task cycle without granting deployment
+authority. After trusted integration, a background result worker creates a ZIP
+with the actual changed files, a patch and a receipt binding accept_id, Git
+revision, full-gate evidence and SHA-256. A configured gate must pass on an
+immutable committed checkout. A later green revision may be used only when
+the result files are unchanged. Dirty working-tree files cannot supply proof.
+
+The existing owner dashboard, owner notices and `fleet.cmd result` expose the
+bundle. File content is rehashed before it is advertised; missing or modified
+archives are not reported as available. `artifact_available` is distinct from
+target deployment and owner acceptance. No owner.done or approval is inferred.
+Projects without `commit=true` still require their authorized integration path.
+
+Resource admission failure, timeout and launch error are execution outcomes;
+they do not create a code repair without a demonstrated test failure. Deferred
+integration uses durable per-accept retry deadlines, not the rotating batch's
+identity. These mechanisms apply to every registered project.
+
 Delivery is a separate state change **after** acceptance. A passing test or
 review does not prove an artifact reached its target. Trusted server code calls
 fleet.delivery.on_accept; this is NOT an agent-facing MCP tool. All effects

@@ -1,3 +1,26 @@
+// Единая классификация состояния страниц обычных и быстрых агентов.
+// Ошибка имеет приоритет над индикатором генерации и свежим MCP: сломанный интерфейс не работает.
+// Разговор и сообщение пользователя не анализируем, используем только bounded probe от content.js.
+export function classifyPageIssue(page, tab = {}, hasChat = false) {
+  const url = String(tab.url || tab.pendingUrl || page?.url || "");
+  if (/^chrome-error:/i.test(url) || /ERR_(?:CONNECTION|INTERNET|NETWORK|TIMED_OUT)/i.test(String(tab.title || "")))
+    return { kind: "network-load", text: "browser navigation failed" };
+  if (!page) return { kind: "no-response", text: "content script not responding" };
+  if (page.pageLoadFailed) return { kind: "conversation-load", text: String(page.pageLoadFailed).slice(0, 160) };
+  if (page.accountLoadFailed) return { kind: "account-load", text: String(page.accountLoadFailed).slice(0, 160) };
+  if (page.cloudflarePageText) return { kind: "cloudflare", text: String(page.cloudflarePageText).slice(0, 160) };
+  if (page.blocked || page.networkSuspicious || page.ui?.gateSensitive)
+    return { kind: "blocked", text: String(page.blocked || page.networkSuspicious || page.ui?.gate || "").slice(0, 160) };
+  const error = String(page.failed || page.interrupted || page.errorText || "");
+  if (/no response from chatgpt|check your connection|network error|message delivery timed out|something went wrong|соединение прервано|ошибка сети/i.test(error))
+    return { kind: "turn-failed", text: error.slice(0, 160) };
+  if (page.interrupted) return { kind: "interrupted", text: String(page.interrupted).slice(0, 160) };
+  if (page.failed) return { kind: "turn-failed", text: String(page.failed).slice(0, 160) };
+  if (hasChat && page.composerPresent === false && !page.generating && !page.loading)
+    return { kind: "composer-missing", text: "conversation composer missing" };
+  return { kind: "", text: "" };
+}
+
 // Адрес сессии — закреплённая цель вкладки. Текущий URL после ошибки её не заменяет.
 export const RECOVERY_DEFAULTS = {
   // Эксперимент владельца: открытие интерфейса и перезагрузка делят одну полосу.
@@ -41,6 +64,17 @@ export function rememberSession(previous, value, label, now) {
 
 export function accountActionWait(account, now, cfg = RECOVERY_DEFAULTS) {
   return Math.max(0, (account?.lastActionAt || 0) + cfg.accountActionGapSec * 1000 - now);
+}
+
+// Локальный предохранитель, НЕ документированная квота ChatGPT. Одна история для
+// открытий, перезагрузок и отправок всех типов агентов, включая быстрых.
+export const ACCOUNT_ACTIONS_PER_HOUR = 120;
+export function pacedAccountActionWait(account, now, cfg = RECOVERY_DEFAULTS, limit = ACCOUNT_ACTIONS_PER_HOUR) {
+  const recent = (account?.history || []).filter((item) =>
+    Number.isFinite(item?.at) && item.at <= now && now - item.at < 3600_000);
+  const ceiling = recent.length >= limit
+    ? Math.max(0, recent[recent.length - limit].at + 3600_000 - now) : 0;
+  return Math.max(accountActionWait(account, now, cfg), ceiling);
 }
 
 export function markAccountAction(account, now, type, tabId, label = "") {
@@ -123,12 +157,47 @@ export function placeCheck(action, stateUrl, session, projectUrl) {
     reason: "вкладка не в чате, свой чат неизвестен — ничего не шлю" };
 }
 
-// «Не удалось загрузить аккаунт» — единственный известный сигнал исчерпания лимита аккаунта.
-// Пауза новых чатов 10 → 20 → 40 … ≤ 120 мин подряд; первый удачный запуск сбрасывает.
+// 429 одного разговора не означает 429 аккаунта. Не опрашиваем его чаще
+// Retry-After или 2→4→8→16→30 мин: иначе расширение само поддерживает лимит.
+export function conversationApiCheck(previous, result, nowMs, conv = "") {
+  const status = Number.isInteger(result?.status) ? result.status : null;
+  const prev = previous?.conv === conv ? previous : null;
+  if (status === null) {
+    return prev?.status === 429 ? { ...prev, nextAt: Math.max(prev.nextAt || 0, nowMs + 60_000) } :
+      { at: nowMs, status: null, conv, nextAt: nowMs + 60_000 };
+  }
+  if (status !== 429) return { at: nowMs, status, conv, nextAt: nowMs + 60_000 };
+  const consecutive = prev?.status === 429 ? (prev.consecutive || 1) + 1 : 1;
+  const first429At = prev?.status === 429 ? (prev.first429At || prev.at) : nowMs;
+  const exponentialMs = Math.min(30 * 60_000, 2 * 60_000 * 2 ** Math.min(consecutive - 1, 12));
+  const retryAfterSec = Math.max(0, Number(result.retryAfterSec) || 0);
+  return { at: nowMs, status, conv, consecutive, first429At, retryAfterSec,
+    nextAt: nowMs + Math.max(exponentialMs, retryAfterSec * 1000) };
+}
+
+export function conversation429Backoff(check, nowMs) {
+  return check?.status === 429 ? Math.max(0, (check.nextAt || 0) - nowMs) : 0;
+}
+
+export function conversation429Unavailable(check, nowMs) {
+  return check?.status === 429 && Number.isFinite(check.first429At) &&
+    nowMs - check.first429At >= 30 * 60_000;
+}
+
+// «Не удалось загрузить аккаунт» или независимо подтверждённая 429 —
+// пауза 10 → 20 → 40 … ≤ 120 мин; после тишины >= 2 длительностей сброс.
 export function accountOverloaded(launch, nowMs) {
-  const level = Math.min((launch?.overloadLevel || 0) + 1, 5);
+  const priorLevel = launch?.overloadLevel || 0;
+  const lastAt = (launch?.overloads || []).at(-1);
+  const inferredMs = lastAt && Number(launch?.overloadUntil) > lastAt
+    ? launch.overloadUntil - lastAt
+    : Math.min(10 * 2 ** Math.max(0, priorLevel - 1), 120) * 60_000;
+  const lastPauseMs = Number(launch?.overloadPauseMs) > 0 ? launch.overloadPauseMs : inferredMs;
+  const decayed = lastAt && nowMs - lastAt >= 2 * lastPauseMs ? 0 : priorLevel;
+  const level = Math.min(decayed + 1, 5);
   const pauseMin = Math.min(10 * 2 ** (level - 1), 120);
   return { ...launch, overloadLevel: level, overloadUntil: nowMs + pauseMin * 60_000,
+    overloadPauseMs: pauseMin * 60_000,
     overloads: [...(launch?.overloads || []).filter((at) => nowMs - at < 86_400_000), nowMs] };
 }
 

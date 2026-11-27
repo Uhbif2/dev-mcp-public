@@ -1,4 +1,4 @@
-"""Versioned quality lenses, Operator/Gemini evidence and defect outcomes."""
+"""Versioned quality lenses, Operator evidence and defect outcomes."""
 from .catalog import CATALOG, VISUAL, Case, Lens, catalog
 from .engine import (
     ART_DIRECTOR, CheckProof, Defect, Frame, LensReport, LensRunner, Observation,

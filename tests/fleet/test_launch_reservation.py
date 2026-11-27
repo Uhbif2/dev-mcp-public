@@ -44,6 +44,20 @@ def test_lost_reservation_response_replays_same_claim_without_empty_queue(tmp_pa
     assert json.loads(api['fleet_launch_release'](args[0],first['claim_id']))['status'] == 'confirmed'
 
 
+def test_rechecking_live_reservation_does_not_need_sqlite_writer(tmp_path):
+    import sqlite3
+    store, api = setup(tmp_path)
+    args = ('f1014-1300abc', 'P')
+    first = json.loads(api['fleet_launch_reserve'](*args))
+    assert first['status'] == 'reserved'
+    writer = sqlite3.connect(str(store.path))
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        assert json.loads(api['fleet_launch_reserve'](*args)) == first
+    finally:
+        writer.close()
+
+
 def test_project_paused_after_reservation_never_starts_a_model(tmp_path):
     store,api = setup(tmp_path)
     args = ('f1014-1300abc','P')

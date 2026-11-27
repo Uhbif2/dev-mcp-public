@@ -120,7 +120,11 @@ def _synthetic_cleaner(project: Path) -> None:
             fn(path)
         else:
             raise error
-    shutil.rmtree(project, onexc=writable_then_retry)
+    # onexc is Python 3.12+; the second PC also runs Python 3.11.
+    # onerror is available on both and passes the same (func, path, exc_info).
+    def onerror(fn, path, exc_info):
+        writable_then_retry(fn, path, exc_info[1])
+    shutil.rmtree(project, onerror=onerror)
 
 
 def _default_repair(state_root: Path, fixture: FaultFixture, version: str) -> RepairSignal | None:
@@ -266,7 +270,7 @@ def _drive_controller(store, state_root: Path, fixture: FaultFixture,
     controller.tick()
     with store.read() as tx:
         tasks = tx.query(
-            "SELECT t.project,t.tz,t.state FROM outcome_work w JOIN tasks t "
+            "SELECT t.project,t.tz,t.state FROM outcome_work w CROSS JOIN tasks t "
             "ON w.project=t.project AND w.tz=t.tz WHERE w.outcome_id='drill-outcome'"
         )
     if len(tasks) != 1 or tasks[0]["state"] != "ready":

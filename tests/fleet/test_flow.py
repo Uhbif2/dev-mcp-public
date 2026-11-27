@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 from dev_mcp.fleet import flow
 
@@ -18,6 +19,20 @@ def _db() -> sqlite3.Connection:
 def _ev(conn, ts, kind, worker=None, project="P", tz=None, rc=None, **payload):
     conn.execute("INSERT INTO events (ts,kind,worker_id,project,tz,rc,payload) VALUES (?,?,?,?,?,?,?)",
                  (ts, kind, worker, project, tz, rc, json.dumps(payload)))
+
+
+def test_agent_states_do_not_count_quick_subagents_as_waiting() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE workers (id TEXT, kind TEXT, last_seen TEXT, revoked_at TEXT)")
+    conn.execute("CREATE TABLE claims (worker_id TEXT, state TEXT)")
+    now = datetime(2026, 11, 15, 13, 0, tzinfo=timezone.utc)
+    recent = "2026-11-15T12:59:00+00:00"
+    conn.executemany("INSERT INTO workers VALUES (?,?,?,NULL)", [
+        ("W1", "chatgpt", recent), ("W2", "chatgpt", recent), ("Q1", "quick", recent),
+    ])
+    conn.execute("INSERT INTO claims VALUES ('W1', 'active')")
+    result = flow.agent_states(conn, now=now)
+    assert (result["working"], result["waiting"], result["thinking"], result["silent"]) == (1, 1, 0, 0)
 
 
 def test_first_pass_counts_first_verdict_not_accepted_tasks() -> None:

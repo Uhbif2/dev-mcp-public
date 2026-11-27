@@ -39,6 +39,14 @@ def env(tmp_path, monkeypatch):
     (root / "file.txt").write_text("base\n", encoding="utf-8")
     git(root, "add", "file.txt")
     git(root, "commit", "-m", "base")
+    # Maintenance requires NUL-delimited worktree inventory for safe paths.
+    # Some Git for Windows builds do not support the -z flag yet.
+    inventory = subprocess.run(
+        ["git", "-C", str(root), "worktree", "list", "--porcelain", "-z"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if inventory.returncode:
+        pytest.skip("Git lacks worktree list --porcelain -z; safe inventory unavailable")
     store = Store.open(str(tmp_path / "fleet.sqlite"))
     monkeypatch.setattr(goals, "project_info",
                         lambda _: {"commit": True, "claim_trees": True})

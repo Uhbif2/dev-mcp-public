@@ -181,7 +181,7 @@ def _step(kind: str, oid: str, before: Snapshot, **params: str) -> Step:
     return Step(kind, oid, before.fingerprint, before, tuple(sorted(params.items())))
 
 
-def decide(store: Store, outcome_id: str, *, gemini_available: bool = False) -> Step:
+def decide(store: Store, outcome_id: str) -> Step:
     """Choose an unused rung. A decision is pure: record_attempt consumes it.
 
     An owner escalation latches even if writing its obstacle changes the hash.
@@ -234,8 +234,6 @@ def decide(store: Store, outcome_id: str, *, gemini_available: bool = False) -> 
         spec.get("alternatives") or spec.get("decomposition_available")
     ):
         return _step("alternative", outcome_id, before)
-    if "cross_model" not in used and gemini_available:
-        return _step("cross_model", outcome_id, before, model="gemini")
     return _step("owner", outcome_id, before)
 
 

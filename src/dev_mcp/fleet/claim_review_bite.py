@@ -434,7 +434,7 @@ def reviewer_inspect(store: Any, claim_id: int, reviewer: str, operation: str,
     reviewer are validated on every call. All three operations use the same
     revision as reviewer_run/accept_claim, including unchanged baseline files.
     """
-    if operation not in {"read_file", "search_files", "list_dir"}:
+    if operation not in {"read_file", "read_image", "search_files", "list_dir"}:
         raise ClaimReviewError("unsupported sealed inspect operation")
     if (type(max_results) is not int or not 1 <= max_results <= 100
             or not isinstance(query, str) or len(query) > 512
@@ -489,7 +489,17 @@ def reviewer_inspect(store: Any, claim_id: int, reviewer: str, operation: str,
             raise ClaimReviewError("sealed blob exceeds inspect limit")
         return item.stdout.decode("utf-8", errors="replace")
 
-    if operation == "read_file":
+    if operation == "read_image":
+        if rel not in scope:
+            raise ClaimReviewError("file missing from sealed submission")
+        item = subprocess.run(
+            ["git", "-C", str(root), "show", f"{sub.revision}:{rel}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90,
+        )
+        if item.returncode or len(item.stdout) > 8 * 1024 * 1024:
+            raise ClaimReviewError("sealed image unavailable or exceeds 8 MB")
+        result = item.stdout
+    elif operation == "read_file":
         if rel not in scope:
             raise ClaimReviewError("file missing from sealed submission")
         result = blob(rel)[:65536]

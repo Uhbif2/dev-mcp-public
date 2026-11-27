@@ -395,7 +395,7 @@ async def test_actual_mcp_dashboard_tools_reject_ungranted_and_serve_verified_im
             "fleet_owner", {"agent": token, "command": "intentionally-invalid", "args": []}
         )
         owner_text = " ".join(part.text for part in owner_response.content if hasattr(part, "text"))
-        assert "роль владельца не выдана" in owner_text
+        assert "роль владельца" in owner_text and "не выдана" in owner_text
         args = {"session_token": token}
         accepted = await invoke(client, "owner_dashboard_overview", args)
         assert accepted["status"] == "ready"

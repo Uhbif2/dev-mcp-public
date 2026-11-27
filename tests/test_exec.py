@@ -15,6 +15,21 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def production_policy_requires_host_layout(request):
+    """Live-machine policy assertions require directories declared by that host."""
+    if request.node.get_closest_marker("production") is None:
+        return
+    import tomllib
+    config = Path(__file__).resolve().parents[1] / "policy.toml"
+    raw = tomllib.loads(config.read_text(encoding="utf-8"))
+    missing = [path for path in raw.get("roots", []) if not Path(path).exists()]
+    if missing:
+        pytest.skip("production policy requires host-specific roots: " + ", ".join(missing[:2]))
+
+
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 from fastmcp import Client  # noqa: E402
@@ -495,7 +510,7 @@ async def test_background_pytest_deadline_is_passed_to_registry(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_run_status_recovers_promoted_result_from_fleet_journal(tmp_path: Path) -> None:
+async def test_run_status_recovers_promoted_result_from_fleet_journal(tmp_path: Path,monkeypatch) -> None:
     server, _ = make_server(tmp_path, exec_roots="'{}'".format(tmp_path / 'workspace' / 'proj'))
     job_id = 'abcdef123456'
     store = Store.open(str(tmp_path / 'data' / 'fleet' / 'fleet.sqlite'))
@@ -506,7 +521,15 @@ async def test_run_status_recovers_promoted_result_from_fleet_journal(tmp_path: 
             rc=0,
             payload={'argv': ['python', '-m', 'pytest'], 'promoted': job_id},
         )
+        tx.record_event(kind='run',worker_id='W2',rc=7,
+                        payload={'argv':['python','-c',f"print('{job_id}')"]})
 
+    import contextlib
+    @contextlib.contextmanager
+    def no_writer(*args,**kwargs):
+        raise AssertionError('archived run status must not acquire the SQLite writer')
+        yield
+    monkeypatch.setattr(Store,'tx',no_writer)
     status = await call(server, 'run_status', {'job_id': job_id})
     assert not status.startswith('Отказано')
     assert 'код возврата 0' in status
@@ -765,7 +788,7 @@ async def test_policy_reload_picks_up_edit_without_restart(tmp_path: Path) -> No
     server = build_server(policy, audit, policy_path=policy_path)
 
     before = await call(server, 'policy_info', {})
-    assert 'exec' in before.lower()
+    assert str(tmp_path / 'workspace') in before
 
     new_exec = tmp_path / 'workspace' / 'proj'
     text = policy_path.read_text(encoding='utf-8')

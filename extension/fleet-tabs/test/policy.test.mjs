@@ -620,11 +620,10 @@ test("defaults contain no installation-specific project names", () => {
   assert.deepEqual(BASE_LAUNCH_DEFAULTS.projects, []);
 });
 
-test("мало свободной памяти — новую вкладку не открываем; неизвестно — не мешаем", () => {
-  const low = decideLaunch(Q(), [], [], {}, T0, LAUNCH_DEFAULTS, Math.random, LAUNCH_DEFAULTS.minFreeMemMB - 1);
-  assert.match(low.reason, /свободно памяти/);
-  assert.equal(decideLaunch(Q(), [], [], {}, T0, LAUNCH_DEFAULTS, Math.random, null).action, "launch");
-  assert.equal(decideLaunch(Q(), [], [], {}, T0, LAUNCH_DEFAULTS, Math.random, 4000).action, "launch");
+test("низкая ОЗУ не запрещает новую вкладку", () => {
+  for (const free of [159, LAUNCH_DEFAULTS.minFreeMemMB - 1, null, 4000]) {
+    assert.equal(decideLaunch(Q(), [], [], {}, T0, LAUNCH_DEFAULTS, Math.random, free).action, "launch");
+  }
 });
 
 
@@ -760,4 +759,14 @@ test("новый проект флота включается сам, снята
   const later = includeNewProjects(owner, [...fleet, { name: "Later" }]);
   assert.deepEqual(later.projects, ["A", "New", "Later"]);
   assert.ok(!later.projects.includes("B"));
+});
+
+test('18.11: «Could not load» при API 200 (apiOk) перезагружается и при исчерпанном часовом потолке, без удвоения паузы', () => {
+  const now = Date.now();
+  const history = Array.from({ length: 24 }, (_, i) => now - (i + 1) * 60_000);
+  const tab = { pageLoadFailed: 'Could not load this ChatGPT conversation', composerEmpty: true };
+  const mem = { since: now - 10_000, lastAt: now - 70_000, streak: 4 };
+  assert.equal(reloadPlan(tab, mem, history, now).reload, false, 'без проверки API потолок действует');
+  assert.equal(reloadPlan({ ...tab, apiOk: true }, mem, history, now).reload, true);
+  assert.equal(reloadPlan({ ...tab, apiOk: true }, { ...mem, lastAt: now - 30_000 }, history, now).reload, false, 'не чаще раза в минуту');
 });

@@ -10,7 +10,18 @@ from dev_mcp.fleet.store import Store
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, monkeypatch):
+    # Intake behavior is tested with task generation explicitly enabled;
+    # the production opt-in defaults to disabled on a clean checkout.
+    from dev_mcp.fleet import generators
+    monkeypatch.setattr(generators, 'enabled', lambda: True)
+    # Intake tests exercise source fencing and registration, not the host's
+    # optional Windows `py` launcher (absent on clean Python 3.13 installs).
+    from dev_mcp.fleet import spec_preflight
+    real_exists = spec_preflight._executable_exists
+    monkeypatch.setattr(spec_preflight, '_executable_exists',
+                        lambda argv, root: True if argv and argv[0] == 'py'
+                        else real_exists(argv, root))
     root = tmp_path/'product'
     root.mkdir()
     store = Store.open(str(tmp_path/'fleet.sqlite'))
@@ -210,3 +221,63 @@ def test_historical_spec_demanded_by_live_task_is_registered(env):
         tx.change("INSERT INTO tasks(project,tz,state,owns,needs,acceptance,created_at,updated_at) VALUES(?,?,?,?,?,?,'2026-10-17','2026-10-17')",
                   ('Product', 'TZ-2', 'ready', '["b/**"]', '["TZ-1"]', '["py -3 -c pass"]'), event='seed')
     assert tick(env)['registered'] == ['Product/TZ-1']
+
+
+def test_manual_registration_retires_repair_opened_before_it(env):
+    """28.10: файл увидели до bootstrap → «ремонт»; после регистрации он держал зону ТЗ."""
+    store, root, _ = env
+    tick(env)
+    spec(root, tz='TZ-LEAD', suffix='lead')
+    queue_intake._issue(store, 'Product', root, 'TZ-LEAD', 'preflight reject: overlap',
+                        ['ToDo/tz/TZ-LEAD-lead.md'])
+    with store.tx() as tx:  # оператор зарегистрировал ТЗ вручную
+        tx.change("INSERT INTO tasks(project,tz,title,state,priority,kind,owns,body,created_at,updated_at) "
+                  "VALUES('Product','TZ-LEAD','lead','ready',0,'work','[]','','x','x')", (), event='seed')
+    tick(env)
+    with store.read() as tx:
+        assert tx.one("SELECT state FROM queue_source_issues WHERE tz='TZ-LEAD'")['state'] == 'resolved'
+        assert tx.one("SELECT state FROM tasks WHERE tz LIKE 'fix:queue-source:%'")['state'] == 'rejected'
+
+
+def test_source_repair_cannot_narrow_registered_owns(env):
+    # 28.10: the repair of TZ-LEAD cut client/app out of owns; the registry kept them.
+    store, root, _ = env
+    from dev_mcp.fleet.model import norm_path
+    wide = [norm_path(str(root/'client')), norm_path(str(root/'ops'))]
+    with store.tx() as tx:
+        tx.change("INSERT INTO tasks(project,tz,title,state,priority,kind,owns,body,created_at,updated_at) "
+                  "VALUES('Product','TZ-LEAD','lead','submitted',0,'work',?,'','t','t')",
+                  (json.dumps(wide),), event='seed')
+    narrowed = queue_intake._narrowed_owns(store, 'Product', 'TZ-LEAD', [norm_path(str(root/'ops'))])
+    assert narrowed == [wide[0]]
+    assert queue_intake._narrowed_owns(store, 'Product', 'TZ-LEAD', wide) == []
+    assert queue_intake._narrowed_owns(store, 'Product', 'TZ-NONE', []) == []
+
+
+def test_unchanged_inventory_reuses_metadata_without_full_file_validation(env, monkeypatch):
+    _, root, _ = env
+    spec(root)
+    expected = queue_intake._files(root)
+    assert expected
+
+    def unexpected_guard(*_args, **_kwargs):
+        raise AssertionError('unchanged regular file must not be re-resolved')
+
+    monkeypatch.setattr(queue_intake, '_safe_draft', unexpected_guard)
+    assert queue_intake._files(root) == expected
+
+
+def test_cached_inventory_rejects_symlink_replacement(env, tmp_path):
+    _, root, _ = env
+    path = spec(root)
+    assert queue_intake._files(root)
+    outside = tmp_path / 'outside.md'
+    outside.write_bytes(path.read_bytes())
+    path.unlink()
+    try:
+        path.symlink_to(outside)
+    except OSError:
+        pytest.skip('creating file symlinks requires Windows developer privileges')
+    entry = queue_intake._files(root)['ToDo/tz/TZ-1-work.md']
+    assert entry['error'] == 'unsafe_or_oversize_spec'
+    assert not entry['sha']

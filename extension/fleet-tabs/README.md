@@ -6,8 +6,8 @@ interface. Worker state and task ownership come from the server.
 
 ## Install
 
-1. Run your own dev-mcp behind an MCP proxy exposing
-   `http://127.0.0.1:8766/servers/dev/mcp`. The proxy/gateway is a separate deployment.
+1. Run your own standalone dev-mcp on the loopback endpoint
+   `http://127.0.0.1:8766/servers/dev/mcp`. For ChatGPT use the authorized tunnel in [INSTALL.md](../../INSTALL.md). Never publish an unauthenticated listener.
 2. Extract the release ZIP (or use this directory). In `chrome://extensions`,
    enable Developer mode and choose **Load unpacked**. Select the directory
    containing `manifest.json`.
@@ -17,7 +17,8 @@ interface. Worker state and task ownership come from the server.
    where you are signed in to that account. The optional
    `start-fleet-chrome.cmd` uses a separate `FleetChrome` profile.
 4. In the popup, copy the project instructions and paste them into your ChatGPT
-   project. Supply the installation path in those instructions.
+   project. Supply the authorized workspace path of a copy of the public fleet
+   protocol; the default standalone policy does not expose the install directory.
 5. Reload the extension, then turn **Включено** on. Available fleet projects are
    discovered from your server; select the ones to work on.
 
@@ -28,7 +29,7 @@ as the background worker.
 
 The distributed manifest uses a dedicated public extension ID, distinct from the
 maintainer's private installation. It requests chatgpt.com and loopback access,
-tabs, alarms, local storage, notifications, scripting and system memory.
+tabs, alarms, local storage, notifications, scripting, system memory and debugger access. Review these permissions in the dedicated FleetChrome profile; do not install in your personal browsing profile.
 It contains no telemetry collection endpoint. Diagnostic exports are downloaded
 locally; chat addresses and fleet status are sent to your own dev-mcp server.
 

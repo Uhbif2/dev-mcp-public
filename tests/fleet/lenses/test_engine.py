@@ -108,7 +108,7 @@ def test_real_operator_proofs_real_pixels_and_two_separate_clean_runs(harness):
     assert len({c["execution_id"] for c in harness["called"]}) == 4
     assert len({o.evidence["ref"] for group in final.runs for o in group}) == 4
     proof = final.runs[0][1].evidence
-    assert proof["producer"] == "operator+gemini.look"
+    assert proof["producer"] == "operator+visual_judge"
     assert proof["intent_sha256"] == runner.intent_sha256
     assert proof["subject_version"] == V and proof["env_version"] == ENV
     assert proof["operation"] == "device.screens" and proof["request_fingerprint"]
@@ -191,7 +191,7 @@ def test_forged_caption_cannot_override_pixel_based_p0(harness):
     assert any(d.severity == "P0" for d in report.defects)
 
 
-def test_two_conflicting_gemini_verdicts_never_close(harness):
+def test_two_conflicting_visual_verdicts_never_close(harness):
     counter = []
     def look(images, rubric):
         counter.append(1)
@@ -209,7 +209,7 @@ def test_two_conflicting_gemini_verdicts_never_close(harness):
     assert runner.run_once("error_empty").done
 
 
-def test_gemini_unavailable_or_self_contradictory_never_passes(harness):
+def test_visual_judge_unavailable_or_self_contradictory_never_passes(harness):
     assert harness["runner"](look=lambda images, rubric: None).run_once("error_empty").status == "blocked"
     assert harness["runner"](look=lambda images, rubric: {
         "ok": True, "defects": [{"severity": "P1", "where": "home", "what": "broken"}],

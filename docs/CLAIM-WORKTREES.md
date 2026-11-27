@@ -1,13 +1,17 @@
 # Fleet claim worktrees — core contract (TZ-34)
 
+**Исторический контракт TZ-34; действующий канон — `FLEET-PROTOCOL.md`, `CLAUDE-CODE-FLEET.md` и модули `src/dev_mcp/fleet/claim_*.py`.** Маршрут `ClaimWorktrees` подключён: `claim_tree.py` реализует worktree-механизм; `claim_take_routing.py`, `queue.py` и `tools.py` обслуживают выдачу/маршрутизацию claim и операций; `claim_review_bite.py` — ревью и bite; `claim_accept_flow.py` и `integrate.py` — принятие/интеграцию; `claim_maintenance.py` — обслуживание; `controller.py` учитывает флаги маршрута. Он включается **только одновременно при `commit = true` и `claim_trees = true`**. На 17.11.2026 ни у одного проекта в `fleet-projects.toml` нет `claim_trees = true`, поэтому изолированные claim-worktree сейчас **выключены во всех проектах**, используется общий маршрут.
+
 **Decision:** trunk contains accepted results only; deployment reads trunk.
-The current fleet queue and integrator have **not yet been wired** to this
-module. This is the isolated Git core and executable proof in temporary repos.
+The queue, review/bite, accepted-only integration and maintenance routes were wired
+**after TZ-34**. The lifecycle below records the original design-stage contract;
+current execution depends on the project feature flags above.
 Do not point an agent at the shared trunk and call it an isolated claim.
 
 ## Storage and identity
 
-For a project with `commit = true`, `ClaimWorktrees(project_root).open(id, base)`
+For a project with both `commit = true` and `claim_trees = true`,
+`ClaimWorktrees(project_root).open(id, base)`
 creates a Git worktree with branch `claim/<safe-id>` at
 `<project_root>/../.fleet-trees/<project-directory>/<safe-id>`.
 Top-level `open(project_root, claim_id, base="HEAD") -> Path` is equivalent.
@@ -24,10 +28,10 @@ language runtimes should use the same source-tree isolation principle.
 
 ## Lifecycle
 
-1. Trusted queue owner verifies `commit = true`, captures trunk commit SHA
-   and uses `open(root, id, sha)`; binds claim id → worktree path/branch in
-   durable queue state. For `commit = false`, continue the existing shared
-   tree behavior (this module is not invoked).
+1. Trusted queue owner verifies `commit = true` **and** `claim_trees = true`,
+   captures trunk commit SHA and uses `open(root, id, sha)`; binds claim id →
+   worktree path/branch in durable queue state. If either flag is disabled,
+   continue the existing shared-tree behavior (this module is not invoked).
 2. All file tools, command cwd, review and bite tests for this claim must
    operate in **its** worktree. Paths, file events and acceptance freshness
    checks must be translated into that tree. The trusted post-accept consumer
@@ -35,8 +39,8 @@ language runtimes should use the same source-tree isolation principle.
    and verifies the accepted event. Do not commit all staged/untracked files.
 3. Only after verified acceptance, call
    `integrate(Claim(root, id, accepted=True), gate=gate_on_trunk)`.
-   The flag is a trusted assertion by the future queue integration, not an
-   authorization handed to a web agent. No acceptance → no integration.
+   The flag is a trusted assertion by the queue/integrator after verified
+   acceptance, not an authorization handed to a web agent. No acceptance → no integration.
    Dirty claim or dirty trunk → refusal. If the trunk advanced, the claim
    branch is rebased onto its current HEAD, then Git fast-forwards trunk.
    Rebase conflicts → `IntegrationResult(status="needs_result",
@@ -61,7 +65,7 @@ Open, integrate and close use an exclusive per-project lock under
 owner before clearing it; do not steal it on a timer. Git refs and tree files
 are not rewritten on merge conflict. No live worktree is created by unit tests.
 
-## Follow-on implementation tickets (not delivered by TZ-34)
+## Follow-on implementation tickets (historical TZ-34 plan; wiring subsequently implemented)
 
 1. **TZ-35 — Queue worktree routing:** issue/open worktree per claim in
    `fleet_take` for `commit=true`, persist root/base/path, route
@@ -78,5 +82,5 @@ are not rewritten on merge conflict. No live worktree is created by unit tests.
    recovery after restart, stale integration-lock diagnosis, branch/worktree
    audit, and canary deploying *only* the accepted trunk.
 
-These numbers are **proposed tickets**, not claims that they were bootstrapped.
-The active shared-tree fleet is unchanged until these integrations pass review.
+These numbers were **proposed tickets**, not evidence of their bootstrap under these IDs.
+Use the current modules and project flags above to determine the actual execution route.

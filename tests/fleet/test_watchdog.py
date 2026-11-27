@@ -600,12 +600,12 @@ def test_daemon_does_not_report_fresh_tick_when_sensor_failed(tmp_path):
     assert count(store, "watchdog_tick_error") == 1
 
 
-def test_ambiguous_obstacle_is_only_gemini_hypothesis_not_automatic_thaw(tmp_path):
+def test_ambiguous_obstacle_is_only_model_hypothesis_not_automatic_thaw(tmp_path):
     store = setup(tmp_path)
     task(store, "TZ-1", state="frozen")
     event(store, "block", tz="TZ-1", payload={"reason": "unknown"})
     sig = Signals(ambiguities={"question-1": "страж или сеть?"})
-    assert found(store, sig)["ambiguous"].repair == "gemini_hypothesis"
+    assert found(store, sig)["ambiguous"].repair == "model_hypothesis"
     watchdog_tick(store, now=NOW, signals=sig)
     assert state(store, "TZ-1") == "frozen"
     assert count(store, "watchdog_hypothesis_needed") == 1

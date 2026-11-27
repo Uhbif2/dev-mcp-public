@@ -129,11 +129,16 @@ def front_snapshot(tx: Any, now: datetime) -> list[dict[str, Any]]:
 
     # Delivery/integration is progress only when it refers to work linked to
     # this intent. Unrelated project integrations cannot unstick another front.
+    # 08.11: нужен только последний момент — MAX(id) по индексу (project,tz,kind) вместо всех
+    # 180 тыс. событий integrate (интегратор пишет их на каждом такте): 4,5–9,4 с → 0,2 с на ход.
     for r in tx.query(
-        "SELECT o.project,o.intent_id,e.ts FROM events e "
-        "JOIN outcome_work w ON w.project=e.project AND w.tz=e.tz "
-        "JOIN outcomes o ON o.id=w.outcome_id "
-        "WHERE e.kind IN ('claim_integrated','integrate')"):
+        "SELECT o.project,o.intent_id,MAX(e.ts) AS ts FROM outcomes o "
+        "JOIN outcome_work w ON w.outcome_id=o.id "
+        "JOIN events e ON e.id IN ("
+        "(SELECT MAX(id) FROM events x WHERE x.project=w.project AND x.tz=w.tz AND x.kind='integrate'),"
+        "(SELECT MAX(id) FROM events x WHERE x.project=w.project AND x.tz=w.tz "
+        "AND x.kind='claim_integrated')) "
+        "GROUP BY o.project,o.intent_id"):
         mark((r["project"], r["intent_id"]), r["ts"])
 
     open_obstacles: dict[str, list[str]] = collections.defaultdict(list)

@@ -4,25 +4,45 @@
 <meta charset="utf-8">
 <title>Вкладки флота</title>
 <style>
-  body { font: 13px/1.4 system-ui, sans-serif; margin: 0; padding: 12px; width: 480px; color: #1d1d1f; background: #fff; }
+  :root { color-scheme: light dark; --ink: #1d1d1f; --muted: #60636b; --page: #fff; --panel: #f7f8fa; --border: #dfe2e7; --table: #eee; --danger: #fdf1f1; --warn: #8a5a00; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink: #ececf0; --muted: #acb0bc; --page: #1b1d22; --panel: #282b33; --border: #434752; --table: #3a3e49; --danger: #452729; --warn: #f1bd61; }
+  }
+  body { font: 13px/1.4 system-ui, sans-serif; margin: 0; padding: 12px; width: 480px; color: var(--ink); background: var(--page); }
   h1 { font-size: 14px; margin: 12px 0 6px; }
   h1:first-child { margin-top: 0; }
   label { display: block; margin: 3px 0; }
   input[type=number] { width: 48px; }
-  .muted { color: #6b6b70; font-size: 12px; }
+  .muted { color: var(--muted); font-size: 12px; }
   .line { margin: 2px 0; }
-  .projects { border: 1px solid #e6e6e8; border-radius: 6px; padding: 4px 8px; margin: 4px 0 6px; }
+  .projects { border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; margin: 4px 0 6px; }
   .projects label { display: flex; gap: 6px; align-items: baseline; margin: 4px 0; }
   .projects .name { font-weight: 600; }
   .row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
   table { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 12px; }
-  th, td { text-align: left; padding: 3px 4px; border-bottom: 1px solid #eee; vertical-align: top; }
-  tr.other td { color: #9a9aa0; }
-  .warn { color: #8a5a00; }
+  th, td { text-align: left; padding: 3px 4px; border-bottom: 1px solid var(--table); vertical-align: top; }
+  tr.other td { color: var(--muted); }
+  .warn { color: var(--warn); }
   .warn:empty { display: none; }
-  .attention { border-left: 3px solid #c62828; background: #fdf1f1; padding: 6px 8px; margin: 6px 0; border-radius: 4px; }
+  .attention { border-left: 3px solid #c62828; background: var(--danger); padding: 6px 8px; margin: 6px 0; border-radius: 4px; }
   .attention b { display: block; margin-bottom: 2px; }
-  pre { background: #f6f6f7; padding: 6px; max-height: 220px; overflow: auto; font-size: 11px; white-space: pre-wrap; margin: 0; }
+  pre { background: var(--panel); padding: 6px; max-height: 220px; overflow: auto; font-size: 11px; white-space: pre-wrap; margin: 0; }
+  [hidden] { display: none !important; }
+  .agent-overview { margin: 7px 0 11px; }
+  .overview-total { display: flex; gap: 14px; align-items: center; padding: 10px 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
+  .overview-value { min-width: 2ch; font-size: 36px; line-height: 1; font-weight: 750; font-variant-numeric: tabular-nums; }
+  .overview-subtitle { display: block; margin-top: 2px; }
+  .overview-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
+  .overview-tile { display: grid; grid-template-columns: 3ch minmax(0, 1fr); gap: 10px; align-items: center; min-height: 47px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
+  .overview-tile:last-child { grid-column: 1 / -1; }
+  .tile-value { font-size: 25px; line-height: 1; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .tile-label { white-space: nowrap; font-size: 12px; }
+  .tile-note { display: block; font-size: 11px; color: var(--muted); }
+  .platform-health { display: flex; justify-content: space-between; gap: 8px; white-space: nowrap; margin-top: 9px; padding: 7px 3px 0; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+  .health-part { display: inline-flex; align-items: center; gap: 5px; }
+  .health-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #9298a3; }
+  .health-part[data-health="ok"] .health-dot { background: #2e9e52; }
+  .health-part[data-health="down"] .health-dot { background: #dc4040; }
 </style>
 </head>
 <body>
@@ -31,12 +51,40 @@
     <div class="row"><button id="resume">Снять остановку и продолжить</button></div></div>
   <div class="line"><a href="dashboard/index.html" target="_blank" rel="noopener noreferrer">Открыть панель результатов и витрину визуальных вариантов</a></div>
   <label><input type="checkbox" id="enabled"> Включено — продолжать агентов и открывать чаты под готовые задачи</label>
+  <label id="overseerRow" hidden>Надзор за этим чатом:
+    <select id="overseerMode"><option value="off">выкл</option><option value="shadow">тень (только журнал)</option><option value="send">отправлять в чат</option></select>
+    <span id="overseerNote" class="muted"></span></label>
+  <div class="row" id="exportRow" hidden><button id="exportSession">Экспорт сессии (полный JSON)</button>
+    <span id="exportNote" class="muted"></span></div>
   <label>Агентов одновременно: <input type="number" id="maxWorking" min="1" max="500"> <span class="muted">(агент — разговор; вкладок при этом 1–3)</span></label>
-  <label>Вкладок одновременно: <input type="number" id="maxTabs" min="1" max="8"> <span class="muted">(загруженные интерфейсы ChatGPT; каждая ≈ 250 МБ)</span></label>
-  <label><input type="checkbox" id="browserAutostart"> Сервер сам запускает и перезапускает браузер флота</label>
+  <label>Вкладок ChatGPT одновременно: <input type="number" id="maxTabs" min="1" max="32"> <span class="muted">(все интерфейсы; ограничивает открытия)</span></label>
+   <label><input type="checkbox" id="browserAutostart"> Сервер сам запускает и перезапускает браузер флота</label>
 
   <h1>Проекты</h1>
-  <div class="line"><strong>Агенты:</strong> <span id="agentStates">нет данных сервера</span></div>
+  <section id="agentStates" class="agent-overview" aria-label="Статистика агентов" aria-live="polite">
+    <div class="overview-total"><strong class="overview-value" id="agentTotal">—</strong><div><strong>работают сейчас</strong><span class="muted overview-subtitle" id="agentFresh">Нет свежих данных</span></div></div>
+    <div class="overview-grid">
+      <div class="overview-tile"><strong class="tile-value" id="agentWaiting">—</strong><span class="tile-label">ждут работы</span></div>
+      <div class="overview-tile"><strong class="tile-value" id="agentInactive">—</strong><span class="tile-label">простаивают / не отвечают</span></div>
+      <div class="overview-tile"><strong class="tile-value" id="agentQuick">—</strong><span class="tile-label">быстрые работают<span class="tile-note" id="quickWorking">—</span></span></div>
+      <div class="overview-tile"><strong class="tile-value" id="quickParked">—</strong><span class="tile-label">запаркованы</span></div>
+      <div class="overview-tile"><strong class="tile-value" id="quickAnswered">—</strong><span class="tile-label">ответили, ждут владельца</span></div>
+      <div class="overview-tile"><strong class="tile-value" id="quickWaitingSend">—</strong><span class="tile-label">ждут отправки</span></div>
+      <div class="overview-tile"><strong class="tile-value" id="quickOpened">—</strong><span class="tile-label">вкладки ChatGPT</span></div>
+    </div>
+    <div class="muted line" id="workingBreakdown">—</div>
+    <div class="muted line">Активность за 24 часа (обычные / быстрые, точки до 1 мин)</div>
+    <svg id="activityChart" viewBox="0 0 300 70" role="img" aria-label="Активность агентов за сутки" style="width:100%;height:85px;display:block"></svg>
+    <div class="muted" id="activityNote">История пока не загружена</div>
+    <div class="platform-health" aria-label="Здоровье платформы">
+      <span class="health-part" id="healthDev"><i class="health-dot"></i>dev</span>
+      <span class="health-part" id="healthCore"><i class="health-dot"></i>core</span>
+      <span class="health-part" id="healthGateway"><i class="health-dot"></i>шлюз</span>
+      <span class="health-part" id="healthController"><i class="health-dot"></i>контроллер</span>
+    </div>
+  </section>
+  <div id="memoryGuard" class="muted line" aria-live="polite">Данные об ОЗУ и живых вкладках пока не получены</div>
+  <div id="quickSendPauses" class="muted line" aria-live="polite"></div>
   <div class="muted">Вкладки закрываются сами; агенты продолжают работать в фоне.</div>
   <div class="muted">Галочка — открывать чаты под задачи проекта. Чат берёт задачи только своего проекта.</div>
   <div id="projects" class="projects"></div>
@@ -51,6 +99,10 @@
   </table>
   <details>
     <summary>Служебное</summary>
+    <label><input type="checkbox" id="limitReload"> Перезагружать вкладки ChatGPT при «A temporary limit…» (1→2→5→10 мин)</label>
+    <label id="limitExcludeRow" hidden><input type="checkbox" id="limitExclude"> …кроме этой вкладки</label>
+    <label><input type="checkbox" id="fullHandoff"> Чат под надзором исчерпан («maximum length») — экспорт и новый чат в том же проекте</label>
+    <label><input type="checkbox" id="fullHandoffDraftOnly"> …только вписать файлы и текст, Send нажимаю сам</label>
     <label><input type="checkbox" id="dryRun"> Вхолостую — только писать в лог, что сделал бы</label>
     <label><input type="checkbox" id="lockTabs"> Блокировать ввод во вкладках агентов</label>
     <div id="rateStats" class="muted"></div>

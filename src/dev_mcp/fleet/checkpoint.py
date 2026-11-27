@@ -95,16 +95,25 @@ def render(cp: dict[str, Any] | None, title: str = "Контрольная то�
     return "\n".join(lines)
 
 
+_FIRST_NEW_TOOL_TS: dict[int, str] = {}  # per Store object
+
+
 def _sees_new_tools(tx: Any, worker_id: str) -> bool:
     """Видит ли агент fleet_checkpoint. ChatGPT берёт список инструментов при подключении
     коннектора; до переподключения руль звал бы инструмент, которого у агента нет (07.10: ноль
     вызовов за 10 дней). Признак переподключения — первый вызов нового инструмента кем угодно;
     видят его агенты, подключившиеся после этого."""
-    first = tx.one(
-        "SELECT MIN(ts) AS ts FROM events WHERE kind='checkpoint' OR tool IN ('fleet_checkpoint','apply_patch')"
-    )
-    if first is None or not first["ts"]:
-        return False
+    # 05.11.2026: MIN over kind OR tool is a full scan of the events table (1.7M rows)
+    # on every steering pass. Once it exists, the first call never changes: remember it.
+    store_key = id(getattr(tx, "_store", tx))
+    if store_key not in _FIRST_NEW_TOOL_TS:
+        first = tx.one(
+            "SELECT MIN(ts) AS ts FROM events WHERE kind='checkpoint' OR tool IN ('fleet_checkpoint','apply_patch')"
+        )
+        if first is None or not first["ts"]:
+            return False
+        _FIRST_NEW_TOOL_TS[store_key] = str(first["ts"])
+    first = {"ts": _FIRST_NEW_TOOL_TS[store_key]}
     worker = tx.one("SELECT first_seen FROM workers WHERE id=?", (worker_id,))
     return worker is not None and str(worker["first_seen"]) >= str(first["ts"])[:19] or (
         tx.one("SELECT 1 FROM events WHERE worker_id=? AND (kind='checkpoint' OR tool IN "

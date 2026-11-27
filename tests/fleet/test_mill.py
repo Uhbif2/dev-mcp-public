@@ -75,8 +75,8 @@ def test_runs_sources_then_tick_and_bootstraps_new_pairs(tmp_path, monkeypatch):
     run, calls = recorder(tick_out={"new_tz": ["TZ-MA-b1", "TZ-MR-b1"], "open_pairs": 1})
     root = mill_tree(tmp_path)
     report = mill.tick(FakeStore(str(root)), run=run)
-    assert calls == [["tick", "--dry"], ["run", "--sources", "fleet"],
-                     ["run", "--sources", "claude_code"], ["tick"]]
+    assert calls == [["tick", "--dry"], ["run", "--sources", "claude_code"],
+                     ["run", "--sources", "fleet"], ["tick"]]
     assert seen == {"project": "Mill Works", "root": str(root), "tzs": ["TZ-MA-b1", "TZ-MR-b1"]}
     assert report["new_tz"] == ["TZ-MA-b1", "TZ-MR-b1"]
 
@@ -100,3 +100,18 @@ def test_orphan_pair_files_are_enqueued(tmp_path, monkeypatch):
     report = mill.tick(FakeStore(str(root), queued=("TZ-MA-b9",)), run=run)
     assert seen["tzs"] == ["TZ-MA-b0", "TZ-MR-b0"]
     assert report["new_tz"] == ["TZ-MA-b0", "TZ-MR-b0"]
+
+
+def test_generators_off_still_dispatch_mill_extraction_batches(tmp_path, monkeypatch):
+    """Owner 25.11: the 15.11 switch must not stop memory extraction (none accepted since)."""
+    seen = {}
+
+    def fake_sync(store, project, root, tzs, *, policy=None):
+        seen["tzs"] = list(tzs)
+        return {"inserted": len(tzs), "errors": {}}
+    monkeypatch.setattr("dev_mcp.fleet.spec.sync_selected", fake_sync)
+    monkeypatch.setattr("dev_mcp.fleet.generators.enabled", lambda: False)
+    run, _calls = recorder(tick_out={"new_tz": ["TZ-EX-batch-aa", "TZ-MA-b1"], "open_pairs": 1})
+    report = mill.tick(FakeStore(str(mill_tree(tmp_path))), run=run)
+    assert seen == {"tzs": ["TZ-EX-batch-aa"]}
+    assert report["new_tz"] == ["TZ-EX-batch-aa", "TZ-MA-b1"]

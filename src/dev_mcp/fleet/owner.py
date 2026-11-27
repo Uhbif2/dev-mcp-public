@@ -42,9 +42,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from dev_mcp.json_book import read_json, write_json
 from typing import Callable
 
-SESSION_TTL_S = 12 * 3600
+# 48 ч (владелец 20.11.2026): 12 ч не хватало на ночь — роль истекала, пока владелец спал.
+SESSION_TTL_S = 48 * 3600
 MAX_FAILURES = 5  # столько неверных паролей подряд за FAILURE_WINDOW_S →
 FAILURE_WINDOW_S = 15 * 60  # …разблокировка закрыта на LOCKOUT_S для всех
 LOCKOUT_S = 15 * 60
@@ -59,7 +61,7 @@ def grants_path(secret_file: Path) -> Path:
 
 def read_grants(path: Path) -> dict[str, float]:
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = read_json(path, strict=True)
     except (OSError, ValueError):
         return {}
     if not isinstance(data, dict):
@@ -76,9 +78,7 @@ def read_grants(path: Path) -> dict[str, float]:
 def _write_grants(path: Path, grants: dict[str, float]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(grants, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    write_json(path, grants, indent=2)
 
 
 def grant(path: Path, worker_id: str, ttl_s: int = SESSION_TTL_S, *, now: float | None = None) -> float:
@@ -100,6 +100,54 @@ def revoke_grant(path: Path, worker_id: str | None = None) -> list[str]:
     if gone:
         _write_grants(path, {w: u for w, u in grants.items() if w not in gone})
     return gone
+
+
+def owner_ids_for_store(store_or_path: object, *, now: float | None = None) -> set[str]:
+    """worker_id с действующей выдачей роли для реестра `<repo>/data/fleet/fleet.sqlite`.
+
+    Автовосстановление возвращает захват в очередь, но вкладку владельца не отзывает (20.11.2026):
+    отзыв не давал владельцу продлить роль — приходилось заново регистрировать агента. Реестр
+    в другой раскладке (тесты) — пустое множество.
+    """
+    raw = getattr(store_or_path, "path", store_or_path)
+    try:
+        db = Path(str(raw))
+        if db.parent.name.lower() != "fleet" or db.parent.parent.name.lower() != "data":
+            return set()
+        now = time.time() if now is None else now
+        grants = read_grants(grants_path(secret_path(db.parents[2])))
+    except (OSError, ValueError, TypeError):
+        return set()
+    return {w for w, until in grants.items() if until > now}
+
+
+def carry_grant(store_or_path: object, src: str, dst: str, *, now: float | None = None) -> bool:
+    """Перенести действующую выдачу роли с `src` на `dst` (тот же срок); True — перенесено.
+
+    Тот же логический агент меняет номер при передаче сессии в новый чат (chat_handoff) и при
+    слиянии дублей одной метки браузера. Без переноса вкладка владельца теряла роль и владелец
+    выдавал её заново (20.11.2026). Срок не продлевается; выдача `src` остаётся до своего срока.
+    Реестр не в раскладке `data/fleet` (тесты) — ничего не делает.
+    """
+    src, dst = str(src or "").strip(), str(dst or "").strip()
+    if not src or not dst or src == dst:
+        return False
+    raw = getattr(store_or_path, "path", store_or_path)
+    try:
+        db = Path(str(raw))
+        if db.parent.name.lower() != "fleet" or db.parent.parent.name.lower() != "data":
+            return False
+        now = time.time() if now is None else now
+        target = grants_path(secret_path(db.parents[2]))
+        grants = {w: u for w, u in read_grants(target).items() if u > now}
+        until = grants.get(src)
+        if until is None or grants.get(dst, 0.0) >= until:
+            return False
+        grants[dst] = until
+        _write_grants(target, grants)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def secret_path(base_dir: Path) -> Path:
@@ -130,9 +178,7 @@ def set_password(path: Path, password: str) -> None:
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    write_json(path, record, indent=2)
 
 
 def verify_password(path: Path, password: str) -> bool:
@@ -182,7 +228,8 @@ class OwnerSessions:
                 return False, "неверный пароль"
             self._failures.clear()
             self._until[worker_id] = now + self.ttl_s
-        return True, f"сессия владельца открыта для {worker_id} на {self.ttl_s // 3600} ч (до перезапуска dev-mcp)"
+        return True, (f"сессия владельца открыта для {worker_id} на {self.ttl_s // 3600} ч (до перезапуска "
+                      "dev-mcp); выдача без пароля — `fleet.cmd owner-grant <номер>`, 48 ч, переживает перезапуск")
 
     def is_owner(self, worker_id: str) -> bool:
         worker_id = str(worker_id or "").strip()

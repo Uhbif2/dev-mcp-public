@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import weakref
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
@@ -225,6 +226,57 @@ def _claim_label(snapshot: _Snapshot, claim: _ClaimState) -> str:
     return f"{who}, {claim.project}/{claim.tz}"
 
 
+_LEAD_RESERVED = ("/todo/lead/", "/ops/lead/")
+
+
+def _lead_reserved(path_norm: str) -> bool:
+    """Файлы ведущего проекта: книга, STATE/PROTOCOL, её проверки."""
+    value = path_norm.replace("\\", "/").casefold() + "/"
+    return "/todo/lead/reviews/" not in value and any(part in value for part in _LEAD_RESERVED)
+
+
+# 08.11 (LEAD-SYSTEM-DESIGN 3.1, «проект − канон − приборы»): зона ведущего — весь проект через
+# auto-expand свободных путей, кроме канона владельца и служебных папок флота. Раньше канон держал
+# только перечисленный owns устава, а auto-expand присоединил бы и product/ — дыра, не правило.
+_LEAD_CANON = ("product", "goal.md", "claude.md", "agents.md", "intent",
+               "todo/tz", "todo/decisions", "todo/fleet")
+
+
+def _lead_canon(store: Any, snapshot: _Snapshot, worker_id: str, path_norm: str) -> str:
+    """Путь канона владельца/служебного флота в проекте ведущего; "" — не канон."""
+    try:
+        projects = {c.project for c in snapshot.claims if c.worker_id == worker_id}
+        with store.read() as tx:
+            roots = [str(r["root"]) for r in tx.query(
+                "SELECT root FROM projects WHERE name IN (%s)" % ",".join("?" * len(projects)),
+                tuple(projects))] if projects else []
+        value = path_norm.replace("\\", "/").casefold()
+        for root in roots:
+            base = norm_path(root).rstrip("/") + "/"
+            if not value.startswith(base):
+                continue
+            rel = value[len(base):]
+            for canon in _LEAD_CANON:
+                if rel == canon or rel.startswith(canon + "/"):
+                    return rel
+    except Exception:  # noqa: BLE001 — страж не падает из-за чтения корня
+        return ""
+    return ""
+
+
+def _instrument(snapshot: _Snapshot, worker_id: str, path_norm: str) -> str:
+    """Путь прибора в проекте любой активной заявки воркера (Р1); "" — не прибор."""
+    try:
+        from .witness import instrument_rel
+        for project in {c.project for c in snapshot.claims if c.worker_id == worker_id}:
+            rel = instrument_rel(project, path_norm)
+            if rel:
+                return rel
+    except Exception:  # noqa: BLE001 — страж не падает из-за конфигурации приборов
+        return ""
+    return ""
+
+
 def _matches_path(claim: _ClaimState, path_norm: str) -> bool:
     return any(paths_overlap(owned, path_norm) for owned in claim.paths)
 
@@ -266,7 +318,60 @@ def _decision(store: Any, worker_id: str | None, abs_path: str) -> Decision:
     )
 
     if worker_id is not None:
-        foreign = tuple(claim for claim in matching if claim.worker_id != worker_id)
+        from .lead import is_lead
+        # 03.11: зона ведущего уступает профильным задачам. Его широкий claim (client/, app/)
+        # не мешает им писать; сам ведущий не пишет туда, где сейчас работает профильная задача.
+        writer_is_lead = any(c.worker_id == worker_id and is_lead(c.tz) for c in snapshot.claims)
+        instrument = _instrument(snapshot, worker_id, path_norm)
+        if writer_is_lead and instrument:
+            # 06.11 (LEAD-SYSTEM-DESIGN Р1): прибор вне зоны записи ведущего — непредставимость,
+            # а не надежда на дисциплину (150 правок свидетеля за ночь без продуктового файла).
+            return Decision(
+                allow=False,
+                code="FLEET_INSTRUMENT",
+                reason=(
+                    f"{instrument} — прибор проекта: ведущий его не правит, чтобы «позеленело» значило "
+                    "продукт, а не градусник. Нужна правка — fleet_lead(action='issue') рабочему: "
+                    "доказанный ложный вердикт, отрицательный контроль (красный на подложенной поломке, "
+                    "зелёный на эталоне). Сам — чини продукт по вердикту прибора."
+                ),
+                worker_id=worker_id,
+                degraded=False,
+            )
+        canon = _lead_canon(store, snapshot, worker_id, path_norm) if writer_is_lead else ""
+        if canon:
+            return Decision(
+                allow=False,
+                code="FLEET_LEAD_CANON",
+                reason=(
+                    f"{canon} — канон владельца или служебные файлы флота: ведущий их не правит. "
+                    "Расхождение канона с реальностью — предложение в ToDo/lead/OWNER.md."
+                ),
+                worker_id=worker_id,
+                degraded=False,
+            )
+        if _lead_reserved(path_norm) and not instrument:
+            # 05.11: книга и инструменты ведущего (ToDo/lead, ops/lead) — его, а не уступающая зона:
+            # ревью отклонило веху за книгу, а LEDGER.json держали ревалидации и профильные задачи —
+            # исправить было нечем. Здесь ведущий не уступает, а остальные уступают ему.
+            foreign = tuple(claim for claim in matching if claim.worker_id != worker_id
+                            and is_lead(claim.tz) and not writer_is_lead)
+        else:
+            foreign = tuple(claim for claim in matching if claim.worker_id != worker_id
+                            and (writer_is_lead or not is_lead(claim.tz)))
+        if foreign and writer_is_lead:
+            holder = foreign[0]
+            return Decision(
+                allow=False,
+                code="FLEET_FOREIGN_PATH",
+                reason=(
+                    f"Путь сейчас у профильной задачи {_claim_label(snapshot, holder)}: она важнее "
+                    "в этих файлах. Не жди и не проси отдельную задачу — возьми следующий пункт "
+                    "книги обязательств; нужна правка здесь — request_note её исполнителю."
+                ),
+                worker_id=worker_id,
+                degraded=False,
+            )
         if foreign:
             holder = foreign[0]
             return Decision(
@@ -351,9 +456,55 @@ def _decision(store: Any, worker_id: str | None, abs_path: str) -> Decision:
     )
 
 
+def _quick_write(store: Any, worker_id: str, abs_path: str) -> Decision | None:
+    """Быстрый агент (fleet/quick.py, 15.11): права владельца — его захваты и его область.
+
+    Закрытый — не пишет; вне области владельца — отказ; иначе решение принимается так, как
+    если бы писал сам владелец-воркер (захваты ведущего — свои, чужие — чужие). Предупреждение
+    «вне заявки» быстрому агенту не показывается: у него нет и не должно быть захвата.
+    """
+    from . import quick
+
+    if not quick.is_quick_agent(worker_id):
+        return None
+    try:
+        job = quick.lookup(quick.Book(Path(str(store.path)).parent), worker_id)
+    except Exception:  # noqa: BLE001
+        job = None
+    if job is None:
+        return None
+    def deny(code: str, reason: str) -> Decision:
+        return Decision(allow=False, code=code, reason=reason, worker_id=worker_id, degraded=False)
+    if job.get("state") == "closed":
+        return deny("FLEET_QUICK_CLOSED", f"Быстрый агент {worker_id} закрыт владельцем — останови работу.")
+    reason = quick.scope_denial(job, norm_path(abs_path))
+    if reason:
+        return deny("FLEET_QUICK_SCOPE", reason)
+    parent = str(job.get("owner") or "")
+    if parent.startswith("W"):
+        try:
+            me = _reader_for(store).snapshot().workers.get(worker_id)
+        except (OSError, sqlite3.Error, RuntimeError):
+            me = None
+        if me is not None and me.revoked:
+            return deny("FLEET_REVOKED", f"Быстрый агент {worker_id} отозван владельцем.")
+        decision = _decision(store, parent, abs_path)  # права — ровно владельца
+    else:
+        decision = _decision(store, worker_id, abs_path)
+    if decision.allow and decision.code == "FLEET_OUT_OF_CLAIM":
+        decision = Decision(allow=True, code="", reason="", worker_id=worker_id, degraded=False)
+    elif decision.allow:
+        decision = Decision(allow=True, code=decision.code, reason=decision.reason,
+                            worker_id=worker_id, degraded=decision.degraded)
+    return decision
+
+
 def check_write(store: Any, worker_id: str | None, abs_path: str) -> Decision:
     """Decide whether a filesystem write may proceed."""
 
+    quick_decision = _quick_write(store, worker_id, abs_path) if worker_id else None
+    if quick_decision is not None:
+        return quick_decision
     decision = _decision(store, worker_id, abs_path)
     if decision.allow and decision.code == "FLEET_OUT_OF_CLAIM" and worker_id:
         foreign = _foreign_project(store, worker_id, abs_path)

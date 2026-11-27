@@ -365,3 +365,80 @@ def test_degraded_decision_can_be_written_to_audit(tmp_path: Path) -> None:
     row = json.loads(audit.path.read_text(encoding="utf-8"))
     assert row["agent"] == "W4"
     assert row["degraded"] is True
+
+
+def test_lead_zone_yields_to_specialized_claim(tmp_path: Path) -> None:
+    # 03.11: TZ-LEAD держит client/ целиком, TZ-312 — client/win/field.
+    store = _store(tmp_path)
+    client = tmp_path / "client"
+    field = client / "win" / "field"
+    _seed_claim(store, root=tmp_path, worker_id="WL", tz="fix:TZ-LEAD", owned=client)
+    _seed_claim(store, root=tmp_path, worker_id="WS", tz="TZ-312", owned=field)
+
+    specialized = check_write(store, "WS", str(field / "recorder.py"))
+    assert specialized.allow is True and specialized.code == ""
+
+    lead_in_field = check_write(store, "WL", str(field / "recorder.py"))
+    assert lead_in_field.allow is False and "профильной задачи" in lead_in_field.reason
+
+    lead_elsewhere = check_write(store, "WL", str(client / "win" / "window.py"))
+    assert lead_elsewhere.allow is True and lead_elsewhere.code == ""
+
+
+def test_lead_book_is_reserved_for_the_lead(tmp_path: Path) -> None:
+    # 05.11: LEDGER.json держали ревалидации — ведущий не мог исправить отклонённую книгу.
+    store = _store(tmp_path)
+    lead_dir = tmp_path / "ToDo" / "lead"
+    _seed_claim(store, root=tmp_path, worker_id="WL", tz="fix:TZ-LEAD:7", owned=tmp_path / "ToDo")
+    _seed_claim(store, root=tmp_path, worker_id="WR", tz="revalidate:abc", owned=lead_dir)
+
+    lead_book = check_write(store, "WL", str(lead_dir / "LEDGER.json"))
+    assert lead_book.allow is True and lead_book.code == ""
+
+    other = check_write(store, "WR", str(lead_dir / "LEDGER.json"))
+    assert other.allow is False and other.code == "FLEET_FOREIGN_PATH"
+
+
+def test_independent_review_path_yields_to_its_claimant(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    lead_dir = tmp_path / "ToDo" / "lead"
+    review = lead_dir / "reviews" / "s13-recovery"
+    _seed_claim(store, root=tmp_path, worker_id="WL", tz="TZ-LEAD", owned=lead_dir)
+    _seed_claim(store, root=tmp_path, worker_id="WR", tz="sub:LEAD-7", owned=review)
+
+    assert check_write(store, "WR", str(review / "probe.py")).allow
+    assert check_write(store, "WL", str(review / "probe.py")).code == "FLEET_FOREIGN_PATH"
+    assert check_write(store, "WL", str(lead_dir / "LEDGER.json")).allow
+
+
+def test_lead_cannot_write_instruments_but_worker_can(tmp_path: Path, monkeypatch) -> None:
+    # 06.11 (LEAD-SYSTEM-DESIGN Р1, фаза 0.2): 150 правок свидетеля ведущим за ночь без продукта.
+    from dev_mcp.fleet import goals, project_config
+    store = _store(tmp_path)
+    monkeypatch.setattr(project_config, "project_root", lambda p: str(tmp_path))
+    monkeypatch.setattr(goals, "project_info", lambda p: {"witness": [
+        {"id": "a", "cmd": ["py", "-3", "ops/pilot/android_witness.py"]}]})
+    _seed_claim(store, root=tmp_path, worker_id="WL", tz="TZ-LEAD", owned=tmp_path)
+    _seed_claim(store, root=tmp_path, worker_id="WS", tz="sub:LEAD-1", owned=tmp_path / "ops" / "witness")
+    for rel in ("ops/witness/mcp_search_live.py", "ops/lead/ledger_check.py", "ops/pilot/android_witness.py"):
+        decision = check_write(store, "WL", str(tmp_path / rel))
+        assert decision.allow is False and decision.code == "FLEET_INSTRUMENT", rel
+    assert check_write(store, "WL", str(tmp_path / "ops" / "lead" / "fleet.toml")).allow is True
+    assert check_write(store, "WL", str(tmp_path / "client" / "app.py")).allow is True
+    worker = check_write(store, "WS", str(tmp_path / "ops" / "witness" / "mcp_search_live.py"))
+    assert worker.allow is True and worker.code == ""
+
+
+def test_lead_cannot_write_owner_canon_or_fleet_service_files(tmp_path: Path) -> None:
+    # 08.11 (LEAD-SYSTEM-DESIGN 3.1): зона ведущего — проект минус канон и служебный флот.
+    store = _store(tmp_path)
+    _seed_claim(store, root=tmp_path, worker_id="WL", tz="TZ-LEAD", owned=tmp_path)
+    _seed_claim(store, root=tmp_path, worker_id="WT", tz="triage:1", owned=tmp_path / "ToDo" / "decisions")
+    for rel in ("product/spec/A.md", "GOAL.md", "AGENTS.md", "CLAUDE.md", "intent/goal.md",
+                "ToDo/tz/TZ-LEAD-x.md", "ToDo/fleet/results/r.md"):
+        decision = check_write(store, "WL", str(tmp_path / rel))
+        assert decision.allow is False and decision.code == "FLEET_LEAD_CANON", rel
+    for rel in ("client/app.py", "ToDo/lead/STATE.md", "productivity/x.py", "docs/a.md"):
+        assert check_write(store, "WL", str(tmp_path / rel)).allow is True, rel
+    # Не ведущий — прежние правила.
+    assert check_write(store, "WT", str(tmp_path / "ToDo" / "decisions" / "d.md")).allow is True

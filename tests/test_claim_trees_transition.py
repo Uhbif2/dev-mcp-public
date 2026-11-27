@@ -146,6 +146,12 @@ def test_existing_shared_claim_remains_shared_after_flag_and_integrates(world, t
 
 def test_maintenance_ignores_shared_epoch_and_bounded_repairs(world):
     root, store, flags, task = world
+    inventory = subprocess.run(
+        ['git', '-C', str(root), 'worktree', 'list', '--porcelain', '-z'],
+        capture_output=True, check=False,
+    )
+    if inventory.returncode:
+        pytest.skip('Git lacks worktree list --porcelain -z; safe inventory unavailable')
     task("TZ-OLD", "ToDo/legacy.md", priority=1)
     flags["claim_trees"] = False
     assert queue.take_next(store, "W-A", "Fleet Platform").tz == "TZ-OLD"

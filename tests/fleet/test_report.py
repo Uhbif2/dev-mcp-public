@@ -109,6 +109,52 @@ def event(db: sqlite3.Connection, kind: str, *, tz: str | None = None, wid: str 
     )
 
 
+
+
+def test_uncommitted_accept_alarm_shows_latest_reason_and_only_commit_projects(
+    db: sqlite3.Connection, tmp_path: Path,
+) -> None:
+    project(db, tmp_path)
+    for name in ("TZ-pending", "TZ-done", "TZ-recent", "TZ-skipped"):
+        task(db, name, "accepted")
+    event(db, "accept", tz="TZ-pending", ts=iso(-180))
+    event(db, "integrate", tz="TZ-pending", ts=iso(-150),
+          payload={"reason": "resource_busy", "deferred": ["a.py"]})
+    event(db, "integrate", tz="TZ-pending", ts=iso(-120),
+          payload={"reason": "validation_timeout", "deferred": ["a.py"]})
+    event(db, "accept", tz="TZ-done", ts=iso(-180))
+    event(db, "integrate", tz="TZ-done", ts=iso(-170), payload={"commit": "abcdef"})
+    event(db, "accept", tz="TZ-recent", ts=iso(-10))
+    event(db, "accept", tz="TZ-skipped", ts=iso(-180))
+    event(db, "integrate", tz="TZ-skipped", ts=iso(-170),
+          payload={"skipped": "уже в истории"})
+    assert report.uncommitted_accepts(db, commit_projects=set()) == []
+    lines = report.uncommitted_accepts(db, commit_projects={"P"})
+    assert len(lines) == 1
+    assert "ПРИНЯТО, НО НЕ ЗАКОММИЧЕНО P: 1 задач" in lines[0]
+    assert "TZ-pending" in lines[0] and "validation_timeout" in lines[0]
+    assert "resource_busy" not in lines[0]
+    assert "TZ-done" not in lines[0]
+    assert "TZ-recent" not in lines[0]
+    assert "TZ-skipped" not in lines[0]
+
+
+def test_uncommitted_alarm_persists_without_receipt_and_clears_after_commit(
+    db: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project(db, tmp_path)
+    task(db, "TZ-1", "accepted")
+    event(db, "accept", tz="TZ-1", ts=iso(-90))
+    original = report.uncommitted_accepts
+    monkeypatch.setattr(report, "uncommitted_accepts",
+                        lambda store, *, now: original(
+                            store, now=now, commit_projects={"P"}))
+    assert any("TZ-1" in line and "интеграция не запускалась" in line
+               for line, _ in report.exception_items(db))
+    event(db, "integrate", tz="TZ-1", ts=iso(-30), payload={"commit": "abc"})
+    assert not any("ПРИНЯТО, НО НЕ ЗАКОММИЧЕНО" in line
+                   for line, _ in report.exception_items(db))
+
 def test_claimed_vs_done_uses_run_event_rc_and_result_file(db: sqlite3.Connection, tmp_path: Path) -> None:
     spec = tmp_path / "TZ-1.md"
     spec.write_text("# TZ\n\n## Итог\n\nСделано.\n", encoding="utf-8")
@@ -316,6 +362,7 @@ def test_submitted_wait_exception_threshold(db: sqlite3.Connection, tmp_path: Pa
     project(db, tmp_path)
     task(db, "TZ-OLD", "submitted", updated_at=iso(-40))
     task(db, "TZ-NEW", "submitted", updated_at=iso(-10))
+    task(db, "review:TZ-OLD", "ready", kind="review")
     event(db, "submit", tz="TZ-OLD", ts=iso(-40))
     event(db, "submit", tz="TZ-NEW", ts=iso(-10))
     items = report.exceptions(db)

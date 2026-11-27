@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from dev_mcp.fleet import egress  # noqa: E402
+from dev_mcp.json_book import write_json  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,8 +38,8 @@ def main(argv: list[str] | None = None) -> int:
             routes = egress.load_routes(args.routes)
             if not routes:
                 if server is not None: server.selector.current = None
-                args.state.write_text(json.dumps({'route':None,'port':args.port,
-                    'owner_action':egress.missing_routes_action(args.routes)},ensure_ascii=False),encoding='utf-8')
+                write_json(args.state, {'route': None, 'port': args.port,
+                                        'owner_action': egress.missing_routes_action(args.routes)})
             else:
                 if selector is None or routes != selector.routes:
                     selector = egress.Selector(routes,on_switch=egress.registry_switch_writer(args.db))
@@ -54,8 +55,8 @@ def main(argv: list[str] | None = None) -> int:
             # log exception text, which could contain upstream credentials.
             if server is not None: server.selector.current = None
             try:
-                args.state.write_text(json.dumps({'route':None,'port':args.port,
-                    'error_type':type(exc).__name__}),encoding='utf-8')
+                write_json(args.state, {'route': None, 'port': args.port,
+                                            'error_type': type(exc).__name__})
             except OSError:
                 pass
         time.sleep(max(1,args.interval))

@@ -233,6 +233,29 @@ def test_validate_spec_outside_write_root_and_cycle(tmp_path: Path):
     assert any("цикл" in issue for issue in issues)
 
 
+def test_product_path_warning_in_both_bootstrap_routes(tmp_path: Path):
+    root = tmp_path / "Project"
+    path = root / "ToDo" / "tz" / "TZ-1-demo.md"
+    _write_spec(path, owns="src/a.py")
+    store = StubStore(tmp_path / "product-path.sqlite")
+    with store.tx() as db:
+        db.execute("INSERT INTO projects(name,root,priority,active) VALUES(?,?,5,1)",
+                   ("Project", str(root)))
+
+    backlog = sync_backlog(store, "Project", str(root))
+    assert backlog["inserted"] == 1
+    assert any("Путь продукта" in s for s in backlog["warnings"]["ToDo/tz/TZ-1-demo.md"])
+    selected = sync_selected(store, "Project", str(root), ["TZ-1"])
+    assert any("Путь продукта" in s for s in selected["warnings"]["ToDo/tz/TZ-1-demo.md"])
+
+    _write_spec(path, owns="src/a.py", prose="# Work\n## Путь продукта\nТочка входа: SourceLayer.\nКонтрпример: сломанный ответ сервера.")
+    assert sync_backlog(store, "Project", str(root))["warnings"] == {}
+    assert sync_selected(store, "Project", str(root), ["TZ-1"])["warnings"] == {}
+
+    _write_spec(path, owns="tests/test_a.py")
+    assert sync_backlog(store, "Project", str(root))["warnings"] == {}
+
+
 def test_sync_backlog_does_not_reset_taken_task(tmp_path: Path):
     root = tmp_path / "Project"
     path = root / "ToDo" / "tz" / "TZ-1-demo.md"

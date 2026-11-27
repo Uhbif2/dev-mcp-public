@@ -10,8 +10,28 @@
 
 Флаги:  --core         перезапустить core-экземпляр (:8765: memory_service, obsidian, …)
         --all          перезапустить оба экземпляра (и лончер целиком)
+        --instance N   только экземпляр N (aux :8767, lib :8768 — живая библиотека)
         --local-only   только шаги 1–3 (не трогать воркер и шлюз)
         --no-tests     пропустить боевые стражи (шаг 1 оставляет только синтаксис)
+        --force-tests  прогнать стражей, даже если код и конфиги не менялись
+
+21.11.2026 — быстрее и без «зависаний».
+
+* **Стражи не гоняются зря.** Отпечаток (sha256) policy.toml, fleet-projects.toml,
+  pyproject.toml, src/, tests/ и самого restart.py сравнивается с последним зелёным
+  прогоном (logs/restart-guards.ok.json, не старше 24 ч). Совпал — шаг 1 занимает доли
+  секунды. Иначе pytest получает только файлы, где встречается «production» (отбор тот же).
+* **Один снимок процессов вместо пачки PowerShell/WMI.** Раньше до taskkill шло 3–5
+  запусков PowerShell с Get-CimInstance (до 30 с каждый при нехватке RAM, без перехвата
+  таймаута). Теперь — psutil, если есть, иначе один вызов WMI; порты — netstat.
+  Не удалось получить список процессов — ошибка, а не второй лончер.
+* **Каждый шаг печатает прошедшее время**, так что зависание видно сразу.
+* **Шаг 2 ждёт по стадиям, а не 2 минуты.** При нехватке RAM (21.11: 0,1 ГиБ свободно) dev
+  поднимался 13 мин: прокси 78 с, dev-mcp до server_start 8 мин, uvicorn ещё 3 мин. Старый
+  предел в 2 мин рисовал [X], и следующий restart.cmd убивал уже поднявшийся сервер. Теперь
+  стадии читаются из mcp-proxy\\mcp_proxy_<имя>.log; ошибка — только если 5 мин нет движения,
+  экземпляр упал или прошло 20 мин. Экземпляр, который уже поднимается после последней правки
+  кода, повторный запуск не трогает, а дожидается. В начале — предупреждение о свободной RAM.
 
 19.09.2026 — что здесь поменялось и почему.
 
@@ -92,11 +112,14 @@ WORKER_VBS = OCVPS / "worker" / "run-worker-hidden.vbs"
 PYTHONW = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Python" / "Python313" / "pythonw.exe"
 GATEWAY_URL_FALLBACK = "https://gateway.example.net"
 REPORT = REPO / "logs" / "restart-last.txt"
+GUARD_TIMEOUT_S = 900
 
 # Экземпляры mcp-proxy. Должно совпадать с INSTANCES в mcp_launcher.py.
 INSTANCES = {
     "dev": {"port": 8766, "probe": "dev", "what": "dev-mcp (флот агентов)"},
     "core": {"port": 8765, "probe": "memory_service", "what": "memory_service, obsidian, google-sheets, demo-service"},
+    "aux": {"port": 8767, "probe": "tg-notify", "what": "soft-patterns, tg-notify, second-pc"},
+    "lib": {"port": 8768, "probe": "local-library", "what": "local-library (живая библиотека)"},
 }
 
 INIT_BODY = json.dumps({
@@ -108,6 +131,21 @@ INIT_BODY = json.dumps({
 _ok = True
 _public_ok = False
 _lines: list[str] = []
+_T0 = time.monotonic()
+GUARD_STAMP = REPO / "logs" / "restart-guards.ok.json"
+GUARD_LOG = REPO / "logs" / "restart-guards.log"
+GUARD_STAMP_MAX_AGE_S = 24 * 3600
+START_LIMIT_S = 20 * 60      # общий предел ожидания порта
+START_STALL_S = 5 * 60       # столько без движения в журнале прокси — ошибка
+_STAGES = (("child", "Setting up named server"), ("server", "Starting MCP server"),
+           ("up", "Uvicorn running"))
+_STAGE_TEXT = {
+    "proxy": "mcp-proxy запускается",
+    "child": "dev-mcp запущен (run.cmd): импорт и загрузка политики",
+    "server": "dev-mcp готов, mcp-proxy поднимает HTTP",
+    "up": "uvicorn запущен",
+    "crashed": "экземпляр упал, лончер перезапускает",
+}
 
 
 def say(mark: str, msg: str) -> None:
@@ -116,6 +154,8 @@ def say(mark: str, msg: str) -> None:
 
 
 def head(msg: str) -> None:
+    if msg.strip() and not msg.strip().startswith("="):
+        msg = f"{msg}   [+{time.monotonic() - _T0:.0f} с]"
     _lines.append(msg)
     print(msg, flush=True)
 
@@ -149,9 +189,59 @@ def _env_value(path: Path, key: str) -> str:
 
 
 def _ps(cmd: str, timeout: int = 30) -> str:
-    r = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
-                       capture_output=True, text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                           capture_output=True, text=True, timeout=timeout,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
     return (r.stdout or "").strip()
+
+
+# Один снимок процессов на шаг вместо PowerShell/WMI на каждый вопрос (21.11.2026).
+_TABLE: dict = {"at": 0.0, "rows": None}
+_PY_NAME = re.compile(r"(?i)^(?:python|pythonw|py-[^\\/]*)\.exe$")
+
+
+def _invalidate_table() -> None:
+    _TABLE.update(at=0.0, rows=None, full=False)
+
+
+def _process_table(max_age: float = 15.0) -> list[dict] | None:
+    """[{pid, name, cmd}] или None, если список процессов получить не удалось."""
+    if _TABLE["rows"] is not None and time.monotonic() - _TABLE["at"] < max_age:
+        return _TABLE["rows"]
+    rows: list[dict] | None = None
+    full = False
+    try:
+        import psutil  # type: ignore[import-not-found]
+        rows = []
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                cmd = " ".join(proc.cmdline())
+            except Exception:  # noqa: BLE001 - AccessDenied/ZombieProcess
+                cmd = ""
+            rows.append({"pid": int(proc.info["pid"]), "name": str(proc.info.get("name") or ""), "cmd": cmd})
+        full = True
+    except ImportError:
+        rows = None
+    except Exception:  # noqa: BLE001
+        rows = None
+    if rows is None:
+        out = _ps("Get-CimInstance Win32_Process -Filter \"Name LIKE 'py%' OR Name='wscript.exe'\" | "
+                  "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress", timeout=90)
+        try:
+            data = json.loads(out) if out else None
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            data = [data]
+        if isinstance(data, list) and data:
+            rows = [{"pid": int(d.get("ProcessId") or 0), "name": str(d.get("Name") or ""),
+                     "cmd": str(d.get("CommandLine") or "")} for d in data if isinstance(d, dict)]
+    if rows is not None:
+        _TABLE.update(at=time.monotonic(), rows=rows, full=full)
+    return rows
 
 
 def _split_literal(needle: str) -> str:
@@ -168,14 +258,20 @@ def _split_literal(needle: str) -> str:
 
 
 def _pids_of(*needles: str) -> list[int]:
-    decls = "; ".join(f"$n{i} = {_split_literal(n)}" for i, n in enumerate(needles))
-    cond = " -or ".join(f"$_.CommandLine -like \"*$n{i}*\"" for i in range(len(needles)))
-    out = _ps(f"{decls}; Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe' OR Name='python.exe'\" | "
-              f"Where-Object {{ {cond} }} | ForEach-Object {{ $_.ProcessId }}")
-    return [int(x) for x in out.split() if x.strip().isdigit()]
+    """PID python-процессов с подстрокой в командной строке; RuntimeError — список недоступен."""
+    rows = _process_table()
+    if rows is None:
+        raise RuntimeError("список процессов недоступен (psutil нет, PowerShell/WMI не ответили)")
+    me = os.getpid()
+    return [r["pid"] for r in rows if r["pid"] != me and _PY_NAME.match(r["name"])
+            and any(n.casefold() in r["cmd"].casefold() for n in needles)]
 
 
 def _proc_alive(needle: str) -> bool:
+    rows = _process_table()
+    if rows is not None:
+        me = os.getpid()
+        return any(r["pid"] != me and needle.casefold() in r["cmd"].casefold() for r in rows)
     return _ps(f"$n = {_split_literal(needle)}; "
                f"[bool](Get-CimInstance Win32_Process | ? {{ $_.CommandLine -like \"*$n*\" }})") == "True"
 
@@ -205,7 +301,47 @@ def _mcp_initialize(url: str, timeout: int = 30) -> tuple[bool, str]:
 
 # ---------------------------------------------------------------------------
 
-def step_check_policy(run_tests: bool) -> Policy | None:
+def _guard_fingerprint() -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    files = [REPO / "policy.toml", REPO / "fleet-projects.toml", REPO / "pyproject.toml",
+             Path(__file__).resolve()]
+    for sub in ("src", "tests"):
+        files += sorted(p for p in (REPO / sub).rglob("*.py") if "__pycache__" not in p.parts)
+    for path in files:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            data = b"<missing>"
+        digest.update(str(path.relative_to(REPO) if path.is_relative_to(REPO) else path.name).encode())
+        digest.update(hashlib.sha256(data).digest())
+    return digest.hexdigest()
+
+
+def _guard_files() -> list[str]:
+    """Файлы, где вообще встречается «production»: -k production выбирает из них то же самое."""
+    picked = []
+    for path in sorted((REPO / "tests").rglob("test_*.py")):
+        try:
+            if "production" in path.name or "production" in path.read_text(encoding="utf-8", errors="ignore"):
+                picked.append(str(path.relative_to(REPO)))
+        except OSError:
+            return ["tests"]
+    return picked or ["tests"]
+
+
+def _guard_cached(fingerprint: str) -> dict | None:
+    try:
+        stamp = json.loads(GUARD_STAMP.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (isinstance(stamp, dict) and stamp.get("fingerprint") == fingerprint
+            and time.time() - float(stamp.get("at") or 0) < GUARD_STAMP_MAX_AGE_S):
+        return stamp
+    return None
+
+
+def step_check_policy(run_tests: bool, force_tests: bool = False) -> Policy | None:
     head("\n[1/5] Проверка policy.toml")
     try:
         policy = Policy.load(str(REPO / "policy.toml"))
@@ -216,13 +352,39 @@ def step_check_policy(run_tests: bool) -> Policy | None:
                 f"бинарей {len(policy.exec_allowed_bin)}")
     if policy._exec_bin_missing:
         say("[!]", f"нет в PATH (run ответит отказом): {', '.join(policy._exec_bin_missing)}")
+    fingerprint = _guard_fingerprint() if run_tests else ""
+    cached = None if (force_tests or not run_tests) else _guard_cached(fingerprint)
+    if cached:
+        age = (time.time() - float(cached["at"])) / 60
+        say("[OK]", f"боевые стражи: код, тесты и конфиги не менялись с зелёного прогона "
+                    f"{age:.0f} мин назад ({cached.get('last', '')[:80]}) — прогон пропущен; "
+                    f"--force-tests прогонит заново")
+        return policy
     if run_tests:
-        r = subprocess.run([sys.executable, "-m", "pytest", "tests", "-q", "-k", "production",
-                            "--no-header", "-p", "no:cacheprovider"],
-                           cwd=str(REPO), capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        last = (r.stdout or r.stderr).strip().splitlines()[-1] if (r.stdout or r.stderr).strip() else ""
+        # 09.11.2026: the step hung with no output. A live log plus a hard limit; on timeout
+        # name the last started test instead of waiting forever.
+        guard_log = GUARD_LOG
+        guard_log.parent.mkdir(exist_ok=True)
+        with guard_log.open("w", encoding="utf-8", errors="replace") as fh:
+            try:
+                r = subprocess.run([sys.executable, "-m", "pytest", *_guard_files(), "-v", "-k", "production",
+                                    "--no-header", "-p", "no:cacheprovider"],
+                                   cwd=str(REPO), stdout=fh, stderr=subprocess.STDOUT, text=True,
+                                   timeout=GUARD_TIMEOUT_S,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except subprocess.TimeoutExpired:
+                tail = guard_log.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+                fail(f"guards exceeded {GUARD_TIMEOUT_S}s; last test: {(tail or ['?'])[-1][:200]}; log: {guard_log}")
+                return None
+        lines = guard_log.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        last = lines[-1] if lines else ""
         if r.returncode == 0:
             say("[OK]", f"боевые стражи: {last}")
+            try:
+                GUARD_STAMP.write_text(json.dumps({"fingerprint": fingerprint, "at": time.time(),
+                                                   "last": last}, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                pass
         else:
             fail(f"боевые стражи упали (config ослаблен?):\n      {last}\n"
                  f"      подробно: .venv\\Scripts\\python.exe -m pytest tests -k production")
@@ -236,8 +398,12 @@ def _ensure_launcher() -> bool:
     Второй лончер — это два mcp-proxy на один порт и вечный WinError 10048;
     поэтому «на всякий случай перезапустить» здесь неправильный рефлекс.
     """
-    if _pids_of("mcp_launcher.py"):
-        return True
+    try:
+        if _pids_of("mcp_launcher.py"):
+            return True
+    except RuntimeError as exc:
+        fail(f"{exc} — лончер не трогаю, перезапуск остановлен (повтори через минуту)")
+        return False
     if not LAUNCHER.exists():
         fail(f"лончер не найден: {LAUNCHER}")
         return False
@@ -251,6 +417,67 @@ def _ensure_launcher() -> bool:
     return True
 
 
+def _free_ram_gib() -> float | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    class _Mem(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                    ("avail", ctypes.c_ulonglong), ("pt", ctypes.c_ulonglong), ("pa", ctypes.c_ulonglong),
+                    ("vt", ctypes.c_ulonglong), ("va", ctypes.c_ulonglong), ("ve", ctypes.c_ulonglong)]
+    mem = _Mem()
+    mem.length = ctypes.sizeof(_Mem)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem)):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    return mem.avail / 2**30
+
+
+def _start_progress(name: str) -> dict:
+    """Стадия последнего старта экземпляра по его журналу mcp-proxy (без процессов и WMI)."""
+    st = _proxy_state().get(name, {})
+    path = PROXY_STATE.parent / str((st or {}).get("log") or f"mcp_proxy_{name}.log")
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            fh.seek(max(0, size - 400_000))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return {"stage": "", "size": 0, "started": None}
+    marker = f"=== mcp-proxy[{name}] START "
+    at = text.rfind(marker)
+    if at < 0:
+        return {"stage": "", "size": size, "started": None}
+    segment = text[at:]
+    started = None
+    match = re.match(r"=== mcp-proxy\[[^\]]+\] START (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", segment)
+    if match:
+        try:
+            started = time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            started = None
+    stage = "proxy"
+    for key, needle in _STAGES:
+        if needle in segment:
+            stage = key
+    if f"=== mcp-proxy[{name}] CRASHED/STOPPED" in segment:
+        stage = "crashed"
+    return {"stage": stage, "size": size, "started": started}
+
+
+def _newest_code_mtime() -> float:
+    newest = 0.0
+    for path in [REPO / "policy.toml", REPO / "fleet-projects.toml", *(REPO / "src").rglob("*.py")]:
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            pass
+    return newest
+
+
 def _proxy_state() -> dict:
     try:
         return json.loads(PROXY_STATE.read_text(encoding="utf-8")).get("instances", {})
@@ -259,7 +486,26 @@ def _proxy_state() -> dict:
 
 
 def _port_listener_pids(port: int) -> set[int]:
-    """PID владельцев LISTEN на локальном порту, а не совпадения по имени процесса."""
+    """PID владельцев LISTEN на локальном порту, а не совпадения по имени процесса.
+
+    netstat — секунда без PowerShell; строка слушателя узнаётся по пустому удалённому
+    адресу (0.0.0.0:0 / [::]:0), а не по локализованному слову LISTENING.
+    """
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, timeout=20,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        text = out.decode("ascii", "replace") if isinstance(out, bytes) else str(out)
+        found = set()
+        for line in text.splitlines():
+            parts = line.split()
+            if (len(parts) >= 5 and parts[0].upper() == "TCP" and parts[1].endswith(f":{port}")
+                    and parts[2] in ("0.0.0.0:0", "[::]:0") and parts[-1].isdecimal()):
+                found.add(int(parts[-1]))
+        found.discard(0)
+        if found or "TCP" in text:
+            return found
+    except (subprocess.TimeoutExpired, OSError):
+        pass
     output = _ps(
         f"Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue | "
         "Select-Object -ExpandProperty OwningProcess -Unique"
@@ -268,6 +514,13 @@ def _port_listener_pids(port: int) -> set[int]:
 
 
 def _process_command_line(pid: int) -> str:
+    rows = _process_table()
+    if rows is not None:
+        row = next((r for r in rows if r["pid"] == pid), None)
+        if row is not None:
+            return row["cmd"]
+        if _TABLE.get("full"):  # psutil видит все процессы: нет в снимке — процесса нет
+            return ""
     return _ps(f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' "
                "-ErrorAction SilentlyContinue).CommandLine")
 
@@ -326,6 +579,7 @@ def _stop_proxy_instance(name: str, port: int) -> list[int]:
             capture_output=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        _invalidate_table()
         if result.returncode and _process_command_line(pid):
             fail(f"[{name}] taskkill PID {pid}: rc={result.returncode}")
     return victims
@@ -338,8 +592,18 @@ def step_restart_proxy(targets: list[str]) -> None:
     if targets == ["dev"]:
         say("[!]", "перезапуск dev рвёт текущее соединение с dev-mcp — если эту команду "
                    "запустил агент, его вызов оборвётся; итог будет в logs\\restart-last.txt")
+    waiting: set[str] = set()
     for name in targets:
         port = INSTANCES[name]["port"]
+        progress = _start_progress(name)
+        if (not _port_open(port) and progress["stage"] in ("proxy", "child", "server")
+                and progress["started"] and progress["started"] > _newest_code_mtime()
+                and time.time() - progress["started"] < START_LIMIT_S):
+            say("[..]", f"[{name}] уже поднимается с {time.strftime('%H:%M:%S', time.localtime(progress['started']))} "
+                        f"(после последней правки кода; стадия: {_STAGE_TEXT[progress['stage']]}) — "
+                        "не убиваю, дожидаюсь")
+            waiting.add(name)
+            continue
         victims = _stop_proxy_instance(name, port)
         if not victims and _port_open(port):
             fail(f"[{name}] порт {port} занят, но безопасный PID для остановки не найден")
@@ -350,16 +614,34 @@ def step_restart_proxy(targets: list[str]) -> None:
         port = INSTANCES[name]["port"]
         # Лончер ждёт свои 10с backoff, плюс холодный старт: dev — секунды,
         # core — десяток секунд (obsidian ходит в npm за mcp-remote).
-        for i in range(1, 121):
+        started = time.monotonic()
+        last_key, last_stage, changed_at, crashed_at = None, None, started, None
+        while True:
+            elapsed = time.monotonic() - started
             if _port_open(port):
-                say("[OK]", f"[{name}] порт {port} поднялся ({i}s) — {INSTANCES[name]['what']}")
+                say("[OK]", f"[{name}] порт {port} поднялся ({elapsed:.0f}s) — {INSTANCES[name]['what']}")
+                break
+            progress = _start_progress(name)
+            key = (progress["stage"], progress["size"])
+            if key != last_key:
+                last_key, changed_at = key, time.monotonic()
+                if progress["stage"] and progress["stage"] != last_stage:
+                    say("[..]", f"[{name}] {_STAGE_TEXT.get(progress['stage'], progress['stage'])} ({elapsed:.0f}s)")
+                    last_stage = progress["stage"]
+            crashed_at = (crashed_at or time.monotonic()) if progress["stage"] == "crashed" else None
+            st = _proxy_state().get(name, {})
+            log_name = st.get("log", f"mcp_proxy_{name}.log") if st else f"mcp_proxy_{name}.log"
+            if crashed_at and time.monotonic() - crashed_at > 60:
+                fail(f"[{name}] экземпляр упал и не перезапустился за минуту — смотри mcp-proxy\\{log_name}")
+                break
+            if time.monotonic() - changed_at > START_STALL_S:
+                fail(f"[{name}] {START_STALL_S // 60} мин без движения в журнале на стадии "
+                     f"«{_STAGE_TEXT.get(progress['stage'], progress['stage'] or '?')}» — смотри mcp-proxy\\{log_name}")
+                break
+            if elapsed > START_LIMIT_S:
+                fail(f"[{name}] порт {port} не поднялся за {START_LIMIT_S // 60} мин — смотри mcp-proxy\\{log_name}")
                 break
             time.sleep(1)
-        else:
-            st = _proxy_state().get(name, {})
-            hint = f", состояние по state.json: {st.get('state')}" if st else ""
-            fail(f"[{name}] порт {port} не поднялся за 2 мин{hint} — смотри "
-                 f"mcp-proxy\\{st.get('log', 'mcp_proxy.log')}")
 
 
 def step_local_hop(targets: list[str]) -> None:
@@ -386,6 +668,7 @@ def step_worker() -> None:
             return
         subprocess.Popen(["wscript.exe", str(WORKER_VBS)], cwd=str(WORKER_VBS.parent))
         time.sleep(6)
+        _invalidate_table()
         if _proc_alive("poll_worker.py"):
             say("[OK]", "воркер поднят")
         else:
@@ -477,12 +760,18 @@ def main() -> int:
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("--all", action="store_true", help="restart dev and core")
     scope.add_argument("--core", action="store_true", help="restart core only")
+    scope.add_argument("--instance", choices=sorted(INSTANCES), action="append",
+                       help="restart only these instances (aux, lib: без рестарта dev/core)")
     parser.add_argument("--local-only", action="store_true", help="skip public gateway checks")
     parser.add_argument("--no-tests", action="store_true", help="skip the production test selection")
+    parser.add_argument("--force-tests", action="store_true",
+                        help="run the production guards even if nothing changed since the last green run")
     args = parser.parse_args()
     local_only = args.local_only
     run_tests = not args.no_tests
-    if args.all:
+    if args.instance:
+        targets = list(dict.fromkeys(args.instance))
+    elif args.all:
         targets = ["dev", "core"]
     elif args.core:
         targets = ["core"]
@@ -492,8 +781,13 @@ def main() -> int:
     head("=" * 60)
     head(f" restart dev-mcp  ({'+'.join(targets)})")
     head("=" * 60)
+    free = _free_ram_gib()
+    if free is not None and free < 1.0:
+        say("[!]", f"свободно {free:.2f} ГиБ RAM — запуск dev может занять 10+ мин (всё упирается в подкачку). "
+                   "Закрой тяжёлые процессы (сборки, лишние вкладки); restart.cmd повторно не запускай — "
+                   "он дождётся сам.")
 
-    if step_check_policy(run_tests) is None:
+    if step_check_policy(run_tests, args.force_tests) is None:
         head("\n" + "=" * 60)
         head(" СТОП: policy.toml не в порядке — сервис НЕ перезапущен.")
         head("=" * 60)

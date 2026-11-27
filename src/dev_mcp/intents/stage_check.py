@@ -33,7 +33,8 @@ def size(root: Path) -> str:
     return values[0].lower() if len(values) == 1 else "large"
 
 
-def routing(root: Path, *, allowed_roots: tuple[Path, ...] = ()) -> tuple[str, str]:
+def routing(root: Path, *, allowed_roots: tuple[Path, ...] = (),
+            relocated_target: Path | None = None) -> tuple[str, str]:
     """Read route only from the proved understood artifact, not the raw intent."""
     file = root / "intent" / "understood.md"
     if not file.is_file():
@@ -50,6 +51,12 @@ def routing(root: Path, *, allowed_roots: tuple[Path, ...] = ()) -> tuple[str, s
         raise ValueError("неизвестный kind или пустой target")
     if (kind == "build") != (target == "new"):
         raise ValueError("build требует target: new; остальные — существующий путь")
+    if relocated_target is not None:
+        # Only a trusted caller may supply a Store-validated exact relocation.
+        # It is not exposed by the CLI and cannot authorize a sibling directory.
+        if kind == "build" or relocated_target.resolve(strict=True) != root.resolve(strict=True):
+            raise ValueError("relocation does not match the exact project root")
+        target = str(relocated_target)
     if kind != "build":
         path = Path(target)
         if (not path.is_absolute() or ".." in path.parts or not path.is_dir()
@@ -57,7 +64,7 @@ def routing(root: Path, *, allowed_roots: tuple[Path, ...] = ()) -> tuple[str, s
                 os.path.normcase(str(path.absolute())) != os.path.normcase(
                     str(path.resolve(strict=True)))):
             raise ValueError("target должен быть существующей канонической папкой")
-        if allowed_roots:
+        if allowed_roots and relocated_target is None:
             canonical = path.resolve(strict=True)
             if not any(canonical != allowed.resolve(strict=True) and canonical.is_relative_to(
                     allowed.resolve(strict=True)) for allowed in allowed_roots
@@ -73,8 +80,6 @@ def _triple(root: Path, stage: str) -> list[str]:
                              ("Анализ", "Доказательства", "Вывод")))
     problems.extend(_doc(root, f"consensus/{stage}.md",
                          ("Сравнение", "Расхождения", "Спайк", "Решение")))
-    # Gemini is invoked by the trusted stage prover, not accepted as an
-    # agent-written 'model: gemini' claim.
     return problems
 
 
@@ -171,7 +176,7 @@ def _lenses(root: Path) -> list[str]:
 
 
 def check(root: Path, stage: str, *, strict: bool = False,
-          triple: bool = False) -> list[str]:
+          triple: bool = False, relocated_target: Path | None = None) -> list[str]:
     """Return problems; an empty list means the stage is proven."""
     root = Path(root)
     if stage.startswith("candidate:"):
@@ -188,7 +193,7 @@ def check(root: Path, stage: str, *, strict: bool = False,
                                               "Неясности", "Нужно от владельца"))
         if True:  # маршрут kind/target нужен и без тройки (14.10)
             try:
-                routing(root)
+                routing(root, relocated_target=relocated_target)
             except ValueError as exc:
                 errors.append(str(exc))
         return errors + (_triple(root, stage) if triple else [])
@@ -225,8 +230,7 @@ def check(root: Path, stage: str, *, strict: bool = False,
     if stage == "experiments":
         return _experiments(root)
     if stage == "verified":
-        return _doc(root, "verification.md", ("Повторы", "Независимый агент",
-                                              "Критика Gemini", "Расхождения"))
+        return _doc(root, "verification.md", ("Повторы", "Независимый агент", "Расхождения"))
     if stage == "report":
         return _doc(root, "report.md", ("Вывод", "Эксперименты", "Уверенность", "Что дальше"))
     if stage == "rollback_plan":

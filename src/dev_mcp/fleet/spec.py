@@ -8,8 +8,9 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from dev_mcp.policy import Policy, PolicyError
 
@@ -195,10 +196,26 @@ def _future_project_module(text: str, root: Path | None) -> bool:
     return True
 
 
+def acceptance_trial_enabled() -> bool:
+    """Пробный прогон приёмки при регистрации ТЗ. 24.11.2026 (владелец): «любые ТЗ сразу в
+    работу», регистрация шла 37–117 с на ТЗ — выключен. Вернуть: [platform.bootstrap]
+    acceptance_trial = true в fleet-projects.toml."""
+    from .goals import _load_doc
+    return acceptance_trial_from(_load_doc())
+
+
+def acceptance_trial_from(doc: Mapping[str, Any]) -> bool:
+    value = (doc.get("platform") or {}).get("bootstrap") or {}
+    return isinstance(value, dict) and value.get("acceptance_trial") is True
+
+
 def _checked_acceptance_updates(
     store: Any, project: str, root: Path,
     parsed: dict[str, Task], errors: dict[str, str],
+    warnings: dict[str, list[str]],
     dry_runner: Any | None = None,
+    timing: Any | None = None,
+    source_session: dict[str, Any] | None = None,
 ) -> set[str]:
     """Fail closed on changed registered acceptance; never run under a DB lock.
 
@@ -206,7 +223,7 @@ def _checked_acceptance_updates(
     requires a REAL trial run and collection on an immutable source snapshot.
     Ownership/spec validation is independent of this runtime requirement.
     """
-    from .exec_preflight import preflight_gate, project_deps
+    from .exec_preflight import parse_command, preflight_gate, project_deps
     from .gate_snapshot import SnapshotStore
     from .goals import project_info
     from . import review
@@ -221,6 +238,7 @@ def _checked_acceptance_updates(
             for row in rows
         }
     rejected: set[str] = set()
+    session = source_session if source_session is not None else {}
     for key, item in list(parsed.items()):
         previous = old.get(item.tz.casefold())
         try:
@@ -241,6 +259,7 @@ def _checked_acceptance_updates(
                     python = root / ".venv" / "Scripts" / "python.exe"
                     deps = project_deps(root, tuple(project_info(project).get("deps") or ()))
                     for command in item.acceptance:
+                        owned_tests = _red_acceptance_owned(command, root, item.owns)
                         if dry_runner is not None:
                             # Drafts already probed this command with the trusted isolated
                             # fixture runner (drafts.register_drafts); its rc is a baseline.
@@ -255,18 +274,53 @@ def _checked_acceptance_updates(
                                 reason = "gate_launch_failed: " + static
                                 break
                             continue
+                        # Owned files and explicit acceptance inputs must remain
+                        # stable; unrelated writers may change the rest of the tree.
+                        critical = {*item.owns, item.spec_path}
+                        try:
+                            for argument in parse_command(command):
+                                rel = argument.replace("\\", "/")
+                                if (not Path(rel).is_absolute()
+                                        and not rel.startswith("../")
+                                        and (root / rel).exists()
+                                        and (rel.startswith(("test/", "tests/"))
+                                             or Path(rel).suffix.casefold()
+                                             in (".py", ".cmd", ".bat", ".ps1"))):
+                                    critical.add(rel)
+                        except ValueError:
+                            pass  # The normal launch checker reports malformed argv.
                         result = preflight_gate(
                             command, source_root=root, snapshots=snapshots,
                             binary_root=root, deps=deps,
                             python=str(python) if python.is_file() else sys.executable,
                             timeout_s=180,
+                            cache_source=True,
+                            critical_paths=tuple(sorted(critical)),
+                            acceptance_red=owned_tests,
+                            collection_targets=_pytest_collection_targets(command, root),
+                            source_session=session,
+                            **({"timing": lambda stage, seconds, data, tz=item.tz:
+                                timing(stage, seconds, {"tz": tz, **data})}
+                               if timing is not None else {}),
                         )
-                        if not result.ok:
+                        if not result.ok or result.reason == "baseline_red":
+                            # Preserve the RED command/rc as evidence, not a green gate.
                             log_path = _preflight_log(project, item.tz, command, result)
+                        if result.ok and result.reason == "baseline_red":
+                            rc = result.launch.returncode if result.launch else None
+                            warnings.setdefault(item.spec_path or item.tz, []).append(
+                                f"acceptance RED (pytest rc={rc}); full log: {log_path}")
+                            with store.tx() as tx:
+                                tx.record_event(
+                                    kind="exec_preflight_red", project=project, tz=item.tz,
+                                    payload={"source": "task.acceptance", "spec_sha": item.spec_sha,
+                                             "command": command, "rc": rc})
                         if not result.ok and result.reason == "gate_launch_failed":
-                            reason = _launch_failure(result, root)
-                            if reason:
-                                break
+                            # _probe explicitly refuses parser, ImportError and infrastructure
+                            # failures; a generic rc=1/4/5 is NOT enough to override it.
+                            reason = _launch_failure(result, root) or (
+                                "gate_launch_failed: invalid RED or infrastructure failure")
+                            break
                         elif (not result.ok and result.reason == "pytest_collection_failed"
                               and result.launch is not None and result.launch.ok
                               and "import file mismatch" not in (
@@ -297,7 +351,11 @@ def _checked_acceptance_updates(
         rejected.add(item.tz.casefold())
         errors[item.spec_path or item.tz] = "exec_preflight: " + reason[:350] + (
             f" [полный вывод: {log_path}]" if log_path else "")
-        if cache_key in _ACCEPTANCE_REJECTIONS or reason.startswith("resource_busy"):
+        if (cache_key in _ACCEPTANCE_REJECTIONS
+                or reason.startswith(("resource_busy", "snapshot_failed",
+                                      "pytest_collection_failed"))):
+            # Transient environment/snapshot failures must be retried on the
+            # next bootstrap even when this YAML's spec_sha is unchanged.
             continue
         _ACCEPTANCE_REJECTIONS[cache_key] = reason
         try:
@@ -319,6 +377,85 @@ def _checked_acceptance_updates(
             # Rejected executable remains rejected independent of reporting.
             pass
     return rejected
+
+
+def _pytest_collection_targets(command: str, root: Path) -> tuple[str, ...] | None:
+    """Collect only explicit pytest paths from this acceptance, if present.
+
+    An absent future test is allowed by RED baseline; collecting it separately
+    would fail with pytest rc=4, not a meaningful import/collection failure.
+    With no explicit pytest paths retain the full-tree safety check.
+    """
+    from .exec_preflight import parse_command
+
+    try:
+        argv = list(parse_command(command))
+    except ValueError:
+        return None
+    if not (any(argv[i] == "-m" and argv[i + 1] == "pytest"
+                for i in range(len(argv) - 1))
+            or (argv and Path(argv[0]).stem.casefold() in ("pytest", "py.test"))):
+        # Non-pytest commands retain whole-tree validation: duplicate test
+        # modules still invalidate an otherwise successful registration.
+        return None
+    candidates = []
+    for arg in argv:
+        if arg.startswith("-"):
+            continue
+        path = arg.split("::", 1)[0].replace("\\", "/").rstrip("/")
+        if not path or path.startswith("/") or ".." in Path(path).parts:
+            continue
+        rel = Path(path)
+        if (path.startswith(("test/", "tests/"))
+                or path in ("test", "tests")
+                or (rel.name.startswith("test_") and rel.suffix == ".py")):
+            candidates.append(path)
+    if not candidates:
+        return None
+    return tuple(dict.fromkeys(path for path in candidates if (root / path).exists()))
+
+
+def _red_acceptance_owned(command: str, root: Path, owns: Sequence[str]) -> bool:
+    """RED is reserved for pytest commands testing paths declared in owns.
+
+    A missing path outside owns cannot be made admissible by declaring an
+    unrelated test file in owns. Broad pytest suites may be red if a test is owned.
+    """
+    from .exec_preflight import parse_command
+
+    normalized = tuple(name.replace("\\", "/").rstrip("/") for name in owns)
+    owned_tests = tuple(name for name in normalized
+                        if name.startswith(("test/", "tests/"))
+                        or Path(name).name.startswith("test_"))
+    if not owned_tests:
+        return False
+    try:
+        argv = parse_command(command)
+    except ValueError:
+        return False
+    if not (Path(argv[0]).stem.casefold() in ("pytest", "py.test")
+            or any(argv[i:i + 2] == ("-m", "pytest")
+                   for i in range(len(argv) - 1))):
+        return False
+    targets = []
+    for arg in argv:
+        if arg.startswith("-"):
+            continue
+        target = arg.split("::", 1)[0].replace("\\", "/").rstrip("/")
+        if (target.startswith(("tests/", "test/")) or target in ("test", "tests")
+                or Path(target).name.startswith("test_")):
+            targets.append(target)
+    if not targets:
+        return True
+
+    def covered(target: str) -> bool:
+        return any(target == owner or
+                   owner.endswith("/**") and target.startswith(owner[:-3] + "/") or
+                   owner.startswith(target + "/") for owner in owned_tests)
+
+    return (any(covered(target) for target in targets)
+            and all((root / target).exists() or covered(target)
+                    for target in targets))
 
 
 def _header(path: Path) -> tuple[str, str]:
@@ -413,7 +550,33 @@ def _body_after_header(text: str) -> str:
     return text[match.end():].lstrip() if match else text
 
 
+_PARSE_CACHE: dict[str, tuple[tuple[int, int, int], Task]] = {}
+
+
 def parse_spec(abs_path: str) -> Task:
+    """Parsed spec, reused while the file is byte-for-byte the same file.
+
+    05.11.2026: draft registration re-parsed every TZ of every project each 30 s
+    (~15 % of the server's CPU, py-spy). Key: size, mtime_ns, ctime_ns. A parse
+    error is not cached, so a fixed file is seen on the next pass.
+    """
+    try:
+        st = os.stat(abs_path)
+        sig = (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    except OSError:
+        sig = None
+    hit = _PARSE_CACHE.get(abs_path)
+    if sig is not None and hit is not None and hit[0] == sig:
+        return hit[1]
+    task = _parse_spec(abs_path)
+    if sig is not None:
+        if len(_PARSE_CACHE) > 20000:
+            _PARSE_CACHE.clear()
+        _PARSE_CACHE[abs_path] = (sig, task)
+    return task
+
+
+def _parse_spec(abs_path: str) -> Task:
     path = Path(abs_path)
     if not path.is_absolute():
         raise SpecError(f"{path}: parse_spec ожидает абсолютный путь")
@@ -427,6 +590,10 @@ def parse_spec(abs_path: str) -> Task:
     for key in ("tz", "owns"):
         if key not in head or head[key] in (None, ""):
             raise SpecError(f"{path.name}: в шапке нет обязательного поля {key}")
+    from .project_review import task_id as project_review_task_id
+
+    if project_review_task_id(str(head["tz"]).strip()):
+        raise SpecError(f"{path.name}: идентификатор зарезервирован для серверного ревью")
 
     project_root = _project_root(path)
     project = str(head.get("project") or project_root.name).strip()
@@ -717,13 +884,16 @@ def sync_backlog(store: Any, project: str, root: str) -> dict:
                 errors[rel] = f"{path.name}: дублирующий tz {item.tz}"
                 continue
             seen_tz[tz_key] = rel
+            from .tz_lint import product_path_warning
+            if notice := product_path_warning(item):
+                warnings.setdefault(rel, []).append(notice)
             if tz_key not in duplicate_tz:
                 parsed[rel.casefold()] = item
         except (OSError, SpecError, ValueError) as exc:
             errors[rel] = str(exc)
 
     registered = _freeze_registered_acceptance(store, project, parsed, errors, warnings)
-    rejected_updates = _checked_acceptance_updates(store, project, project_root, parsed, errors)
+    rejected_updates = _checked_acceptance_updates(store, project, project_root, parsed, errors, warnings)
     inserted = updated = frozen = skipped_taken = unchanged = 0
     now_paths = set(parsed)
 
@@ -780,7 +950,7 @@ def sync_backlog(store: Any, project: str, root: str) -> dict:
                     unchanged += 1
                     continue
                 tx.change(
-                    "UPDATE tasks SET title=?,spec_path=?,body=?,updated_at=datetime('now') "
+                    "UPDATE tasks SET title=?,spec_path=?,body=?,updated_at=strftime('%Y-%m-%dT%H:%M:%f+00:00','now') "
                     "WHERE project=? AND tz=?",
                     (item.title, item.spec_path, item.body, project, row["tz"]),
                     event=_event(
@@ -794,7 +964,7 @@ def sync_backlog(store: Any, project: str, root: str) -> dict:
 
             tx.change(
                 "UPDATE tasks SET title=?,priority=?,kind=?,spec_path=?,spec_sha=?,needs=?,owns=?,"
-                "resources=?,acceptance=?,body=?,updated_at=datetime('now') "
+                "resources=?,acceptance=?,body=?,updated_at=strftime('%Y-%m-%dT%H:%M:%f+00:00','now') "
                 "WHERE project=? AND tz=?",
                 (*values, project, row["tz"]),
                 event=_event(project, str(row["tz"]), "update"),
@@ -812,7 +982,7 @@ def sync_backlog(store: Any, project: str, root: str) -> dict:
                 continue
             if row["state"] != "frozen":
                 tx.change(
-                    "UPDATE tasks SET state='frozen',updated_at=datetime('now') "
+                    "UPDATE tasks SET state='frozen',updated_at=strftime('%Y-%m-%dT%H:%M:%f+00:00','now') "
                     "WHERE project=? AND tz=?",
                     (project, row["tz"]),
                     event=_event(project, str(row["tz"]), "freeze_missing"),
@@ -845,6 +1015,8 @@ def sync_selected(
     fixture_paths: Mapping[str, Iterable[str]] | None = None,
     dry_runner: Any | None = None,
     new_only: bool = False,
+    timing: Any | None = None,
+    source_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Import/update only explicitly selected backlog items.
 
@@ -858,6 +1030,28 @@ def sync_selected(
     requested = {str(tz).strip().casefold(): str(tz).strip() for tz in tzs if str(tz).strip()}
     if not requested:
         raise ValueError("sync_selected requires at least one tz")
+    if len(requested) > 1 and not strict_preflight:
+        # Each completed preflight becomes visible in the registry immediately.
+        # The next TZ must never postpone earlier registrations for hours.
+        aggregate: dict[str, Any] = {
+            "requested": 0, "parsed": 0, "inserted": 0, "updated": 0,
+            "reactivated": 0, "unchanged": 0, "errors": {}, "warnings": {},
+            "preflight": {},
+        }
+        shared_source = source_session if source_session is not None else {}
+        for tz in requested.values():
+            result = sync_selected(
+                store, project, root, [tz], reactivate=reactivate, policy=policy,
+                strict_preflight=False, required_paths=required_paths,
+                fixture_paths=fixture_paths, dry_runner=dry_runner,
+                new_only=new_only, timing=timing, source_session=shared_source,
+            )
+            for name in ("requested", "parsed", "inserted", "updated",
+                         "reactivated", "unchanged"):
+                aggregate[name] += result.get(name, 0)
+            for name in ("errors", "warnings", "preflight"):
+                aggregate[name].update(result.get(name, {}))
+        return aggregate
 
     project_root = Path(root).resolve()
     from .project_identity import require_available
@@ -871,6 +1065,7 @@ def sync_selected(
     candidates: dict[str, list[Task]] = {}
     candidate_errors: dict[str, list[tuple[str, str]]] = {}
 
+    parse_started = time.perf_counter()
     for path in sorted(backlog.glob("TZ-*.md")) if backlog.is_dir() else []:
         rel = path.relative_to(project_root).as_posix()
         folded_name = path.stem.casefold()
@@ -878,6 +1073,10 @@ def sync_selected(
             key for key in requested
             if folded_name == key or folded_name.startswith(key + "-")
         ]
+        # A selected import must not reparse hundreds of unrelated backlog
+        # documents. The filename prefix is the explicit selected-TZ index.
+        if not filename_keys:
+            continue
         try:
             item = parse_spec(str(path.resolve()))
         except (OSError, SpecError, ValueError) as exc:
@@ -896,6 +1095,9 @@ def sync_selected(
             )
         )
 
+    if timing is not None:
+        timing("parse", time.perf_counter() - parse_started,
+               {"tz": ",".join(requested.values()), "candidates": sum(map(len, candidates.values()))})
     for key, shown in requested.items():
         items = candidates.get(key, [])
         if len(items) == 1:
@@ -909,6 +1111,9 @@ def sync_selected(
                     continue
                 if soft:
                     warnings[item.spec_path or shown] = soft
+            from .tz_lint import product_path_warning
+            if notice := product_path_warning(item):
+                warnings.setdefault(item.spec_path or shown, []).append(notice)
             parsed[key] = item
             continue
         if len(items) > 1:
@@ -979,7 +1184,12 @@ def sync_selected(
             else:
                 owners.append(item)
 
-    _checked_acceptance_updates(store, project, project_root, parsed, errors, dry_runner=dry_runner)
+    if acceptance_trial_enabled():
+        _checked_acceptance_updates(store, project, project_root, parsed, errors,
+                                    warnings, dry_runner=dry_runner, timing=timing,
+                                    source_session=source_session)
+    elif timing is not None:
+        timing("acceptance_skipped", 0.0, {"reason": "platform.bootstrap.acceptance_trial выкл"})
     inserted = updated = reactivated = unchanged = 0
     if strict_preflight and not parsed:
         # A rejected batch must not even register/update the project row.
@@ -988,6 +1198,7 @@ def sync_selected(
             "updated": 0, "reactivated": 0, "unchanged": 0,
             "errors": errors, "warnings": warnings, "preflight": preflight_reports,
         }
+    registry_started = time.perf_counter()
     with store.tx() as tx:
         if owner_snapshot is not None:
             # Fail closed on a race between the probe and registry mutation.
@@ -1068,7 +1279,7 @@ def sync_selected(
 
             tx.change(
                 "UPDATE tasks SET title=?,state=?,priority=?,kind=?,spec_path=?,spec_sha=?,"
-                "needs=?,owns=?,resources=?,acceptance=?,body=?,updated_at=datetime('now') "
+                "needs=?,owns=?,resources=?,acceptance=?,body=?,updated_at=strftime('%Y-%m-%dT%H:%M:%f+00:00','now') "
                 "WHERE project=? AND tz=?",
                 (
                     item.title,
@@ -1096,6 +1307,9 @@ def sync_selected(
             else:
                 updated += 1
 
+    if timing is not None:
+        timing("registry", time.perf_counter() - registry_started,
+               {"tz": ",".join(item.tz for item in parsed.values())})
     return {
         "requested": len(requested),
         "parsed": len(parsed),

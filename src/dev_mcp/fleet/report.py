@@ -5,6 +5,7 @@ import json
 import math
 import os
 import sqlite3
+from fnmatch import fnmatchcase
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -144,11 +145,78 @@ def _payload(raw: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def claim_write_status(
+    event: Mapping[str, Any], claim: Mapping[str, Any] | None,
+    owns: Sequence[str],
+) -> str:
+    """Provenance of one write against a particular task take (never just worker_id).
+
+    The claim's captured claim_paths are authoritative; current tasks.owns can change
+    between takes. Missing scope is explicitly *unverified*, not a silent grant.
+    """
+    if claim is None or any(
+        str(event.get(key) or "") != str(claim.get(key) or "")
+        for key in ("worker_id", "project", "tz")
+    ):
+        return "no_claim"
+    occurred, started, released = (_dt(event.get("ts")), _dt(claim.get("started_at")),
+                                   _dt(claim.get("released_at")))
+    if not occurred or not started or occurred < started or (released and occurred > released):
+        return "no_claim"
+    payload = _payload(event.get("payload"))
+    linked = payload.get("claim_id", payload.get("source_claim_id"))
+    if linked is not None and str(linked) != str(claim.get("id")):
+        return "no_claim"
+    if not owns:
+        return "unknown_owns"
+    path = str(event.get("path_norm") or "").replace("\\", "/").casefold()
+    for pattern in owns:
+        if fnmatchcase(path, str(pattern).replace("\\", "/").casefold()):
+            return "owned"
+    return "outside_owns"
+
+
+def _claim_owns(store: Any, claim_id: int) -> list[str]:
+    return [str(r["path_norm"]) for r in _query(
+        store, "SELECT path_norm FROM claim_paths WHERE claim_id=?", (claim_id,)
+    )]
+
+
 def _foreign(row: Mapping[str, Any]) -> bool:
     data = _payload(row.get("payload"))
     code = str(data.get("code") or data.get("reason_code") or "")
     zone_codes = ("FLEET_FOREIGN_PATH", "FLEET_OUT_OF_CLAIM")
     return code in zone_codes or any(c in str(row.get("payload") or "") for c in zone_codes)
+
+
+def _quick_operator_scope(store: Any, row: Mapping[str, Any]) -> bool:
+    """A *recorded denial* was inside a Claude quick job's explicit operator scope.
+
+    This is not a successful write: the fleet guard can still deny a conflicting
+    claim even when policy.DELEGATED_ROOTS allowed the operator's path.
+    """
+    try:
+        from . import quick
+        from .model import norm_path
+        worker = str(row.get("worker_id") or "")
+        if not quick.is_quick_agent(worker):
+            return False
+        db_path = str(getattr(store, "path", "") or "")
+        if not db_path:
+            db_path = next((str(r["file"]) for r in _query(store, "PRAGMA database_list")
+                            if str(r.get("name") or "") == "main"), "")
+        if not db_path:
+            return False
+        job = quick.lookup(quick.Book(Path(db_path).parent), worker)
+        if not job or not str(job.get("owner") or "").startswith("claude") or not job.get("scope"):
+            return False
+        occurred, created, closed = (_dt(row.get("ts")), _dt(job.get("created")),
+                                     _dt(job.get("closed_at")))
+        if not occurred or not created or occurred < created or (closed and occurred >= closed):
+            return False
+        return not quick.scope_denial(job, norm_path(str(row.get("path_norm") or "")))
+    except (KeyError, OSError, ValueError, sqlite3.Error, TypeError):
+        return False
 
 
 def _run_name(row: Mapping[str, Any]) -> str:
@@ -248,19 +316,39 @@ def claimed_vs_done(store: Any, project: str | None = None) -> str:
         events = _query(store, """
             SELECT id,ts,kind,worker_id,project,tz,tool,path_norm,rc,payload
               FROM events
-             WHERE worker_id=? AND (project IS NULL OR project=?)
-               AND (tz IS NULL OR tz=?) AND ts>=?
+             WHERE worker_id=? AND project=? AND tz=? AND ts>=?
+               AND (? IS NULL OR ts<=?)
              ORDER BY id
-        """, (claim["worker_id"], claim["project"], claim["tz"], claim["started_at"]))
+        """, (claim["worker_id"], claim["project"], claim["tz"], claim["started_at"],
+              claim["released_at"], claim["released_at"]))
+        owns = _claim_owns(store, int(claim["id"]))
         paths: list[str] = []
+        outside: list[str] = []
+        unverified = False
+        foreign_n = 0
         for row in events:
-            if row.get("kind") == "write" and row.get("path_norm"):
-                path = _display_path(row["path_norm"], claim.get("root"))
+            if _foreign(row):
+                foreign_n += 1
+            if row.get("kind") != "write" or not row.get("path_norm"):
+                continue
+            status = claim_write_status(row, claim, owns)
+            path = _display_path(row["path_norm"], claim.get("root"))
+            if status == "outside_owns" or status == "no_claim":
+                if path not in outside:
+                    outside.append(path)
+                if not _foreign(row):
+                    foreign_n += 1
+            else:
                 if path not in paths:
                     paths.append(path)
+                if status == "unknown_owns":
+                    unverified = True
         written = "—" if not paths else paths[0] + (f"(+{len(paths)-1})" if len(paths) > 1 else "")
-        foreign_n = sum(1 for row in events if _foreign(row))
+        if unverified:
+            written += " [owns не подтверждены]"
         foreign_text = "—" if not foreign_n else f"{foreign_n} (!)"
+        if outside:
+            foreign_text += " [вне owns: " + outside[0] + (f" (+{len(outside)-1})" if len(outside) > 1 else "") + "]"
         runs = [row for row in events if row.get("kind") == "run" and row.get("rc") is not None]
         run_text = "—" if not runs else f"{_run_name(runs[-1])} rc={runs[-1]['rc']}"
         has_result = _result_nonempty(str(claim.get("root") or ""), str(claim.get("spec_path") or ""))
@@ -279,6 +367,124 @@ def claimed_vs_done(store: Any, project: str | None = None) -> str:
 def exceptions(store: Any) -> list[str]:
     """Return owner-attention conditions only; [] is the normal result."""
     return [text for text, _ts in exception_items(store)]
+
+
+UNCOMMITTED_ACCEPT_MIN = 60
+
+
+def _integration_class(payload: dict[str, Any]) -> str:
+    code = str(payload.get('reason_code') or '')
+    reason = str(payload.get('reason') or payload.get('error') or '')
+    if 'WinError 206' in reason or 'filename or extension is too long' in reason.lower():
+        return 'winerror206'
+    if code in {'accepted_candidate_bytes_changed', 'accepted_candidate_bytes_changed_by_unfinished'}:
+        return 'foreign' if code.endswith('_by_unfinished') else 'drift'
+    if 'unfinished foreign writes' in reason:
+        return 'foreign'
+    if code in {'resource_busy'} or payload.get('gate_wait') or payload.get('resource_wait'):
+        return 'busy'
+    if code == 'validation_timeout' or 'timeout' in reason.lower() or 'timed out' in reason.lower():
+        return 'timeout'
+    if code.startswith('missing_acceptance_script') or "can't open file" in reason:
+        return 'missing_script'
+    if code == 'missing_candidate_dependency' or 'modulenotfounderror' in reason.lower():
+        return 'missing_import'
+    if code in {'candidate_paths_already_staged'}:
+        return 'staged'
+    if 'seal' in code or 'запечатан' in reason:
+        return 'unsealed'
+    if code in {'launch_error'} or 'gate_launch_failed' in reason:
+        return 'gate_launch_failed'
+    if payload.get('error'):
+        return 'git_error'
+    return 'validation' if payload.get('deferred') else 'other'
+
+
+def _integration_status(payload: dict[str, Any], now: datetime) -> str:
+    if payload.get('operator_required') or _integration_class(payload) in {'drift', 'staged'}:
+        return 'ждёт оператора'
+    if payload.get('retry_exhausted') or (payload.get('skipped') and not payload.get('deferred')):
+        return 'окончательно'
+    retry = payload.get('retry') or {}
+    transient = (_integration_class(payload) in {'busy', 'timeout', 'foreign', 'git_error', 'gate_launch_failed'}
+                 or str(payload.get('reason') or '') in {
+                     'candidate changed during validation', 'candidate changed during staging'})
+    if retry or transient:
+        try:
+            at = datetime.fromtimestamp(float(retry.get('next_at') or now.timestamp())).astimezone()
+            return 'повтор в ' + at.strftime('%H:%M')
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+    return 'ждёт оператора' if payload.get('deferred') else 'окончательно'
+
+
+def uncommitted_accepts(store: Any, *, now: datetime | None = None,
+                        commit_projects: set[str] | None = None) -> list[str]:
+    """Accepted task chains without a final integration receipt on commit-enabled projects."""
+    if commit_projects is None:
+        import tomllib
+        try:
+            config = Path(__file__).resolve().parents[3] / "fleet-projects.toml"
+            with config.open("rb") as stream:
+                projects = tomllib.load(stream).get("projects", {})
+            commit_projects = {name for name, flags in projects.items()
+                               if isinstance(flags, dict) and flags.get("commit") is True}
+        except (OSError, ValueError, TypeError):
+            return []  # Unknown configuration is not evidence of a required commit.
+    if not commit_projects:
+        return []
+    now = now or _utcnow()
+    # Match the integrator's retry horizon. Older historical accepts can predate
+    # integration entirely or have been committed manually without any receipt.
+    from datetime import timedelta
+    since = (now - timedelta(days=14)).isoformat()
+    pending: dict[str, list[str]] = {}
+    for project in sorted(commit_projects):
+        accepts = _query(store, """
+            SELECT e.id,e.tz,e.ts FROM events e
+            JOIN (SELECT tz,MAX(id) id FROM events
+                  WHERE project=? AND kind='accept' AND ts>=? GROUP BY tz) last ON last.id=e.id
+            WHERE e.project=? ORDER BY e.id
+        """, (project, since, project))
+        if not accepts:
+            continue
+        integrations = _query(store, """
+            SELECT e.tz,e.payload,e.ts FROM events e
+            JOIN (SELECT tz,MAX(id) id FROM events
+                  WHERE project=? AND kind='integrate' GROUP BY tz) last ON last.id=e.id
+            WHERE e.project=?
+        """, (project, project))
+        latest = {str(row["tz"]): row for row in integrations}
+        for accepted in accepts:
+            age = _minutes_since(accepted["ts"], now)
+            if age < UNCOMMITTED_ACCEPT_MIN:
+                continue
+            receipt = latest.get(str(accepted["tz"]))
+            # A final receipt must belong to this acceptance, not an earlier round.
+            current_receipt = bool(
+                receipt and _dt(receipt["ts"]) and
+                _dt(receipt["ts"]) >= _dt(accepted["ts"]))
+            payload = _payload(receipt["payload"]) if current_receipt else {}
+            skip = str(payload.get('skipped') or '')
+            final = bool(payload.get('commit') or payload.get('superseded') is True
+                         or (skip and ('уже в истории' in skip or
+                                       'переписаны более поздними' in skip or
+                                       'несут более поздние' in skip)))
+            if final:
+                continue
+            reason = str(payload.get("reason") or payload.get("error") or
+                         payload.get("skipped") or "интеграция не запускалась")
+            reason = " ".join(reason.split())[:140]
+            kind = _integration_class(payload)
+            status = _integration_status(payload, now)
+            pending.setdefault(project, []).append(
+                f"{accepted['tz']} ({_age_label(age)}; {kind}; {status}; {reason})")
+    # The registry includes pre-integrator history; never drown recent refusals
+    # in hundreds of old tasks. Preserve the full total and show the newest first.
+    return [f"ПРИНЯТО, НО НЕ ЗАКОММИЧЕНО {project}: {len(items)} задач — " +
+            "; ".join(items[-30:][::-1]) +
+            (f"; … ещё {len(items)-30} старых" if len(items) > 30 else "")
+            for project, items in pending.items()]
 
 
 def exception_items(store: Any) -> list[tuple[str, str | None]]:
@@ -319,18 +525,32 @@ def exception_items(store: Any) -> list[tuple[str, str | None]]:
                 "отозвать старого worker и вернуть задачу в ready", None
             ))
 
-    # Предфильтр в SQL: 18.10 сводка читала payload всех 775 тыс. событий (3 ГБ) в Python
-    # и шла 3+ минуты. _foreign ниже остаётся окончательной проверкой.
+    # Only deny/write can be a guard violation. Without kind the query scans
+    # the entire multi-million-row events table (including read payloads that
+    # merely quote the code), even though events_kind_id is indexed.
+    # Keep all history here for fleet.cmd --all; the CLI applies its own TTL.
+    foreign_rows: dict[tuple[str, str, str, str], tuple[dict[str, Any], int]] = {}
     for row in _query(store, """
         SELECT id,ts,worker_id,project,tz,path_norm,payload FROM events
-         WHERE payload LIKE '%FLEET_FOREIGN_PATH%' OR payload LIKE '%FLEET_OUT_OF_CLAIM%'
+         WHERE kind IN ('deny','write')
+           AND (payload LIKE '%FLEET_FOREIGN_PATH%' OR payload LIKE '%FLEET_OUT_OF_CLAIM%')
          ORDER BY id
     """):
         if _foreign(row):
             target = "/".join(x for x in (str(row.get("project") or ""), str(row.get("tz") or "")) if x) or "?"
-            label = "ВНЕ ЗОНЫ" if "FLEET_OUT_OF_CLAIM" in str(row.get("payload") or "") else "ЧУЖОЙ ПУТЬ"
-            out.append((f"{label} {target} {row.get('worker_id') or '?'}: "
-                        f"{row.get('path_norm') or 'путь не указан'}", row.get("ts")))
+            code = "outside" if "FLEET_OUT_OF_CLAIM" in str(row.get("payload") or "") else "foreign"
+            key = (code, target, str(row.get("worker_id") or "?"), str(row.get("path_norm") or ""))
+            _, n = foreign_rows.get(key, (row, 0))
+            foreign_rows[key] = (row, n + 1)
+    from .quick import is_quick_agent
+    for (code, target, worker, path), (row, count) in foreign_rows.items():
+        label = ("ВНЕ ЗОНЫ" if code == "outside"
+                 else "ОТКАЗ QUICK В SCOPE" if _quick_operator_scope(store, row)
+                 else "ЧУЖОЙ ПУТЬ")
+        repeat = f" (повторов {count})" if count > 1 else ""
+        target_text = "" if target == "?" and is_quick_agent(worker) else target + " "
+        out.append((f"{label} {target_text}{worker}: {path or 'путь не указан'}{repeat}",
+                    row.get("ts")))
 
     latest_runs: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in _query(store, """
@@ -368,25 +588,41 @@ def exception_items(store: Any) -> list[tuple[str, str | None]]:
                 "maintenance поднимет его при следующем fleet_list/fleet_take", row.get("ts")
             ))
 
+    # Accepted is not the same as committed. Keep this current-state alarm visible
+    # even when the integration refusal itself is older than the normal alarm TTL.
+    for line in uncommitted_accepts(store, now=now):
+        out.append((line, None))
+
     # Воркер без активной задачи ack уже не пришлёт: вкладка отработала и закрыта.
     # Его непрочитанное — не исключение для владельца, а мусор рассылки.
     holding = {str(r["worker_id"]) for r in _query(store, "SELECT worker_id FROM claims WHERE state='active'")}
+    noacks: dict[tuple[str, str], list[tuple[dict[str, Any], float]]] = {}
     for msg in _query(store, """
         SELECT id,to_worker,to_task,broadcast,kind,created_at
           FROM messages WHERE acked_at IS NULL ORDER BY created_at
     """):
         if msg.get("to_worker") and str(msg["to_worker"]) not in holding:
             continue
-        # Заметка задаче, которая уже закрыта (принята, отклонена, заморожена) или не
-        # существует, не дойдёт никогда: её прочтёт только следующий держатель, а его не будет.
+        # Заметка сданной задаче тоже не будет прочитана: следующий держатель
+        # возьмёт review, не исходную submitted-задачу.
         if msg.get("to_task"):
             project, _, tz = str(msg["to_task"]).partition("/")
-            if states.get((project, tz)) in (None, "accepted", "rejected", "frozen"):
+            if states.get((project, tz)) in (None, "accepted", "rejected", "frozen", "submitted"):
                 continue
         age = _minutes_since(msg.get("created_at"), now)
         if age >= PENDING_ACK_MIN:
             target = msg.get("to_worker") or msg.get("to_task") or ("всем" if msg.get("broadcast") else "?")
-            out.append((f"БЕЗ ACK {msg['id']} → {target}: {_age_label(age)}", msg.get("created_at")))
+            noacks.setdefault((str(target), str(msg.get("kind") or "")), []).append((msg, age))
+    for (target, kind), group in noacks.items():
+        last, last_age = group[-1]
+        if len(group) == 1:
+            out.append((f"БЕЗ ACK {last['id']} → {target}: {_age_label(last_age)}",
+                        last.get("created_at")))
+        else:
+            oldest_age = max(age for _msg, age in group)
+            out.append((f"БЕЗ ACK {len(group)} сообщений ({kind}) → {target}: "
+                        f"старейшее {_age_label(oldest_age)}, последнее {_age_label(last_age)}",
+                        last.get("created_at")))
 
     free = [
         row for row in _query(store, """
@@ -402,8 +638,18 @@ def exception_items(store: Any) -> list[tuple[str, str | None]]:
         suffix = "" if len(free) <= 6 else f" (+{len(free)-6})"
         out.append((f"ОЧЕРЕДЬ ПУСТА: свободны {ids}{suffix}", None))
 
+    # All reviewer routes are in tasks already. A correlated LIKE review lookup
+    # per submitted task repeatedly scans the tasks table on real fleet DBs.
+    reviews: dict[str, list[tuple[str, str]]] = {}
+    for review in _query(store, "SELECT project,tz,state FROM tasks WHERE kind='review'"):
+        reviews.setdefault(str(review["project"]), []).append(
+            (str(review["tz"]).casefold(), str(review["state"])))
+    priority = {"ready": 0, "taken": 1, "submitted": 2, "draft": 3, "frozen": 4}
+    for rows in reviews.values():
+        rows.sort(key=lambda item: priority.get(item[1], 5))
+    unrouted: dict[tuple[str, str], list[tuple[str, float]]] = {}
     for task in _query(store, """
-        SELECT t.project,t.tz,t.updated_at,
+        SELECT t.project,t.tz,t.kind,t.updated_at,
                (SELECT MAX(e.ts) FROM events e
                  WHERE e.project=t.project AND e.tz=t.tz AND e.kind='submit') submitted_at
           FROM tasks t WHERE t.state='submitted'
@@ -416,7 +662,22 @@ def exception_items(store: Any) -> list[tuple[str, str | None]]:
     """):
         age = _minutes_since(task.get("submitted_at") or task.get("updated_at"), now)
         if age >= REVIEW_WAIT_MIN:
-            out.append((f"ЖДЁТ ПРИЁМКИ {task['project']}/{task['tz']}: {_age_label(age)}", None))
+            expected = ("review:" + str(task["tz"])).casefold()
+            review_state = next((state for tz, state in reviews.get(str(task["project"]), ())
+                                 if tz == expected or tz.startswith(expected + ":")), None)
+            if review_state in ("ready", "taken", "submitted", "draft"):
+                out.append((f"ЖДЁТ ПРИЁМКИ {task['project']}/{task['tz']}: {_age_label(age)}", None))
+            else:
+                # A frozen review cannot be taken; a submitted request without
+                # a review has no receiver at all. Neither is a live review queue.
+                reason = ("ПРИЁМКА ЗАМОРОЖЕНА" if review_state == "frozen"
+                          else "СДАЧА БЕЗ МАРШРУТА ПРИЁМКИ")
+                unrouted.setdefault((str(task["project"]), reason), []).append(
+                    (str(task["tz"]), age))
+    for (project, reason), tasks in sorted(unrouted.items()):
+        examples = "; ".join(f"{tz} ({_age_label(age)})" for tz, age in tasks[:4])
+        suffix = f"; ещё {len(tasks)-4}" if len(tasks) > 4 else ""
+        out.append((f"{reason} {project}: {len(tasks)} — {examples}{suffix}", None))
     return out
 
 

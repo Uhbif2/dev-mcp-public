@@ -35,6 +35,10 @@ def test_same_tree_same_command_gates_once(env):
     git(root, "add", "-A"); git(root, "commit", "-q", "-m", "change")
     assert integ._gate(batch) is not None  # новый HEAD — новый ключ
     assert len(events(store, "gate")) == 2
+    # Identical files on a new history still need a receipt for that commit.
+    git(root, 'commit', '--allow-empty', '-qm', 'new revision with identical tree')
+    assert integ._gate(batch) is not None
+    assert len(events(store, 'gate')) == 3
 
 
 def test_infrastructure_failure_is_not_memoized(env):
@@ -50,12 +54,22 @@ def test_pending_retry_waits_for_new_fact(env, monkeypatch):
     store, root, _rootn, tmp = env
     integ = make(store, tmp)
     calls = []
-    monkeypatch.setattr(integ, "_pending_accepts", lambda: [{"id": 1, "project": "P", "tz": "TZ-1", "worker_id": "W1"}])
-    monkeypatch.setattr(integ, "_commit", lambda b, a: calls.append(a["tz"]) or {"kind": "integrate"})
-    integ._save_cursor(10**9)
+    with store.tx() as tx:
+        tx.record_event(kind='accept', project='P', tz='TZ-1', worker_id='W1')
+
+    def defer(batch, accept):
+        calls.append(accept['tz'])
+        return integ._record(kind='integrate', project='P', tz=accept['tz'],
+                             payload={'accept_id': accept['id'], 'deferred': ['base.txt'],
+                                      'reason_code': 'needs_result'})
+
+    monkeypatch.setattr(integ, "_commit", defer)
     integ.tick(); integ.tick()
     assert calls == ["TZ-1"]  # второй тик без нового факта — ничего
     event(store, "submit", "TZ-2")
+    integ.tick()
+    assert calls == ["TZ-1"]  # чужая сдача не меняет входы этой приёмки
+    event(store, "submit", "TZ-1")
     integ.tick()
     assert calls == ["TZ-1", "TZ-1"]
 

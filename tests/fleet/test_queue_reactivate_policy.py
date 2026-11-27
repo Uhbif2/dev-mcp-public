@@ -124,7 +124,6 @@ def test_manual_freeze_remains_frozen_without_trusted_block(tmp_path, monkeypatc
 
 
 def test_guard_deployment_receipt_uses_policy_not_legacy_thaw(tmp_path, monkeypatch):
-    from pathlib import Path
 
     candidate = "a" * 40
     store = StubStore.open(tmp_path / "deployment.sqlite")
@@ -224,7 +223,10 @@ def test_newer_manual_transition_between_policy_and_commit_stops_thaw(lane, monk
 
     def transition_during_read(tx, *args):
         result = original(tx, *args)
-        if result is not None and not injected:
+        from dev_mcp.fleet.reactivation_plan import ThawPlanner
+        # Planning is now read-only. Race the final authorization in the real
+        # write transaction, where a manual transition must still win.
+        if result is not None and not injected and not isinstance(tx, ThawPlanner):
             tx.record_event(kind="freeze", project="P", tz="TZ-BLOCK",
                             payload={"origin": "owner", "gate": "manual"})
             injected.append(True)

@@ -72,7 +72,6 @@ def _accept(store, stage):
 
 def test_stage_needs_server_proof_then_unlocks_next(monkeypatch, tmp_path: Path) -> None:
     from dev_mcp.intents import stages
-    from dev_mcp.fleet import gemini
     store, controller, project = _spawned(monkeypatch, tmp_path)
     task = _state(store, "understood")
     assert "Готовые решения" in task["body"] and "check.py understood" in task["acceptance"]
@@ -118,8 +117,6 @@ def test_stage_needs_server_proof_then_unlocks_next(monkeypatch, tmp_path: Path)
             tx.change("INSERT INTO claims(project,tz,worker_id,state,started_at,released_at) "
                       "VALUES('demo',?,?,'released','now','now')",
                       (task, worker), event="test.claim")
-    monkeypatch.setattr(gemini, "ask", lambda *args, **kwargs: {
-        "verdict": "approve", "critique": "Независимая критика и проверка спайков"})
     _accept(store, "understood")
     assert stages.prove_once(store) == 1
     controller.tick(); controller.tick()

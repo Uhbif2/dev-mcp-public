@@ -63,7 +63,6 @@ HUB_FLEET = HUB / "_todo" / "hub-fleet"
 SHARED_LIB = HUB / "_lib"
 STACK_JSON = HUB / "stack.json"
 PROXY_STATE: Path = _path("proxy_state", HUB / "gateway-host" / "mcp-proxy" / "state.json")  # type: ignore[assignment]
-GEMINI_RELAY: Path = _path("gemini_relay", HUB / "ai-relay" / "relay.mjs")  # type: ignore[assignment]
 
 
 def is_live(home: Path) -> bool:

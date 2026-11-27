@@ -115,7 +115,7 @@ def agent_states(store: Any, *, now: datetime | None = None) -> dict[str, int]:
     sql = (
         "SELECT w.last_seen, EXISTS("
         "SELECT 1 FROM claims c WHERE c.worker_id=w.id AND c.state='active'"
-        ") AS claimed,w.id FROM workers w WHERE w.revoked_at IS NULL"
+        ") AS claimed,w.id FROM workers w WHERE w.revoked_at IS NULL AND w.id NOT GLOB 'Q[0-9]*'"
     )
     def observations(tx):
         if not tx.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_activity'"):
@@ -344,7 +344,20 @@ def intervention_counts(conn: Any, *, now: datetime | None = None, days: int = 7
     by_class: Counter[str] = Counter()
     for counts in by_day.values():
         by_class.update(counts)
+    from . import platform_manual
+    has_events = bool(_rows(conn, "SELECT name FROM sqlite_master WHERE type='table' AND name='events'"))
+    scans = (_rows(conn, "SELECT ts FROM events WHERE kind='intervention_scan' ORDER BY id DESC LIMIT 1")
+             if has_events else [])
+    observed = _ts(scans[0][0]) if scans else None
+    mode = ('disabled' if platform_manual.enabled() else 'stale'
+            if observed is None or (now-observed).total_seconds() > 1800 else 'current')
+    manual = (_rows(conn, "SELECT ts FROM events WHERE kind='owner_cli_manual' AND ts>=?",
+                    (dates[0],)) if has_events else [])
+    manual_by_day = Counter(str(row[0])[:10] for row in manual)
     return {"goal": 0, "today": today, "yesterday": yesterday,
+            'collection': mode, 'observed_at': observed.isoformat() if observed else None,
+            'operator_today': manual_by_day[dates[-1]],
+            'operator_yesterday': manual_by_day[dates[-2]] if len(dates)>1 else 0,
             "rising": today > yesterday, "by_day": by_day,
             "by_class": dict(sorted(by_class.items()))}
 
@@ -352,6 +365,7 @@ def intervention_counts(conn: Any, *, now: datetime | None = None, days: int = 7
 def flow(conn: Any, entries: Iterable[dict[str, Any]], since: str) -> dict[str, Any]:
     entries = list(entries)
     from . import account_telemetry
+    from .lifecycle import metrics as lifecycle_metrics
     return {
         "account_limit": account_telemetry.metrics(conn),
         "bites": bites(conn, since),
@@ -363,6 +377,7 @@ def flow(conn: Any, entries: Iterable[dict[str, Any]], since: str) -> dict[str, 
         "wakes": wakes(conn, since),
         "gates": gates(conn, since),
         "interventions": intervention_counts(conn),
+        'lifecycle': lifecycle_metrics(conn,since),
     }
 
 
@@ -391,6 +406,15 @@ def format_flow(data: dict[str, Any]) -> list[str]:
                  + _pct(v["first_pass"]["n"], v["first_pass"]["N"]))
     days = " · ".join(f"{d[5:]} {n}" for d, n in v["accepted_per_day"].items()) or "—"
     lines.append(f"принято по дням: {days}")
+    cycle=data.get('lifecycle')
+    if cycle:
+        lines.append(f"цикл: принято {cycle['accepted']} → интегрировано {cycle['integrated']} → "
+                     f"артефакт доступен {cycle['artifact_available']}; "
+                     f"ждут интеграции {cycle['awaiting_integration']}, артефакта {cycle['awaiting_artifact']}; "
+                     "приёмка владельцем учитывается отдельно")
+        for root in cycle['root_blockers'][:5]:
+            lines.append(f"корневое ожидание: {root['project']}/{root['tz']} ({root['state']}); "
+                         f"готовых за ним {root['ready']}, всего {root['consumers']}")
     interventions = data.get("interventions") or {}
     if interventions:
         mix = " · ".join(f"{category} {n}" for category, n
@@ -398,9 +422,14 @@ def format_flow(data: dict[str, Any]) -> list[str]:
         last_days = " · ".join(f"{day[5:]} {sum(counts.values())}"
                                for day, counts in interventions["by_day"].items())
         warning = " · РОСТ" if interventions["rising"] else ""
-        lines.append(f"ручных вмешательств сегодня {interventions['today']}, вчера "
-                     f"{interventions['yesterday']} (цель 0{warning}); "
-                     f"по классам: {mix}; 7д: {last_days}")
+        if interventions.get('collection', 'current') != 'current':
+            state = 'сбор отключён' if interventions.get('collection') == 'disabled' else 'данные устарели'
+            lines.append(f"учёт ручных вмешательств: {state}; операторских команд сегодня "
+                         f"{interventions.get('operator_today', 0)}, вчера {interventions.get('operator_yesterday', 0)}")
+        else:
+            lines.append(f"ручных вмешательств сегодня {interventions['today']}, вчера "
+                         f"{interventions['yesterday']} (цель 0{warning}); "
+                         f"по классам: {mix}; 7д: {last_days}")
     ends = " · ".join(f"{k} {_pct(n, t['n']).split(' ')[1]}" for k, n in t["ends"].items()) or "—"
     lines.append(f"ходов {t['n']} (медиана {_num(t['median_min'], ' мин')}, {_num(t['median_calls'])} вызовов); "
                  f"конец хода: {ends}")

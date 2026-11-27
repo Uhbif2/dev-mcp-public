@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import re
 import threading
@@ -45,6 +46,9 @@ def _platform(fleet: Any, out: dict[str, str]) -> None:
         out["line"] = f"платформа: проверка упала — {exc}"
 
 
+sys.path.insert(0, str(HERE.parent / "src"))
+from dev_mcp.json_book import read_json, write_json
+
 SEEN_FILE = HERE.parent / "data" / "fleet" / "brief-seen.json"
 REPEAT_AFTER_S = 12 * 3600  # тот же набор решений повторно — не чаще раза в 12 ч
 SPEAK_ON = {"startup", "clear"}  # resume/compact — продолжение той же работы, не новый контекст
@@ -53,6 +57,43 @@ SPEAK_ON = {"startup", "clear"}  # resume/compact — продолжение т�
 def _healthy(line: str) -> bool:
     low = line.casefold()
     return "dev:8766 жив" in low and "core:8765 жив" in low and "шлюз ок" in low
+
+
+def _operator_obstacles(conn: Any, project: str | None) -> list[str]:
+    """Live registry projection: does not depend on the periodic JSON export."""
+    sys.path.insert(0, str(HERE.parent / "src"))
+    from dev_mcp.fleet.obstacles import (
+        operator_required, operator_action, operator_acceptance, operator_lead_blocks,
+    )
+    sql = "SELECT project,kind,payload FROM events WHERE kind IN ('obstacle_open','obstacle_closed')"
+    params: tuple[str, ...] = ()
+    if project is not None:
+        sql += " AND project=?"
+        params = (project,)
+    sql += " ORDER BY id"
+    current: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in conn.execute(sql, params):
+        try:
+            data = json.loads(row["payload"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict) or not data.get("id"):
+            continue
+        key = (str(row["project"]), str(data["id"]))
+        if row["kind"] == "obstacle_closed":
+            current.pop(key, None)
+        else:
+            current[key] = data
+    lines = [
+        f"ОПЕРАТОР: {p}/{oid} — {operator_action(item)[:240]}; "
+        f"снятие: {operator_acceptance(item, p)[:200]}"
+        for (p, oid), item in current.items() if operator_required(item)
+    ]
+    for block in operator_lead_blocks(conn, project):
+        lines.append(
+            f"ОПЕРАТОР: {block['project']}/{block['id']} — {block['action'][:240]}; "
+            f"снятие: {block['acceptance'][:200]}")
+    return lines
 
 
 def brief(scope: str | None, db_path: Path | None = None) -> tuple[list[str], str]:
@@ -68,6 +109,7 @@ def brief(scope: str | None, db_path: Path | None = None) -> tuple[list[str], st
     conn = fleet._open_existing(Path(path))
     try:
         conn.execute("PRAGMA busy_timeout=1000")
+        operator_lines = _operator_obstacles(conn, project)
         # Только корневые ворота, которые правда держат работу: не звенья цепочки («агент ждёт агента»)
         # и не мёртвые заморозки. Главная строка — какие ворота нужны ВСЕ ВМЕСТЕ (27.09: телефон дали,
         # а 37 задач так и стояли за покупкой второго входа — пульт показывал это отдельными пунктами).
@@ -96,7 +138,7 @@ def brief(scope: str | None, db_path: Path | None = None) -> tuple[list[str], st
         conn.close()
 
     probe.join(timeout=max(0.1, BUDGET_S - 1.5))
-    lines: list[str] = []
+    lines: list[str] = operator_lines[:5]
     pline = platform.get("line", "")
     if pline and not _healthy(pline):
         lines.extend(pline.splitlines()[:2])  # платформа — только когда она не в порядке
@@ -122,6 +164,7 @@ def brief(scope: str | None, db_path: Path | None = None) -> tuple[list[str], st
     sig += "#" + "|".join(sorted(f"{a['project']}/{a['tz']}" for a in asks))
     sig += "#" + "|".join(m.split(":")[0] for m in missing)
     sig += "#" + "|".join(lesson_asks[:3])
+    sig += "#operator:" + "|".join(operator_lines)
     sig += f"#red{len(red)}#ok{int(not pline or _healthy(pline))}"
     return lines[:MAX_LINES], sig
 
@@ -131,15 +174,17 @@ def _already_shown(scope: str, sig: str) -> bool:
     import time
 
     try:
-        seen = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        seen = {}
+        seen = read_json(SEEN_FILE, default={}, strict=True)
+    except (OSError, RuntimeError):
+        return True  # Damaged dedup book must not be silently overwritten.
+    if not isinstance(seen, dict):
+        return True
     prev = seen.get(scope) or {}
     if prev.get("sig") == sig and time.time() - float(prev.get("ts", 0)) < REPEAT_AFTER_S:
         return True
     seen[scope] = {"sig": sig, "ts": time.time()}
     try:
-        SEEN_FILE.write_text(json.dumps(seen, ensure_ascii=False), encoding="utf-8")
+        write_json(SEEN_FILE, seen)
     except Exception:  # noqa: BLE001
         pass
     return False
@@ -160,6 +205,20 @@ def main(scope: str, *, dedup: bool) -> int:
     if "lines" in result:
         if result["lines"] and not (dedup and _already_shown(scope, result["sig"])):
             print("\n".join(result["lines"]))
+    elif "error" not in result:
+        # Heavy decisions scan may exceed the hook budget. Operator actions must
+        # never disappear with that timeout: use a direct read-only registry query.
+        try:
+            import sqlite3
+            db = HERE.parent / "data" / "fleet" / "fleet.sqlite"
+            with sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=0.5) as conn:
+                conn.row_factory = sqlite3.Row
+                urgent = _operator_obstacles(conn, None if scope == "*" else scope)[:5]
+            signature = "operator:" + "|".join(urgent)
+            if urgent and not (dedup and _already_shown(scope, signature)):
+                print("\n".join(urgent))
+        except Exception:  # noqa: BLE001 — hook must not obstruct Claude Code startup
+            pass
     elif "error" in result and not dedup:
         print(result["error"][:300])
     sys.stdout.flush()

@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from dev_mcp import runner, server
+from dev_mcp import process_execution, runner, server
 
 NO_WINDOW = 0x08000000
 NEW_GROUP = 0x00000200
@@ -40,6 +40,18 @@ class FakeProc:
         self.returncode = -9
 
 
+class FakeOwnedJob:
+    def __init__(self):
+        self.assigned = None
+        self.closed = []
+
+    def assign(self, proc):
+        self.assigned = proc
+
+    def close(self, *, preserve_children=False):
+        self.closed.append(preserve_children)
+
+
 @pytest.fixture
 def flags(monkeypatch):
     # Windows-only constants are not defined on Linux CI.
@@ -47,6 +59,9 @@ def flags(monkeypatch):
     monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", NEW_GROUP, raising=False)
     monkeypatch.setattr(runner, "_CREATE_NO_WINDOW", NO_WINDOW)
     monkeypatch.setattr(runner, "_CREATE_NEW_PROCESS_GROUP", NEW_GROUP)
+    monkeypatch.setattr(process_execution, '_WindowsJob', FakeOwnedJob)
+    monkeypatch.setattr(process_execution.psutil, 'Process',
+                        lambda pid: SimpleNamespace(resume=lambda: None))
 
 
 def test_server_synchronous_run_preserves_process_group(tmp_path, monkeypatch, flags):
@@ -86,28 +101,26 @@ def test_runner_background_start_preserves_process_group(tmp_path, monkeypatch, 
     assert jobs.get(job.job_id).returncode == 0
 
 
-def test_stop_and_kill_tree_launch_taskkill_hidden(tmp_path, monkeypatch, flags):
-    observed = []
+def test_stop_and_kill_tree_use_owned_job_without_spawning_console(tmp_path, monkeypatch):
+    def unexpected_spawn(*args, **kwargs):
+        pytest.fail('stopping an owned process must not spawn a taskkill console')
 
-    def fake_run(argv, **kw):
-        observed.append((argv, kw))
-        return SimpleNamespace(returncode=0)
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", unexpected_spawn)
     proc = FakeProc()
+    owned = proc._dev_mcp_job = FakeOwnedJob()
     server._kill_process_tree(proc)
-    assert observed[0][0][:3] == ["taskkill", "/F", "/T"]
-    assert observed[0][1]["creationflags"] & NO_WINDOW
+    assert owned.closed == [False] and proc.wait_calls
 
     jobs = runner.JobRegistry(tmp_path / "runs")
     fake = FakeProc()
+    owned = fake._dev_mcp_job = FakeOwnedJob()
     job = runner.Job(
         job_id="fake", argv=[], cwd=str(tmp_path),
         log_path=tmp_path / "none.log", started_at=0, proc=fake,
     )
     jobs._jobs[job.job_id] = job
     assert jobs.stop(job.job_id)
-    assert observed[-1][1]["creationflags"] & NO_WINDOW
+    assert owned.closed == [False]
     assert job.stopped and fake.wait_calls
 
 

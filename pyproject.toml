@@ -1,6 +1,6 @@
 [project]
 name = 'dev-mcp'
-version = '0.1.1'
+version = '0.2.0'
 description = 'Policy-controlled MCP file and process server with an agent task fleet'
 requires-python = '>=3.11'
 classifiers = [
@@ -13,11 +13,12 @@ classifiers = [
 ]
 dependencies = [
     'fastmcp>=2.0',
+    "pillow>=13.0.0",
     'psutil>=5.9',
 ]
 
 [project.optional-dependencies]
-dev = ['pytest>=8.0', 'pytest-asyncio>=1.0']
+dev = ['pytest>=8.0', 'pytest-asyncio>=1.0', 'pytest-xdist>=3.6']
 
 [project.scripts]
 dev-mcp = 'dev_mcp.__main__:main'

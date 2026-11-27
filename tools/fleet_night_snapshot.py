@@ -6,6 +6,10 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+from dev_mcp.json_book import write_json
 
 
 def main() -> None:
@@ -38,15 +42,15 @@ def main() -> None:
                 "counts": counts, "event_counts": event_counts, "tasks": tasks,
                 "stages": stages, "events": recent, "claims": claims, "last_progress": last_progress}
         filename = f"{index:02d}-" + "".join(c if c.isalnum() or c in "-_" else "-" for c in name) + ".json"
-        (args.output / filename).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json(args.output / filename, data, indent=2)
         summary = {"project": name, "file": filename, "active": project["active"], "counts": counts,
                    "night": {k: event_counts.get(k, 0) for k in ("take", "accept", "reject", "block", "integrate")},
                    "last": last_progress, "open_stages": [s["title"] for s in stages if s["state"] == "open"]}
         summaries.append(summary)
         print(json.dumps(summary, ensure_ascii=False))
-    (args.output / "index.json").write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(args.output / "index.json", summaries, indent=2)
     global_events = rows("SELECT * FROM events WHERE ts>=? AND project IS NULL AND kind LIKE '%error%' ORDER BY id", (args.since,))
-    (args.output / "global-errors.json").write_text(json.dumps(global_events, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(args.output / "global-errors.json", global_events, indent=2)
     conn.close()
 
 

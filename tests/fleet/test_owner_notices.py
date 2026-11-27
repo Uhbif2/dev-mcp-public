@@ -182,6 +182,9 @@ def test_needs_notice_becomes_one_ticktick_delivery_task_and_freezes_when_resolv
     root = tmp_path / 'hub'
     root.mkdir()
     monkeypatch.setattr(owner_notices, 'TICKTICK_RECEIPTS', root / 'owner-ticktick')
+    from dev_mcp.fleet import goals  # 07.11: в боевом конфиге TickTick выключен владельцем
+    real_doc = goals._load_doc
+    monkeypatch.setattr(goals, '_load_doc', lambda: {**real_doc(), 'platform': {'ticktick': True}})
     store = Store.open(str(tmp_path / "fleet.sqlite"))
     with store.tx() as tx:
         tx.change("INSERT INTO projects(name,root,active) VALUES(?,?,1)",
@@ -221,3 +224,21 @@ def test_ticktick_receipt_checker_rejects_invented_ids(tmp_path):
     path.write_text(json.dumps({'notice': ident, 'ticktick_task_id': '6713a1b2c3d4e5f6a7b8c9d0',
                                 'ticktick_project_id': 'inbox123456', 'title': 't'}), encoding='utf-8')
     assert ttr.check(path) == []
+
+
+def test_world_need_reaches_owner_notice_from_the_shared_calculation(tmp_path, monkeypatch):
+    # 04.11 22:04 – 05.11 08:39 МСК adb не видел телефон, на нём стояли TZ-330 и свидетель —
+    # владелец узнал только утром от оператора. Расчёт один с задачей TickTick: world.owner_needs.
+    from dev_mcp.fleet import world
+    monkeypatch.setattr("dev_mcp.fleet.windows_notify.gui_session_available", lambda: True)
+    store = Store.open(str(tmp_path / "fleet.sqlite"))
+    monkeypatch.setattr(overview, "snapshot", lambda *a, **k: {"status": "empty", "human": {}})
+    needs = [{"resource": "телефон", "since": "2026-11-04T19:04:37+00:00", "waiting": [("P", "TZ-330")],
+              "need": "проверь USB-отладку", "detail": "нет готовых устройств", "live": "down"}]
+    monkeypatch.setattr(world, "owner_needs", lambda store: needs)
+    alert, = owner_notices.world_alerts(store)
+    assert "P/TZ-330" in alert["text"] and "нет готовых устройств" in alert["text"]
+    assert "проверь USB-отладку" in alert["text"]
+    assert owner_notices.reconcile(store) == 1
+    needs.clear()
+    assert owner_notices.reconcile(store) == 0

@@ -93,7 +93,7 @@ def validate_argv(argv: list[str], policy: Any) -> list[str]:
 
 
 def _git(root: str, *args: str, runner: Runner = subprocess.run, timeout: float = 120) -> subprocess.CompletedProcess:
-    return runner(["git", "-C", root, *args], capture_output=True, text=True, encoding="utf-8",
+    return runner(["git", "-c", "core.longpaths=true", "-C", root, *args], capture_output=True, text=True, encoding="utf-8",
                   errors="replace", timeout=timeout,
                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
@@ -208,7 +208,8 @@ def check(store: Any, project_root: str, claim_id: int, argv: list[str], *,
         return {**out, "verdict": "unchecked", "reason": f"{type(exc).__name__}: {exc}"}
     finally:
         _git(project_root, "worktree", "remove", "--force", str(base), runner=runner)
-        shutil.rmtree(base, ignore_errors=True)
+        from .temp_gc import remove_tree
+        remove_tree(base)
     out.update(rc_after=rc_after, rc_before=rc_before, dur_s=round(time.monotonic() - started, 1),
                code_files=len(code_changed))
     if rc_after != 0:

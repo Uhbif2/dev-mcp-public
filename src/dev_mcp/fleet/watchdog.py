@@ -352,7 +352,7 @@ def detect(store: Any, *, now: datetime, signals: Signals = Signals()) -> list[F
                         "thaw", block[0]))
         for name, description in sorted(signals.ambiguities.items()):
             findings.append(_issue("ambiguous", PROJECT, name, str(description),
-                                   "gemini_hypothesis"))
+                                   "model_hypothesis"))
         # 13.10: прогресс, а не очередь — циклы, стоящие интенции, принятое мимо ствола.
         from .progress_watch import findings as progress_findings
         findings.extend(progress_findings(tx, now, _issue))
@@ -615,7 +615,7 @@ def watchdog_tick(store: Any, *, now: datetime | None = None,
                             ts=now.isoformat(),
                             payload={"fingerprint": f.fingerprint, "number": len(previous) + 1,
                                      "repair": f.repair})
-            if f.repair == "gemini_hypothesis":
+            if f.repair == "model_hypothesis":
                 tx.record_event(kind="watchdog_hypothesis_needed", project=f.project,
                                 tz=f.subject, ts=now.isoformat(),
                                 payload={"fingerprint": f.fingerprint,

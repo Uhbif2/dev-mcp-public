@@ -93,7 +93,7 @@ class Regater:
     def _last(self, project: str) -> tuple[int, float, int, dict] | None:
         with self.store.read() as tx:
             row = tx.one("SELECT id,ts,rc,payload FROM events WHERE project=? AND "
-                         "kind='gate' ORDER BY id DESC LIMIT 1", (project,))
+                         "kind IN ('gate','gate_wait') ORDER BY id DESC LIMIT 1", (project,))
         if row is None:
             return None
         try:
@@ -151,17 +151,29 @@ class Regater:
         for project, root in projects:
             before = self._last(project)
             now = self.clock()
-            if before is None or before[2] == 0 or self._cooldown(project, now):
+            if before is None or before[2] == 0:
+                continue
+            execution_wait = before[3].get('outcome') in {
+                'not_started_busy', 'timed_out', 'launch_error'} and not before[3].get('defect_found')
+            if execution_wait and now - before[1] < min(self.min_interval_s, 60):
+                continue
+            if execution_wait and before[3].get('outcome')=='not_started_busy':
+                from . import world
+                from .exec_preflight import parse_command
+                command=str(self.integrator.project_info(project).get('gate') or '')
+                if not command or not world.command_available(parse_command(command)):
+                    continue
+            elif self._cooldown(project,now):
                 continue
             zone = self._blocked_zone(project)
-            if not zone or (now - before[1] < self.stale_after_s
-                            and not _changed_since(root, zone, before[1])):
+            if not execution_wait and (not zone or (now - before[1] < self.stale_after_s
+                            and not _changed_since(root, zone, before[1]))):
                 continue
             with project_gate_lock(project, blocking=False) as acquired:
                 if not acquired:
                     continue
                 current = self._last(project)
-                if current is None or current[0] != before[0] or self._cooldown(project, now):
+                if current is None or current[0] != before[0] or (not execution_wait and self._cooldown(project, now)):
                     continue
                 self.integrator._record(kind="regate_attempt", project=project,
                                         payload={"previous_gate":before[0]})

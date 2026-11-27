@@ -88,6 +88,21 @@ async def test_policy_info_lists_roots(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_policy_info_shows_quick_operator_delegation(tmp_path: Path, monkeypatch) -> None:
+    from dev_mcp.fleet import quick
+
+    server, root, _ = make_server(tmp_path, allow_write=False)
+    monkeypatch.setattr(quick, "is_quick_agent", lambda agent: agent == "Q-test")
+    monkeypatch.setattr(quick, "lookup", lambda book, agent: {"owner": "claude"})
+    monkeypatch.setattr(quick, "operator_roots", lambda entry: (root,))
+    ordinary = await call(server, 'policy_info', {})
+    delegated = await call(server, 'policy_info', {'agent': 'Q-test'})
+    assert 'Делегированная оператором область' not in ordinary
+    assert 'Делегированная оператором область записи и run' in delegated
+    assert str(root) in delegated
+
+
+@pytest.mark.asyncio
 async def test_read_file_inside_root(tmp_path: Path) -> None:
     server, root, _ = make_server(tmp_path, allow_write=False)
     text = await call(server, 'read_file', {'path': str(root / 'pkg' / 'main.py')})

@@ -157,3 +157,59 @@ def test_candidate_gate_replaces_a_slow_whole_project_gate_on_the_candidate(tmp_
         assert ok, reason
     finally:
         store.close()
+
+
+def test_candidate_collection_uses_current_candidate_not_global_baseline(tmp_path):
+    """An unrelated broken HEAD test must not block a candidate-only collection."""
+    root = tmp_path / "project"
+    root.mkdir()
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=root, check=True,
+                              capture_output=True, text=True, encoding="utf-8")
+
+    git("init", "-q")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    tests = root / "tests"
+    tests.mkdir()
+    (tests / "test_unrelated.py").write_text(
+        "import intentionally_missing_dependency_xyz\n", encoding="utf-8")
+    candidate = tests / "test_candidate.py"
+    candidate.write_text("def test_value(): assert 1 == 1\n", encoding="utf-8")
+    (root / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "baseline")
+    fake_python = root / ".venv" / "Scripts" / "python.exe"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text("placeholder", encoding="utf-8")
+    candidate.write_text("def test_value(): assert 2 == 2\n", encoding="utf-8")
+
+    observed = []
+    def runner(argv, **kwargs):
+        actual = list(argv)
+        if actual[0] == str(fake_python):
+            actual[0] = sys.executable
+        if "--collect-only" in actual:
+            cwd = Path(kwargs["cwd"])
+            observed.append((actual, cwd, (cwd / "tests/test_candidate.py").read_text()))
+        return subprocess.run(actual, **kwargs)
+
+    store = Store.open(str(tmp_path / "registry.sqlite"))
+    try:
+        manager = Integrator(
+            store, tmp_path / "state.json", runner=runner,
+            project_info=lambda _: {"gate": "py -3 -m pytest -q", "commit": True},
+        )
+        ok, reason = manager._candidate(str(root), ["tests/test_candidate.py"], "P")
+        assert ok, reason
+        assert len(observed) == 1
+        argv, cwd, candidate_bytes = observed[0]
+        assert "tests/test_candidate.py" in argv
+        assert "tests/test_unrelated.py" not in argv
+        assert cwd != root and candidate_bytes == "def test_value(): assert 2 == 2\n"
+        candidate.write_text("import missing_new_candidate_dependency\n", encoding="utf-8")
+        ok, reason = manager._candidate(str(root), ["tests/test_candidate.py"], "P")
+        assert not ok and "gate_launch_failed" in reason
+    finally:
+        store.close()

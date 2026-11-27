@@ -10,6 +10,19 @@ import pytest
 from dev_mcp.fleet import storage_guard, world
 
 
+def test_emergency_admission_is_below_measured_idle_disk_and_above_failure(monkeypatch):
+    gib = 1024 ** 3
+    assert 256 * 1024**2 < storage_guard.MIN_FREE_BYTES < int(7.9 * gib)
+    monkeypatch.setattr(storage_guard.shutil, 'disk_usage',
+                        lambda path: SimpleNamespace(free=int(7.9 * gib)))
+    assert storage_guard.admission() == (True, '')
+    monkeypatch.setattr(storage_guard.shutil, 'disk_usage',
+                        lambda path: SimpleNamespace(free=5 * gib))
+    allowed, reason = storage_guard.admission()
+    assert not allowed and '5.0 ГиБ' in reason and '6.0 ГиБ' in reason
+    assert 'не удаляются' in reason
+
+
 def backup(home, name, content=b"SQLite format 3\x00" + b"x" * 65536):
     p = home / "data" / "backups" / name
     p.parent.mkdir(parents=True, exist_ok=True)

@@ -1,16 +1,21 @@
 import { drawOwnerAttention } from "./owner-notices.js";
 
-const DEBUG_TARGETS = "http://127.0.0.1:9223/json";
+const DEBUG_TARGETS = "http://localhost:9223/json";
 const EXTENSION_NAME = "Вкладки флота";
 const CONNECT_TIMEOUT_MS = 5000;
 
 function cdpEvaluate(target, expression) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(target.webSocketDebuggerUrl);
-    const timer = setTimeout(() => {
+    let settled = false, requestSent = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(value);
       try { ws.close(); } catch {}
-      reject(new Error("CDP timeout"));
-    }, CONNECT_TIMEOUT_MS);
+    };
+    const timer = setTimeout(() => finish(new Error("CDP timeout")), CONNECT_TIMEOUT_MS);
 
     ws.onopen = () => {
       ws.send(JSON.stringify({
@@ -18,22 +23,21 @@ function cdpEvaluate(target, expression) {
         method: "Runtime.evaluate",
         params: { expression, returnByValue: true, awaitPromise: true },
       }));
+      requestSent = true;
     };
     ws.onmessage = (event) => {
       const message = JSON.parse(event.data);
       if (message.id !== 1) return;
-      clearTimeout(timer);
       if (message.error || message.result?.exceptionDetails) {
-        reject(new Error(JSON.stringify(message.error || message.result.exceptionDetails)));
+        finish(new Error(JSON.stringify(message.error || message.result.exceptionDetails)));
       } else {
-        resolve(message.result?.result?.value);
+        finish(null, message.result?.result?.value);
       }
-      try { ws.close(); } catch {}
     };
     ws.onerror = (event) => {
-      clearTimeout(timer);
-      reject(new Error(String(event?.message || "CDP websocket error")));
+      finish(new Error(String(event?.message || "CDP websocket error")));
     };
+    ws.onclose = () => finish(Object.assign(new Error("CDP target closed"), {requestSent, targetClosed:true}));
   });
 }
 
@@ -59,9 +63,16 @@ async function main() {
     }
     if (info.name !== EXTENSION_NAME) continue;
 
+    // 24.11: readback установленной версии без перезагрузки (the maintainer release script (not included)).
+    if (process.argv.includes("--version")) {
+      console.log(`extension_version=${info.version || "?"}`);
+      return;
+    }
+
     if (process.argv.includes("--diagnostics")) {
       const raw=await cdpEvaluate(target,`(async()=>{
-        const saved=await chrome.storage.local.get(["lastTickAt","tickError","status","wakeMem","recoveryMem","sessions","ownTabs","launch","interfaceQueue","accountActions"]);
+        const saved=await chrome.storage.local.get(["lastTickAt","lastCycleStartedAt","lastCycleFinishedAt","tickError","status","wakeMem","recoveryMem","sessions","ownTabs","launch","interfaceQueue","accountActions"]);
+        const alarm=await chrome.alarms.get("tick");
         const tabs=await chrome.tabs.query({url:"https://chatgpt.com/*"});
         const rows=await Promise.all(tabs.map(async t=>{
           let p=null; try { p=await Promise.race([chrome.tabs.sendMessage(t.id,{type:"probe"}),new Promise(r=>setTimeout(()=>r(null),1500))]); } catch {}
@@ -71,7 +82,7 @@ async function main() {
             recovery:!!saved.recoveryMem?.[t.id],wakeAgeSec:saved.wakeMem?.[t.id]?Math.round((Date.now()-saved.wakeMem[t.id].at)/1000):null,
             action:saved.status?.[t.id]?.action,reason:saved.status?.[t.id]?.reason};
         }));
-        return JSON.stringify({version:chrome.runtime.getManifest().version,tickAgeSec:Math.round((Date.now()-(saved.lastTickAt||0))/1000),error:saved.tickError||"",queuedInterfaces:Object.keys(saved.interfaceQueue||{}).length,navigation:saved.accountActions?.history?.slice(-4),pendingStarts:Object.keys(saved.launch?.launched||{}).length,tabs:rows});
+        return JSON.stringify({version:chrome.runtime.getManifest().version,tickAgeSec:Math.round((Date.now()-(saved.lastTickAt||0))/1000),cycleStartedAt:saved.lastCycleStartedAt||null,cycleFinishedAt:saved.lastCycleFinishedAt||null,alarmPeriodMin:alarm?.periodInMinutes??null,error:saved.tickError||"",queuedInterfaces:Object.keys(saved.interfaceQueue||{}).length,navigation:saved.accountActions?.history?.slice(-4),pendingStarts:Object.keys(saved.launch?.launched||{}).length,tabs:rows});
       })()`);
       console.log(raw); return;
     }
@@ -108,12 +119,25 @@ async function main() {
       return;
     }
 
-    // Health mode is read-only. Using extension storage (not fleet_list lease)
-    // catches a suspended/hung MV3 work loop even while other heartbeats arrive.
+    if (process.argv.includes("--wake")) {
+      const requested = await cdpEvaluate(target, `(async()=>{
+        const alarm=await chrome.alarms.get("tick");
+        if(!alarm || alarm.periodInMinutes!==0.5)
+          await chrome.alarms.create("tick",{periodInMinutes:0.5});
+        await chrome.alarms.create("tick-soon",{when:Date.now()+500});
+        return "wake-requested";
+      })()`);
+      if (requested !== "wake-requested") throw new Error("alarm wake not acknowledged");
+      console.log("extension_wake=requested");
+      return;
+    }
+
+    // Read-only progress, including failed/paused cycles and an in-flight cycle's
+    // start. No independent heartbeat may conceal an indefinitely stuck cycle.
     if (process.argv.includes("--tick-age")) {
       const rawTick = await cdpEvaluate(
         target,
-        "chrome.storage.local.get(['lastTickAt','lastLocalRecoveryAt']).then(s => JSON.stringify({now:Date.now(),lastTickAt:Math.max(s.lastTickAt||0,s.lastLocalRecoveryAt||0)}))",
+        "chrome.storage.local.get(['lastTickAt','lastLocalRecoveryAt','lastCycleStartedAt','lastCycleFinishedAt']).then(s => JSON.stringify({now:Date.now(),lastTickAt:globalThis.fleetRuntimeHealth?.storageError ? 0 : Math.max(s.lastTickAt||0,s.lastLocalRecoveryAt||0,s.lastCycleStartedAt||0,s.lastCycleFinishedAt||0)}))",
       );
       const snapshot = JSON.parse(String(rawTick || "{}"));
       const completed = Number(snapshot.lastTickAt);
@@ -132,7 +156,7 @@ async function main() {
       // service worker. That is still a successful request if the socket closed
       // after Runtime.evaluate was sent; surface a hard error only when no target
       // could be identified.
-      if (/closed|websocket/i.test(String(error))) return "reload-requested";
+      if (error.requestSent && error.targetClosed) return "reload-requested";
       throw error;
     });
     if (requested !== "reload-requested") {

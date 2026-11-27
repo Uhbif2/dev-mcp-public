@@ -26,6 +26,9 @@ def test_checkpoint_needs_claim_and_shows_in_resume(tmp_path: Path) -> None:
     assert "нужны хотя бы" in cp("W1", "", "y")
     saved = cp("W1", "парсер готов, 3 теста зелёные", "дописать CLI", rejected="regex — медленно")
     assert "demo/TZ-1 сохранена" in saved
+    # 03.11.2026: ответ возвращает следующий шаг поручением на этот же ход — не «конец хода».
+    assert "Сейчас, в этом же ходе: дописать CLI" in saved
+    assert "Точка — не конец хода" in saved
     text = resume("W1")
     assert "Контрольная точка — продолжай с неё" in text
     assert "следующий шаг: дописать CLI" in text and "отвергнуто: regex — медленно" in text

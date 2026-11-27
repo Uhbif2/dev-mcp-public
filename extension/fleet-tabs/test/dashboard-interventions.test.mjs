@@ -85,3 +85,20 @@ test('empty and invalid data do not imply healthy zero and cannot inject HTML', 
   } });
   assert.match(elements.get('summary').text, /Сводка вмешательств повреждена/);
 });
+
+test('disabled collection and owner artifacts remain explicit in the rendered dashboard', () => {
+  const { context, elements } = fixture();
+  context.renderOverview({ status: 'ready', intents: [], interventions: {
+    available: true, collection: 'disabled', today: 0, yesterday: 0,
+    operator_today: 13, operator_yesterday: 2,
+  }, human: { done: [{ title: 'Accepted change', text: 'Verified revision',
+    artifact: 'file:///C:/results/result.zip', folder: 'file:///C:/results/' }] } });
+  assert.match(elements.get('summary').text, /Сбор отключён/);
+  assert.match(elements.get('summary').text, /Операторских команд сегодня: 13/);
+  assert.doesNotMatch(elements.get('summary').text, /Сегодня: 0/);
+  const done = elements.get('human-done');
+  assert.match(done.text, /Архив изменений/);
+  const links = done.children[0].children.find(x => x.className === 'human-links').children;
+  assert.equal(links[0].href, 'file:///C:/results/result.zip');
+  assert.equal(links[1].href, 'file:///C:/results/');
+});

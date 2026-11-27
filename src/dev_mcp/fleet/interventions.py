@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterable
 from dev_mcp.audit import iter_entries
 from dev_mcp.fleet.store import Store
 
-COMMANDS = frozenset({"reactivate", "freeze", "priority", "recover", "bootstrap", "tell"})
+COMMANDS = frozenset({"reactivate", "freeze", "priority", "recover", "bootstrap", "tell", "instruct"})
 SHA = re.compile(r"^[0-9a-f]{40}$", re.I)
 COMMIT_PREFIX = re.compile(r"^[0-9a-f]{7,40}$", re.I)
 GIT_FORMAT = "%H%x1f%an%x1f%aI%x1f%s%x1e"
@@ -52,7 +52,7 @@ class Intervention:
 
 
 def classify(item: Intervention) -> str:
-    """Deterministic classification; a Gemini suggestion must remain advisory."""
+    """Deterministic classification; a model suggestion must remain advisory."""
     if item.source == "lesson":
         return item.action
     if item.source == "fleet-cli":

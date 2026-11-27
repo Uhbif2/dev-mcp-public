@@ -115,26 +115,24 @@ def stale_reads(store: Any, worker_id: str, *, stale_min: int = 20) -> list[Mess
         roots = _project_roots(db)
         rows = _fetchall(
             db,
-            """SELECT w.id AS writer_event_id, w.path_norm AS path_norm,
+            # 05.11.2026: the correlated NOT EXISTS scanned all ~235k reads per call (13 s
+            # and more for busy chats, py-spy ~12 % of the server). Latest read per path
+            # first (worker index), then writes on that path after it (path index).
+            """WITH ranked AS (
+                   SELECT id, path_norm, ts, payload,
+                          ROW_NUMBER() OVER (PARTITION BY path_norm ORDER BY ts DESC, id DESC) AS n
+                     FROM events INDEXED BY events_worker_ts
+                    WHERE worker_id=? AND ts>=? AND kind='read' AND path_norm IS NOT NULL)
+               SELECT w.id AS writer_event_id, w.path_norm AS path_norm,
                       w.worker_id AS writer_id, w.ts AS write_ts,
                       w.payload AS write_payload, r.id AS read_event_id,
                       r.ts AS read_ts, r.payload AS read_payload
-                 FROM events AS r
-                 JOIN events AS w ON w.path_norm=r.path_norm
-                WHERE r.kind='read' AND r.worker_id=?
-                  AND NOT EXISTS (
-                      SELECT 1
-                        FROM events AS r2
-                       WHERE r2.kind='read'
-                         AND r2.worker_id=r.worker_id
-                         AND r2.path_norm=r.path_norm
-                         AND (r2.ts>r.ts OR (r2.ts=r.ts AND r2.id>r.id))
-                  )
-                  AND w.kind='write' AND w.worker_id IS NOT NULL
-                  AND w.worker_id<>? AND w.ts>r.ts
-                  AND r.ts>=?
+                 FROM ranked AS r
+                 JOIN events AS w INDEXED BY events_path
+                   ON w.path_norm=r.path_norm AND w.ts>r.ts
+                WHERE r.n=1 AND w.kind='write' AND w.worker_id IS NOT NULL AND w.worker_id<>?
                 ORDER BY w.id""",
-            (worker, worker, since or ""),
+            (worker, since or "", worker),
         )
 
         # Одно уведомление на одно чтение: о последней чужой записи и сколько их было. Раньше

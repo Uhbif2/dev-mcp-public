@@ -126,8 +126,22 @@ def test_briefing_links_project_agents_and_renders_deterministic_context(tmp_pat
     assert "python -m pytest tests/unit.py -q" in text
     assert "TZ-2" in text
     assert "закрытия по rc" in text
+    assert "тест приёмки веди через продуктовую точку входа" in text
+    assert "перед submit временно внеси контрпример" in text
     assert "Пиши только в свою зону" not in text
     assert "Git и телефон не трогай" not in text
+
+
+def test_briefing_warns_taken_consumer_after_submitted_source_rejected(tmp_path: Path):
+    store = setup_store(tmp_path)
+    source = task("TZ-2", state="rejected")
+    consumer = replace(task(), needs=("TZ-2#submitted",))
+    insert_task(store, source)
+    insert_task(store, consumer)
+    message = briefing(store, "W1", consumer)
+    assert "TZ-2#submitted: rejected" in message
+    assert "ВНИМАНИЕ: TZ-2 отклонена после сдачи кода" in message
+    assert "уже взятая задача продолжается" in message
 
 
 def test_briefing_falls_back_to_existing_root_rules_file(tmp_path: Path):
@@ -143,6 +157,95 @@ def test_briefing_falls_back_to_existing_root_rules_file(tmp_path: Path):
     assert str(root / "CLAUDE.md") in text
     assert "ориентируйся на CLAUDE.md" in text
     assert str(root / "AGENTS.md") not in text
+
+
+def test_lead_brief_starts_with_goal_and_links_charter(tmp_path: Path, monkeypatch):
+    from dev_mcp.fleet import goals, instructions
+
+    store = setup_store(tmp_path)
+    monkeypatch.setattr(goals, "project_info", lambda project: {
+        "goal": "Доставить отчёт читателю.",
+        "lead_focus": {"action": "Открыть отчёт через клиент.", "evidence": "Читатель видит исходник."},
+    })
+    instructions.register(store, "P", text="Автоматический сигнал поля", author="field", priority=1, strict=False)
+    instructions.register(store, "P", text="Точное поручение владельца", priority=5, strict=False)
+    instructions.register(store, "P", text="Старый отчёт рабочего", author="worker:W2", strict=False)
+    current = replace(task("TZ-LEAD"), body="Устав целиком")
+    insert_task(store, current)
+
+    text = briefing(store, "W1", current)
+    assert text.splitlines()[0] == "Цель проекта P: Доставить отчёт читателю."
+    assert len(text) <= 2500
+    assert "Точное поручение владельца" not in text
+    assert "Автоматический сигнал поля" not in text
+    assert "Старый отчёт рабочего" not in text
+    assert "Открыть отчёт через клиент." in text
+    assert "O-ID не выбран" in text and "NOT_MEASURED" in text
+    assert "Блокер:" in text and "владелец:" in text and "Одно действие:" in text
+    assert "TZ-LEAD.md" in text and "ToDo/lead/STATE.md" in text
+    assert "fleet_quick new/say" in text
+    assert "fleet_lead(action='issue')" in text and "fleet_lead(action='ask')" in text
+    assert "по независимым уликам" in text and "владельцу передавай только решения" in text
+    assert "Устав целиком" not in text and "Соседи по путям" not in text
+
+
+def test_big_lead_first_brief_is_bounded_with_verified_stage(tmp_path: Path, monkeypatch):
+    from dev_mcp.fleet import goals, instructions, memory_rules
+
+    store = setup_store(tmp_path)
+    root = tmp_path / "P"
+    lead_dir = root / "ToDo" / "lead"
+    lead_dir.mkdir(parents=True)
+    target = "O-release-live"
+    obligations = [{"id": target, "status": "L3"}] + [
+        {"id": f"O-synthetic-{i:04d}", "status": "open", "notes": "История " * 100}
+        for i in range(600)
+    ]
+    (lead_dir / "LEDGER.json").write_text(
+        json.dumps({"obligations": obligations}, ensure_ascii=False), encoding="utf-8")
+    (lead_dir / "STATE.md").write_text("Много данных\n" * 5000, encoding="utf-8")
+    (lead_dir / "PROTOCOL.md").write_text("Правило проекта\n" * 5000, encoding="utf-8")
+    monkeypatch.setattr(goals, "project_info", lambda project: {
+        "goal": "Доставить подписанный релиз пользователю.",
+        "lead_focus": {"action": "Открыть живой релиз.", "evidence": "Проверен результат."},
+    })
+    monkeypatch.setattr(memory_rules, "render", lambda *args: "Важные правила\n" + "A" * 3000)
+    for i in range(30):
+        instructions.register(
+            store, "P", text=f"Поручение владельца {i}: " + "Б" * 3500, strict=False)
+    current = replace(task("TZ-LEAD"), body="Старый текст\n" * 4000)
+    insert_task(store, current)
+    with store.tx() as tx:
+        tx.record_event(kind="checkpoint", project="P", tz="TZ-LEAD",
+                        payload={"note": f"Выбран {target}", "next": "Проверить установку на другом ПК."})
+        tx.record_event(kind="lead_parked", project="P", tz="TZ-LEAD",
+                        payload={"reason": "Нет доступа ко второму ПК; ждём владельца устройства."})
+        tx.record_event(kind="obstacle_open", project="P", tz="TZ-LEAD",
+                        payload={"id": "ob-test-device", "obligations": [target],
+                                 "ask": "Нет доступа ко второму ПК; нужен внешний тестировщик.",
+                                 "actor": "external"})
+        tx.record_event(kind="lead_stage_evidence", project="P", tz="TZ-LEAD",
+                        payload={"obligation": target, "stage": "L1", "sha": "abc",
+                                 "receipt": "test-pass", "test_passed": True})
+        tx.record_event(kind="lead_stage_evidence", project="P", tz="TZ-LEAD",
+                        payload={"obligation": target, "stage": "L2", "sha": "abc",
+                                 "receipt": "review-pass", "review_accepted": True,
+                                 "integrated": True})
+        tx.record_event(kind="lead_stage_evidence", project="P", tz="TZ-LEAD",
+                        payload={"obligation": target, "stage": "L3", "sha": "abc",
+                                 "receipt": "signed-release", "signed": True,
+                                 "published": True, "authorised": True})
+        tx.record_event(kind="reject", project="P", tz="TZ-LEAD",
+                        payload={"note": "Предыдущее ревью " * 10000})
+
+    text = briefing(store, "W1", current)
+    assert len(text) <= 2500
+    assert text.count(target) == 1
+    assert "последняя проверенная стадия: L3" in text
+    assert "Нет доступа ко второму ПК" in text and "владелец: внешняя сторона" in text
+    assert "Одно действие: Проверить установку на другом ПК." in text
+    assert "ToDo/lead/LEDGER.json" in text and "fleet_checkpoint" in text
+    assert "Предыдущее ревью" not in text and "Поручение владельца" not in text
 
 
 def test_briefing_can_resume_active_task_when_task_argument_is_none(tmp_path: Path):
@@ -292,6 +395,8 @@ def test_existing_request_review_receives_original_contract_and_submit_note(tmp_
         review = _task_from_row(tx.one("SELECT * FROM tasks WHERE project='P' AND tz=?", (review_tz,)))
     text = briefing(store, "W2", review)
     assert source.body in text
+    assert "СНАЧАЛА проверь раздел «Путь продукта»" in text
+    assert "иначе reject с указанием раздела" in text
     assert source.owns[0] in text
     assert "Обновлён STATUS.md; live-ворота оставлены красными." in text
     assert "исходной задачи (только чтение)" in text

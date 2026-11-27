@@ -130,6 +130,31 @@ def test_memory_state_probe_failure_is_reported(tmp_path: Path, monkeypatch: pyt
     assert fleet.memory_state(True, now=1.0, probe=boom) == "память НЕ ОТВЕЧАЕТ (TimeoutError)"
 
 
+def test_fleet_rules_state_distinguishes_ambient_delivery_from_core(tmp_path: Path) -> None:
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 11, 17, 20, 0, tzinfo=timezone.utc)
+    journal = tmp_path / "memory-rules.jsonl"
+    journal.write_text("\n".join([
+        json.dumps({"at": "2026-11-17T19:00:00+00:00", "rules": 2, "unavailable": False}),
+        json.dumps({"at": "2026-11-17T19:01:00+00:00", "rules": 0, "unavailable": True}),
+        json.dumps({"at": "2026-11-16T18:00:00+00:00", "rules": 3, "unavailable": False}),
+    ]), encoding="utf-8")
+    result = fleet.fleet_rules_state(now=now, probe=lambda: True, path=journal)
+    assert "ambientd:11437 жив" in result
+    assert "1/2 с правилами, 1 недоступны" in result
+    assert "СБОЙ" not in result
+    down = fleet.fleet_rules_state(now=now, probe=lambda: False, path=journal)
+    assert "НЕ СЛУШАЕТ" in down
+    assert "НЕДОСТУПНЫ" in down
+    journal.write_text("\n".join([
+        json.dumps({"at": "2026-11-17T19:00:00+00:00", "rules": 0, "unavailable": True}),
+        json.dumps({"at": "2026-11-17T19:01:00+00:00", "rules": 0, "unavailable": True}),
+        json.dumps({"at": "2026-11-17T19:02:00+00:00", "rules": 1, "unavailable": False}),
+    ]), encoding="utf-8")
+    assert "СБОЙ ДОСТАВКИ" in fleet.fleet_rules_state(now=now, probe=lambda: True, path=journal)
+
+
 def test_platform_line_uses_server_agent_states_not_gateway_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -237,3 +262,29 @@ def test_grant_records_owner_decision_thaws_named_task_and_reaches_briefing(tmp_
                                                 for l in grants_for(Tx(), "P", "TZ-9"))
     with pytest.raises(ValueError):
         fleet._cmd_grant(conn, "P", "", [])
+
+
+def test_stuck_lines_handles_ready_task_inserted_after_dependency_snapshot(monkeypatch):
+    conn = make_conn()
+    original = fleet.world.build_index
+    first = True
+
+    def insert_after_snapshot(rows, *args, **kwargs):
+        nonlocal first
+        result = original(rows, *args, **kwargs)
+        if first:
+            first = False
+            now = fleet._now()
+            conn.execute(
+                "INSERT INTO tasks(project,tz,state,needs,created_at,updated_at) "
+                "VALUES('P','TZ-new','ready',?,?,?)",
+                (json.dumps(['TZ-missing']), now, now),
+            )
+        return result
+
+    monkeypatch.setattr(fleet.world, "build_index", insert_after_snapshot)
+    try:
+        lines = fleet.stuck_lines(conn, "P")
+        assert any("TZ-new" in line and "TZ-missing" in line for line in lines)
+    finally:
+        conn.close()

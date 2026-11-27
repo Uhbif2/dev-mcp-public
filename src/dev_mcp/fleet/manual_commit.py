@@ -65,7 +65,7 @@ def _git(root: Path, *args: str, env: dict[str, str] | None = None,
     clean_env.update(env or {})
     try:
         result = subprocess.run(
-            ["git", *args], cwd=root, env=clean_env, input=data,
+            ["git", "-c", "core.longpaths=true", *args], cwd=root, env=clean_env, input=data,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45,
             check=False,
         )

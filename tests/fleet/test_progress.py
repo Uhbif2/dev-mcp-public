@@ -98,7 +98,7 @@ def test_method_id_churn_cannot_reset_the_finite_ladder(world):
     store, oid = world
     used = []
     for n in range(100):
-        step = progress.decide(store, oid, gemini_available=True)
+        step = progress.decide(store, oid)
         if step.kind == "owner" and dict(step.params).get("platform_outcome_id"):
             continue
         used.append(step.kind)
@@ -106,7 +106,7 @@ def test_method_id_churn_cannot_reset_the_finite_ladder(world):
             progress.record_attempt(store, oid, step, successful=True, method_id=f"method-{n}")
         else:
             progress.record_attempt(store, oid, step)
-    assert used == ["change_method", "alternative", "cross_model", "owner"]
+    assert used == ["change_method", "alternative", "owner"]
 
 
 def test_structural_subtree_and_obstacle_type_also_count(world):
@@ -127,15 +127,15 @@ def test_hundred_failures_are_bounded_and_owner_gap_is_unique(world):
     store, oid = world
     kinds = []
     for _ in range(100):
-        step = progress.decide(store, oid, gemini_available=True)
+        step = progress.decide(store, oid)
         if step.kind == "owner" and dict(step.params).get("platform_outcome_id"):
             continue
         kinds.append(step.kind)
         progress.record_attempt(store, oid, step)
-    assert kinds == ["change_method", "alternative", "cross_model", "owner"]
+    assert kinds == ["change_method", "alternative", "owner"]
     assert progress.decide(store, oid).kind == "owner"
     with store.read() as tx:
-        assert tx.scalar("SELECT COUNT(*) FROM progress_attempts WHERE outcome_id=?", (oid,)) == 4
+        assert tx.scalar("SELECT COUNT(*) FROM progress_attempts WHERE outcome_id=?", (oid,)) == 3
         assert tx.scalar("SELECT COUNT(*) FROM outcomes WHERE project='Fleet Platform'") == 1
 
 

@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 import hashlib
 import os
 import re
@@ -90,12 +91,11 @@ def _json(value: Any) -> Any:
         return None
 
 
-def _granted(tx: Any, project: str, tz: str, root: str = "") -> list[str]:
-    """Owner decisions (owner_grants.py: project files + registry) for the decide-triage body:
-    a keep over something the owner already allowed is the 18.10 refreeze loop."""
-    from .owner_grants import file_decisions, grants_for, render
+def _granted(tx: Any, project: str, tz: str, file_rules: list[str] | None = None) -> list[str]:
+    """Render registry grants with file decisions loaded before the write transaction."""
+    from .owner_grants import grants_for, render
 
-    lines = render(grants_for(tx, project, tz), file_decisions(root))
+    lines = render(grants_for(tx, project, tz), file_rules)
     return ["", *lines, "Если решение выше снимает препятствие — action: reactivate, не keep."]
 
 
@@ -148,7 +148,19 @@ def _spent_today(tx: Any, project: str, now: datetime) -> int:
 
 
 def _abs(root: str, rel: str) -> str:
-    return norm_path(str(Path(root) / rel)) if rel else ""
+    if not rel:
+        return ""
+    # 08.11: realpath на Windows ~2 мс; ход контроллера звал его на каждый узел (1200 узлов —
+    # 2,4 с CPU). Каталог у решений один — разрешается один раз, имя файла приклеивается.
+    full = Path(root) / rel
+    if any(ch in rel for ch in "*?[") or full.name in ("", ".", ".."):
+        return norm_path(str(full))
+    return _norm_dir(str(full.parent)) + "/" + full.name.casefold()
+
+
+@lru_cache(maxsize=256)
+def _norm_dir(path: str) -> str:
+    return norm_path(path)
 
 
 def _insert(tx: Any, project: str, subject: str, title: str, body: str, owns: list[str], priority: int,
@@ -256,6 +268,9 @@ _RESULT_RULE = (
 
 
 def open_triages(store: Any, decisions: Decisions | None = None, *, now: datetime | None = None) -> list[str]:
+    from .generators import enabled as task_generators_enabled
+    if not task_generators_enabled():
+        return []
     # Repair stale decision owns before allocating any new work (idempotent).
     migrate_legacy_decision_paths(store)
     now = now or _now()
@@ -263,6 +278,11 @@ def open_triages(store: Any, decisions: Decisions | None = None, *, now: datetim
     data: dict[str, Any] | None = None
     with store.read() as tx:
         roots = {str(r["name"]): str(r["root"]) for r in tx.query("SELECT name,root FROM projects WHERE active=1")}
+
+    # OWNER-*.md may sit on a slow drive. Never glob/read it while the global
+    # SQLite writer gate is held; registry grants are still re-read at commit.
+    from .owner_grants import file_decisions
+    file_rules = {project: file_decisions(root) for project, root in roots.items()}
 
     # 2–3 нужны ворота пульта; считаем их вне транзакции (подпроцесс читает ту же базу).
     if decisions is not None:
@@ -394,7 +414,7 @@ def open_triages(store: Any, decisions: Decisions | None = None, *, now: datetim
                 "Обратимый вариант (reactivate/close) применится сразу после принятия. Деньги, аккаунты,"
                 " публикация не применяются никогда — их решает владелец по owner_needs.",
                 "Нет телефона/стенда/устройства — это не keep: очередь ждёт ресурс сама (park или reactivate).",
-                *_granted(tx, project, tz, str(roots.get(project) or "")),
+                *_granted(tx, project, tz, file_rules.get(project)),
                 _RESULT_RULE,
             ])
             opened.append(f"{project}/" + _insert(
@@ -548,6 +568,18 @@ def _read_decision(path: Path) -> dict[str, str]:
     text = path.read_text(encoding="utf-8")
     m = _YAML.search(text)
     block = m.group(1) if m else text
+    # 27.10: агенты пишут `why: >-` с отступом; построчный разбор оставлял «>-» вместо
+    # причины и условия. Сначала настоящий YAML, построчно — только если он не разобрался.
+    try:
+        import yaml
+        data = yaml.safe_load(block)
+    except Exception:  # noqa: BLE001 — свободный текст решения не обязан быть YAML
+        data = None
+    if isinstance(data, dict) and data:
+        return {str(k).strip().casefold(): ("" if v is None else
+                                            json.dumps(v, ensure_ascii=False, default=str)
+                                            if isinstance(v, (list, dict)) else str(v).strip())
+                for k, v in data.items()}
     out: dict[str, str] = {}
     for line in block.splitlines():
         if ":" in line and not line.startswith((" ", "\t", "#")):
@@ -1266,6 +1298,125 @@ def undo_default(store: Any, project: str, tz: str) -> str:
     return f"{project}/{tz}: умолчание «{payload.get('action')}» откачено, состояние снова {prev}"
 
 
+PARK_REVISIT = (timedelta(hours=72), timedelta(days=7), timedelta(days=14))
+_PARK_STATE_KINDS = ("proposal", "block", "freeze", "thaw", "reactivate", "approve", "auto_reactivate",
+                     "default_applied", "default_undo", "park_revisit", "take", "submit", "accept",
+                     "reject", "owner_decide")
+
+
+def revisit_parked(store: Any, *, now: datetime | None = None) -> list[str]:
+    """Return a parked task to the queue on a backoff (27.10).
+
+    Agents park with «система перепроверит через 72 часа», but nothing ever re-read a
+    park: 33 tasks sat frozen for days with no machine condition and no resolver. A park
+    is reversible by definition, so the queue revisits it — 72 h, 7 d, then every 14 d.
+    An owner `keep`, a newer block or any owner action is left alone.
+    """
+    now = now or _now()
+    out: list[str] = []
+    marks = ",".join("?" * len(_PARK_STATE_KINDS))
+    # Scanning the historical journal and parsing park conditions is read-only.
+    # Recheck the exact park event and revisit count under each short write tx.
+    candidates: list[tuple[str, str, int, int, timedelta]] = []
+    with store.read() as tx:
+        frozen = tx.query("SELECT project,tz FROM tasks WHERE state='frozen'")
+        for task in frozen:
+            project, tz = str(task["project"]), str(task["tz"])
+            last = tx.one(f"SELECT id,ts,kind,payload FROM events WHERE project=? AND tz=? "
+                          f"AND kind IN ({marks}) ORDER BY id DESC LIMIT 1",
+                          (project, tz, *_PARK_STATE_KINDS))
+            if last is None:
+                continue
+            payload = _json(last["payload"]) or {}
+            if str(last["kind"]) == "block":
+                reason = str(payload.get("reason") or payload.get("note") or "")
+                if (payload.get("reactivate_policy") or payload.get("change_source")
+                        or payload.get("platform_task") or re.search(r"(?i)\buntil\s*:", reason)):
+                    continue
+            elif str(last["kind"]) in ("proposal", "default_applied"):
+                if payload.get("action") != "park":
+                    continue
+                if str(last["kind"]) == "proposal" and not payload.get("reversible"):
+                    continue
+            else:
+                continue
+            done = int(tx.scalar("SELECT COUNT(*) FROM events WHERE project=? AND tz=? "
+                                 "AND kind='park_revisit'", (project, tz)) or 0)
+            wait = PARK_REVISIT[min(done, len(PARK_REVISIT) - 1)]
+            if now - _parse(last["ts"]) >= wait:
+                candidates.append((project, tz, int(last["id"]), done, wait))
+    for project, tz, event_id, done, wait in candidates:
+        with store.tx() as tx:
+            task = tx.one("SELECT state FROM tasks WHERE project=? AND tz=?", (project, tz))
+            last_id = tx.scalar(
+                f"SELECT id FROM events WHERE project=? AND tz=? "
+                f"AND kind IN ({marks}) ORDER BY id DESC LIMIT 1",
+                (project, tz, *_PARK_STATE_KINDS),
+            )
+            current_done = int(tx.scalar(
+                "SELECT COUNT(*) FROM events WHERE project=? AND tz=? AND kind='park_revisit'",
+                (project, tz),
+            ) or 0)
+            if (task is None or str(task["state"]) != "frozen"
+                    or last_id != event_id or current_done != done):
+                continue
+            tx.change("UPDATE tasks SET state='ready',updated_at=? WHERE project=? AND tz=? "
+                      "AND state='frozen'", (_iso(now), project, tz),
+                      event={"kind": "park_revisit", "project": project, "tz": tz, "payload": {
+                          "after": str(wait), "revisit": done + 1, "park_event": event_id,
+                          "why": "park без проверяемого исполнителем условия — плановая перепроверка; "
+                                 "условие не снято — снова park с until, снято — работай"}})
+            out.append(f"{project}/{tz}")
+    return out
+
+
+def retire_obsolete_reviews(store: Any) -> list[str]:
+    """Close reviews whose source already reached a verdict (27.10: 18 such, up to 13 days).
+
+    `fleet_review` accepts only a submitted source, so a frozen review of an accepted or
+    rejected task can never finish; it only held operator fronts and owner attention.
+    """
+    from .review import _review_target
+    out: list[str] = []
+    now = _now()
+    candidates: list[tuple[str, str, str, str, str, str, str, str, str]] = []
+    # Review parsing and historical scans run without the global writer gate.
+    with store.read() as tx:
+        for task in tx.query("SELECT project,tz,body,state,updated_at FROM tasks WHERE kind='review' "
+                             "AND state IN ('frozen','ready')"):
+            try:
+                project, source = _review_target(str(task["tz"]), str(task["body"] or ""),
+                                                 str(task["project"]))
+            except ValueError:
+                continue
+            row = tx.one("SELECT state,updated_at FROM tasks WHERE project=? AND tz=?", (project, source))
+            if row is not None and str(row["state"]) in ("accepted", "rejected"):
+                candidates.append((
+                    str(task["project"]), str(task["tz"]), str(task["state"]),
+                    str(task["body"] or ""), str(task["updated_at"]),
+                    project, source, str(row["state"]), str(row["updated_at"]),
+                ))
+    for task_project, task_tz, review_state, review_body, review_version, project, source, source_state, source_version in candidates:
+        with store.tx() as tx:
+            review = tx.one("SELECT state,body,updated_at FROM tasks WHERE project=? AND tz=?",
+                            (task_project, task_tz))
+            current = tx.one("SELECT state,updated_at FROM tasks WHERE project=? AND tz=?", (project, source))
+            if (review is None or str(review["state"]) != review_state
+                    or str(review["body"] or "") != review_body
+                    or str(review["updated_at"]) != review_version
+                    or current is None or str(current["state"]) != source_state
+                    or str(current["updated_at"]) != source_version):
+                continue
+            tx.change("UPDATE tasks SET state='rejected',updated_at=? WHERE project=? AND tz=? "
+                      "AND state IN ('frozen','ready')", (_iso(now), task_project, task_tz),
+                      event={"kind": "review_obsolete", "project": task_project,
+                             "tz": task_tz, "payload": {
+                                 "source": f"{project}/{source}", "source_state": source_state,
+                                 "why": "источник уже получил вердикт; ревью завершить невозможно"}})
+            out.append(f"{task_project}/{task_tz}")
+    return out
+
+
 def tick(store: Any, decisions: Decisions | None = pult_decisions) -> dict[str, Any]:
     from . import lessons
 
@@ -1273,6 +1424,8 @@ def tick(store: Any, decisions: Decisions | None = pult_decisions) -> dict[str, 
         "applied": apply_accepted(store),
         "resynced": resync_skipped(store),
         "defaults": apply_defaults(store),
+        "revisited": revisit_parked(store),
+        "obsolete_reviews": retire_obsolete_reviews(store),
         "opened": open_triages(store, decisions),
         "lessons": lessons.tick(store),
     }
